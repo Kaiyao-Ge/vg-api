@@ -82,14 +82,40 @@ enum {
     VG_STRUCTURE_REQUIRED_BIT = 0x80000000u,
     VG_STRUCTURE_RUNTIME_DESC = 1u,
     VG_STRUCTURE_ADAPTER_INFO = 2u,
+    VG_STRUCTURE_REGION_DESC = 3u,
     VG_FACET_KIND_ADDRESS = 0u,
     VG_FACET_KIND_SAMPLE = 1u,
     VG_FACET_KIND_STORAGE = 2u,
     VG_FACET_KIND_ATTACHMENT = 3u,
     VG_FACET_KIND_TRANSFER = 4u,
+    /* Layout/representation traits, not resource lifetimes: the same Region
+     * may be interpreted through any of these without becoming a different
+     * object. */
+    VG_LAYOUT_LINEAR = 0u,
+    VG_LAYOUT_TILED = 1u,
+    VG_LAYOUT_SAMPLE_OPTIMAL = 2u,
+    VG_LAYOUT_STORAGE_OPTIMAL = 3u,
+    VG_LAYOUT_ATTACHMENT = 4u,
+    VG_LAYOUT_TENSOR = 5u,
+    VG_LAYOUT_ACCEL = 6u,
+    VG_LAYOUT_VIDEO = 7u,
+    /* Access classes feed effect inference and backend lowering. They are a
+     * declaration of intent, not a public old/new usage state machine: nothing
+     * transitions a Region from one of these to another. */
+    VG_ACCESS_READ = 1u << 0,
+    VG_ACCESS_WRITE = 1u << 1,
+    VG_ACCESS_ATOMIC = 1u << 2,
+    VG_ACCESS_SAMPLE_READ = 1u << 3,
+    VG_ACCESS_ATTACHMENT_WRITE = 1u << 4,
+    VG_ACCESS_PUBLISH = 1u << 5,
+    VG_ACCESS_TRANSFER = 1u << 6,
+    VG_ACCESS_METADATA = 1u << 7,
+    VG_ACCESS_INSTRUCTION = 1u << 8,
     VG_VALIDATION_DISABLED = 0u,
     VG_VALIDATION_REFERENCE_STRICT = 1u,
     VG_VALIDATION_CHECKED_NATIVE = 2u,
+    VG_VALIDATION_FAST_NATIVE = 3u,
+    VG_VALIDATION_CAPTURE = 4u,
     VG_BACKEND_REFERENCE = 1u,
     VG_BACKEND_METAL = 2u,
     VG_BACKEND_VULKAN = 3u,
@@ -116,6 +142,28 @@ typedef struct VgRuntimeDesc {
     uint32_t validation_profile;
     uint32_t reserved;
 } VgRuntimeDesc;
+
+/* The public form of a logical view over an allocation: shape, layout class
+ * and access intent, never a Buffer or Texture lifetime object. Sample and
+ * attachment use of the same Region is reached through a versioned VgFacetRef
+ * obtained from representation compilation, which is why nothing here names a
+ * backend resource. No entry point consumes this yet -- the first version of
+ * the API deliberately ships a reduced function set -- but its layout is
+ * pinned by the ABI golden test so it cannot drift from the runtime's internal
+ * canonical view. */
+typedef struct VgRegionDesc {
+    VgStructHeader header;
+    VgAddressDomain domain;
+    VgAllocation allocation;
+    uint64_t byte_offset;
+    uint64_t byte_size;
+    VgStableId schema_id;
+    uint64_t shape[4];
+    uint64_t strides[4];
+    uint64_t access_mask;
+    uint32_t layout_class;
+    uint32_t rank;
+} VgRegionDesc;
 
 typedef struct VgAdapterInfo {
     VgStructHeader header;

@@ -14,6 +14,12 @@ namespace vg::core {
 enum class ObjectState { Active, Retired };
 enum class PoisonState { Valid, PartiallyProduced, Poisoned };
 
+// 03-system-architecture.md Sec.12's four profiles. A profile never changes
+// what a legal program means -- it only decides how much diagnosis and
+// instrumentation is paid for, which is why this is a plain input to backends
+// rather than a field of any sealed object.
+enum class ValidationProfile : uint32_t { CheckedNative, FastNative, ReferenceStrict, Capture };
+
 struct Allocation {
   uint64_t id{};
   uint32_t generation{1};
@@ -21,7 +27,36 @@ struct Allocation {
   ObjectState state{ObjectState::Active};
   uint32_t representation_epoch{0};
   uint32_t in_flight{};
+  // How many representation versions of this allocation are still live. Starts
+  // at 1 (the allocation's initial representation); transform() adds one and
+  // release_representation() removes one. This is what a non-zero
+  // Arena::max_in_flight_representations() budget is checked against (E016:
+  // "禁止无界创建版本").
+  uint32_t live_representations{1};
   std::vector<uint8_t> bytes;
+};
+
+// The four obligations 02-principles-and-semantics.md Sec.4.2 requires a
+// caller to discharge before ConsumeInput may run: the old envelope has
+// completed, nothing outside holds a reference, the old version will never be
+// replayed, and the caller accepts that a fault leaves no rollback. Passed as
+// an argument to Arena::consume rather than inferred, because none of the four
+// is observable from arena state alone -- consume() refuses unless all four
+// hold, which is 10-validation-and-benchmarks.md Sec.3's "ConsumeInput proof"
+// conformance row and Sec.4's "illegal consume" negative case.
+struct ConsumeProof {
+  bool envelope_complete{};
+  bool no_external_references{};
+  bool no_replay_required{};
+  bool failure_semantics_accepted{};
+
+  bool complete() const {
+    return envelope_complete && no_external_references && no_replay_required &&
+           failure_semantics_accepted;
+  }
+  // Names the first unmet obligation so a rejection says which proof failed
+  // rather than only that one did; nullptr when complete().
+  const char* first_unmet() const;
 };
 
 class Arena {
@@ -37,17 +72,57 @@ class Arena {
   bool release(uint64_t id, uint32_t generation);
   bool transform(uint64_t id, uint32_t generation, uint32_t* new_epoch, std::string* error = nullptr);
   bool transform(uint64_t id, uint32_t generation, uint32_t expected_epoch, uint32_t* new_epoch, std::string* error = nullptr);
-  bool consume(uint64_t id, uint32_t generation, uint32_t expected_epoch, std::string* error = nullptr);
+  // ConsumeInput (02 Sec.4.2). Destructive: the allocation is retired, its
+  // generation bumped so no old token can ever resolve again, and its backing
+  // bytes actually released -- there is no rollback to the pre-consume
+  // representation afterwards, which is exactly what `proof` attests the
+  // caller accepts. Refuses an incomplete proof before touching any state.
+  bool consume(uint64_t id, uint32_t generation, uint32_t expected_epoch, const ConsumeProof& proof,
+               std::string* error = nullptr);
+  // ConsumeInput applied to a representation transform (06 Sec.11: the proof
+  // buys "reuse heap range、in-place compute transform 或立即释放旧 backing").
+  // The object survives -- its identity, generation and freshly published
+  // epoch stay live, so facets acquired against the new representation keep
+  // resolving -- but the superseded backing is released at once instead of
+  // being retained until the relevant command buffer completes. That released
+  // byte count is the watermark reduction E005 measures, and it is the whole
+  // difference from the default retain-until-completion behaviour.
+  //
+  // Distinct from consume() above, which retires the object entirely: these
+  // are two different destructive operations and collapsing them would make a
+  // transform's target facet stale the moment its own transform succeeded.
+  bool consume_representation(uint64_t id, uint32_t generation, uint32_t expected_epoch,
+                              const ConsumeProof& proof, uint64_t* released_bytes = nullptr,
+                              std::string* error = nullptr);
+  // E016 backpressure. 0 (the default) means unbounded; a non-zero budget makes
+  // transform() refuse -- predictably, with an explicit error -- once an
+  // allocation already has that many live representations, instead of letting
+  // versions accumulate until the process thrashes.
+  void set_max_in_flight_representations(uint32_t budget) { max_in_flight_representations_ = budget; }
+  uint32_t max_in_flight_representations() const { return max_in_flight_representations_; }
+  // Drops one live representation version of `id` without retiring the
+  // allocation, i.e. the producer observed that an older version's readers are
+  // done. Never drops the last one: an Active allocation always has at least
+  // its current representation.
+  bool release_representation(uint64_t id, uint32_t generation, std::string* error = nullptr);
   const std::unordered_map<uint64_t, Allocation>& allocations() const { return allocations_; }
   bool import_allocation(uint64_t id, uint32_t generation, uint64_t size, uint32_t representation_epoch,
                          ObjectState state, const std::vector<uint8_t>& bytes, std::string* error = nullptr);
   uint64_t id() const { return id_; }
   uint64_t topology_epoch() const { return topology_epoch_; }
+  // Arena-wide monotone counter of representation transitions, sibling to
+  // topology_epoch(): that one ticks when the pointer-bearing topology changes,
+  // this one ticks when any allocation's backing/facet interpretation does
+  // (02 Sec.4.1). RepresentationEpochBuilder::seal() stamps it, the same way
+  // GraphEpochBuilder::seal() stamps topology_epoch().
+  uint64_t representation_clock() const { return representation_clock_; }
 
  private:
   uint64_t id_;
   uint64_t next_id_{1};
   uint64_t topology_epoch_{};
+  uint64_t representation_clock_{};
+  uint32_t max_in_flight_representations_{};
   std::unordered_map<uint64_t, Allocation> allocations_;
 };
 
@@ -63,6 +138,11 @@ enum class FacetKind : uint32_t { Address, Sample, Storage, Attachment, Transfer
 // (06-backend-macos-metal.md §6.1–6.3). Extend only when a real path requires it.
 enum class PixelFormat : uint32_t { RGBA8Unorm, R32Float };
 enum class ViewDimension : uint32_t { Texture2D, Texture2DArray };
+
+// Both formats this milestone models are 4 bytes wide, but the two reach that
+// width differently (4x8-bit vs. 1x32-bit), so callers that pack rows must ask
+// rather than assume.
+uint32_t bytes_per_texel(PixelFormat format);
 
 // Sampler policy for SampleFacet only (06 §6.1). Kept off CanonicalView so the
 // same view can be sampled under different filter/wrap without a new view.
@@ -97,6 +177,26 @@ struct CanonicalView {
   uint32_t array_layers{1};
   uint32_t mip_levels{1};
   SwizzleChannels swizzle;
+
+  // Half-and-clamp, the sizing rule every graphics API's mip chain uses.
+  uint32_t mip_width(uint32_t level) const;
+  uint32_t mip_height(uint32_t level) const;
+  uint32_t subresource_count() const { return array_layers * mip_levels; }
+  // Byte layout of the linear allocation this view names: slice-major, then
+  // ascending mip level, each level tightly packed at
+  // mip_width(level) * bytes_per_texel rows. This is the single contract the
+  // Metal upload path and the reference sampling oracle both encode against --
+  // if they disagreed on it, an image-correctness comparison between them
+  // would be meaningless.
+  uint64_t bytes_per_row(uint32_t level) const;
+  uint64_t subresource_byte_size(uint32_t level) const;
+  uint64_t subresource_byte_offset(uint32_t layer, uint32_t level) const;
+  uint64_t byte_size() const;
+  // Rejects a view whose extents/counts cannot describe a real image (zero
+  // extent, zero layers/levels, a mip chain longer than the extent supports,
+  // or array_layers > 1 without the array dimension). Shape validity is a
+  // property of the view contract, so every backend gets the same answer.
+  bool valid(std::string* error = nullptr) const;
 };
 
 // index+generation capability reference into a FacetPool slot -- never a
@@ -172,12 +272,87 @@ class FacetPool {
   bool begin_gpu_use(const Arena& arena, FacetRef ref, std::string* error = nullptr);
   bool end_gpu_use(FacetRef ref, std::string* error = nullptr);
   uint32_t in_flight(FacetRef ref) const;
+  uint32_t slot_count() const { return static_cast<uint32_t>(slots_.size()); }
+  // 06 Sec.6.4 asks the checked profile to verify facet generation *in the
+  // shader*. A shader cannot call lookup(), so the checked profile uploads this
+  // table instead: entry[index] is the generation that index currently
+  // resolves at, or 0 for a retired slot, so a kernel holding a FacetRef can
+  // reject a stale token itself before dereferencing it. Snapshot semantics --
+  // it is only as fresh as the submission that uploaded it, which is why the
+  // host-side lookup() check stays authoritative.
+  void snapshot_generations(std::vector<uint32_t>* out) const;
+  // Host-side mirror of the comparison the checked-profile shader performs, so
+  // a test can state the expected in-shader verdict without a GPU. Deliberately
+  // weaker than lookup(): it sees only what the uploaded table encodes, and so
+  // cannot observe an epoch that went stale after the snapshot.
+  bool generation_valid(FacetRef ref) const;
 
  private:
   void retire_slot(uint32_t index);
 
   std::vector<FacetSlot> slots_;
   std::vector<uint32_t> free_list_;
+};
+
+// One frozen interpretation of a set of allocations' backing/metadata/facets
+// (02 Sec.4.1). Sibling to GraphEpoch, not a generalization of it: GraphEpoch
+// freezes which pointers a topology may dereference, this freezes how the bytes
+// behind those allocations are to be read. A representation transform produces
+// a new one rather than editing this one, which is 02 Sec.8's "transform 不是
+// 纯 barrier" stated as a data structure.
+struct RepresentationRef {
+  uint64_t allocation{};
+  uint32_t allocation_generation{};
+  uint32_t representation_epoch{};
+};
+
+class RepresentationEpoch {
+ public:
+  uint64_t value() const { return value_; }
+  bool sealed() const { return sealed_; }
+  const std::vector<RepresentationRef>& representations() const { return representations_; }
+  const std::vector<FacetRef>& facets() const { return facets_; }
+  bool contains(RepresentationRef reference) const;
+  bool contains(FacetRef ref) const;
+  // 02 Sec.10's "facet generation vs epoch = stale token" at epoch granularity:
+  // true once any frozen representation no longer matches `arena`, meaning
+  // every facet this epoch authorized has to be rebuilt rather than reused.
+  bool stale(const Arena& arena) const;
+
+ private:
+  friend class RepresentationEpochBuilder;
+  uint64_t value_{1};
+  std::vector<RepresentationRef> representations_;
+  std::vector<FacetRef> facets_;
+  bool sealed_{};
+};
+
+// Mirrors GraphEpochBuilder's shape (add references, seal once, stamp the
+// arena's clock) so the two epoch kinds stay recognizably the same mechanism
+// applied to different state.
+class RepresentationEpochBuilder {
+ public:
+  explicit RepresentationEpochBuilder(uint64_t next_epoch = 1) : next_epoch_(next_epoch) {}
+  RepresentationEpochBuilder(const Arena* arena, uint64_t next_epoch = 1)
+      : next_epoch_(next_epoch), arena_(arena) {}
+  bool add_representation(RepresentationRef reference, std::string* error = nullptr);
+  // Snapshots the allocation's *current* representation_epoch, so a caller
+  // cannot freeze a version the arena is not actually at.
+  bool add_representation(const Arena& arena, uint64_t allocation, uint32_t generation,
+                          std::string* error = nullptr);
+  // Adds the facet and the representation it was acquired against together --
+  // a facet whose slot is already stale is refused, since freezing it would
+  // authorize a token that is dead on arrival.
+  bool add_facet(const Arena& arena, const FacetPool& pool, FacetRef ref, std::string* error = nullptr);
+  bool seal(RepresentationEpoch* out, std::string* error = nullptr);
+  bool sealed() const { return sealed_; }
+
+ private:
+  uint64_t next_epoch_;
+  const Arena* arena_{};
+  std::vector<RepresentationRef> representations_;
+  std::vector<FacetRef> facets_;
+  bool sealed_{};
 };
 
 struct TaskRecord {

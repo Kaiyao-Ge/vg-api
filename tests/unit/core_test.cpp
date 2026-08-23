@@ -20,7 +20,12 @@ int main() {
   assert(arena.transform(allocation.id, allocation.generation, &representation_epoch) && representation_epoch == 1);
   assert(arena.lookup(allocation.id, allocation.generation, representation_epoch) != nullptr);
   assert(!arena.transform(allocation.id, allocation.generation, 0, nullptr, &transform_error));
-  assert(arena.consume(allocation.id, allocation.generation, representation_epoch, &transform_error));
+  const vg::core::ConsumeProof discharged{true, true, true, true};
+  assert(!arena.consume(allocation.id, allocation.generation, representation_epoch,
+                        vg::core::ConsumeProof{}, &transform_error) &&
+         transform_error.rfind("ConsumeInput proof incomplete", 0) == 0);
+  assert(arena.consume(allocation.id, allocation.generation, representation_epoch, discharged,
+                       &transform_error));
   assert(arena.lookup(allocation.id, 1) == nullptr);
   auto& second_allocation = arena.allocate(16);
 
@@ -443,6 +448,595 @@ int main() {
 
     // A stale ref can never start new work in the first place.
     assert(!pool.begin_gpu_use(arena, recycled, &error));
+  }
+
+  // ==========================================================================
+  // Phase C: CanonicalView shape contract, RepresentationEpoch, ConsumeInput
+  // proofs, E016 backpressure, the checked-profile generation table, and the
+  // reference backend's Stage 5. Each block states one documented requirement.
+  // ==========================================================================
+
+  // --- CanonicalView::valid()/layout (02 §3.3). Shape validity is a property
+  // of the view contract, so every backend gets the same answer; the byte
+  // layout is the single contract the Metal upload path and the reference
+  // sampling oracle both encode against, so an image comparison between them
+  // is only meaningful if it is pinned here. ---
+  {
+    vg::core::CanonicalView view;
+    view.allocation = 1;
+    view.allocation_generation = 1;
+    view.format = vg::core::PixelFormat::RGBA8Unorm;
+    view.dimension = vg::core::ViewDimension::Texture2D;
+    view.width = 8;
+    view.height = 4;
+    std::string shape_error;
+    assert(view.valid(&shape_error));
+
+    // Zero extent cannot describe a real image.
+    vg::core::CanonicalView zero_width = view;
+    zero_width.width = 0;
+    assert(!zero_width.valid(&shape_error));
+    assert(shape_error == "canonical view extent must be non-zero");
+    vg::core::CanonicalView zero_height = view;
+    zero_height.height = 0;
+    assert(!zero_height.valid(&shape_error));
+    vg::core::CanonicalView zero_layers = view;
+    zero_layers.array_layers = 0;
+    assert(!zero_layers.valid(&shape_error));
+    assert(shape_error == "canonical view must name at least one array layer");
+    vg::core::CanonicalView zero_levels = view;
+    zero_levels.mip_levels = 0;
+    assert(!zero_levels.valid(&shape_error));
+    assert(shape_error == "canonical view must name at least one mip level");
+
+    // 8x4 supports exactly 4 levels (8x4, 4x2, 2x1, 1x1); a 5th would alias
+    // the 1x1 rather than describe new texels, so it is malformed rather than
+    // something to clamp.
+    vg::core::CanonicalView full_chain = view;
+    full_chain.mip_levels = 4;
+    assert(full_chain.valid(&shape_error));
+    vg::core::CanonicalView over_chain = view;
+    over_chain.mip_levels = 5;
+    assert(!over_chain.valid(&shape_error));
+    assert(shape_error == "canonical view mip chain is longer than its extent supports");
+
+    // array_layers > 1 needs the array dimension.
+    vg::core::CanonicalView flat_array = view;
+    flat_array.array_layers = 2;
+    assert(!flat_array.valid(&shape_error));
+    assert(shape_error == "Texture2D canonical view cannot name multiple array layers");
+    vg::core::CanonicalView array_view = view;
+    array_view.dimension = vg::core::ViewDimension::Texture2DArray;
+    array_view.array_layers = 2;
+    array_view.mip_levels = 4;
+    assert(array_view.valid(&shape_error));
+    // A Texture2DArray naming a single layer is legal; only the reverse is not.
+    vg::core::CanonicalView single_layer_array = array_view;
+    single_layer_array.array_layers = 1;
+    assert(single_layer_array.valid(&shape_error));
+
+    // Half-and-clamp, the sizing rule every graphics API's mip chain uses.
+    assert(array_view.mip_width(0) == 8 && array_view.mip_height(0) == 4);
+    assert(array_view.mip_width(1) == 4 && array_view.mip_height(1) == 2);
+    assert(array_view.mip_width(2) == 2 && array_view.mip_height(2) == 1);
+    assert(array_view.mip_width(3) == 1 && array_view.mip_height(3) == 1);
+    // Clamped, not zero, past the end of the chain.
+    assert(array_view.mip_width(9) == 1 && array_view.mip_height(9) == 1);
+
+    assert(vg::core::bytes_per_texel(vg::core::PixelFormat::RGBA8Unorm) == 4);
+    assert(vg::core::bytes_per_texel(vg::core::PixelFormat::R32Float) == 4);
+    assert(array_view.subresource_count() == 8);
+    assert(array_view.bytes_per_row(0) == 32 && array_view.bytes_per_row(2) == 8);
+    assert(array_view.subresource_byte_size(0) == 128);
+    assert(array_view.subresource_byte_size(3) == 4);
+
+    // byte_size() is exactly the sum of every subresource's size.
+    uint64_t summed = 0;
+    for (uint32_t layer = 0; layer < array_view.array_layers; ++layer)
+      for (uint32_t level = 0; level < array_view.mip_levels; ++level)
+        summed += array_view.subresource_byte_size(level);
+    assert(array_view.byte_size() == summed);
+    assert(array_view.byte_size() == 344);
+
+    // Offsets are slice-major, then ascending mip level, tightly packed.
+    assert(array_view.subresource_byte_offset(0, 0) == 0);
+    assert(array_view.subresource_byte_offset(0, 1) == 128);
+    assert(array_view.subresource_byte_offset(0, 2) == 160);
+    assert(array_view.subresource_byte_offset(0, 3) == 168);
+    assert(array_view.subresource_byte_offset(1, 0) == 172);
+    assert(array_view.subresource_byte_offset(1, 3) == 340);
+  }
+
+  // --- RepresentationEpoch/Builder (02 §4.1): a representation transform
+  // produces a new frozen interpretation rather than editing this one, which
+  // is 02 §8's "transform 不是纯 barrier" stated as a data structure. Mirrors
+  // GraphEpochBuilder's shape, so seal() stamps the arena's clock the same way
+  // GraphEpochBuilder::seal() stamps topology_epoch(). ---
+  {
+    vg::core::Arena epoch_arena;
+    auto& epoch_backing = epoch_arena.allocate(256);
+    const uint64_t backing_id = epoch_backing.id;
+    const uint32_t backing_generation = epoch_backing.generation;
+
+    uint32_t published = 0;
+    assert(epoch_arena.transform(backing_id, backing_generation, &published) && published == 1);
+    assert(epoch_arena.representation_clock() == 1);
+
+    vg::core::CanonicalView view;
+    view.allocation = backing_id;
+    view.allocation_generation = backing_generation;
+    view.width = 4;
+    view.height = 4;
+
+    vg::core::FacetPool epoch_pool;
+    vg::core::FacetRef sample_ref;
+    std::string epoch_error;
+    assert(epoch_pool.acquire(epoch_arena, view, vg::core::FacetKind::Sample, &sample_ref, &epoch_error));
+
+    vg::core::RepresentationEpochBuilder epoch_builder(&epoch_arena);
+    // add_representation(arena, ...) snapshots the allocation's *current*
+    // epoch, so a caller cannot freeze a version the arena is not at.
+    assert(epoch_builder.add_representation(epoch_arena, backing_id, backing_generation, &epoch_error));
+    assert(epoch_builder.add_facet(epoch_arena, epoch_pool, sample_ref, &epoch_error));
+    // Re-adding the same reference is idempotent, not an error.
+    assert(epoch_builder.add_representation(epoch_arena, backing_id, backing_generation, &epoch_error));
+    // A reference the arena does not hold is refused rather than frozen.
+    assert(!epoch_builder.add_representation(epoch_arena, 999, 1, &epoch_error));
+    assert(epoch_error == "representation reference is not active in arena");
+    assert(!epoch_builder.add_representation({backing_id, 0, published}, &epoch_error));
+    assert(epoch_error == "representation reference generation must be non-zero");
+
+    vg::core::RepresentationEpoch representation_epoch;
+    assert(!epoch_builder.sealed());
+    assert(epoch_builder.seal(&representation_epoch, &epoch_error));
+    assert(epoch_builder.sealed());
+    assert(representation_epoch.sealed());
+    // Stamped from the arena's representation clock, the sibling of the
+    // topology_epoch() stamp GraphEpochBuilder::seal() uses.
+    assert(representation_epoch.value() == epoch_arena.representation_clock());
+    assert(representation_epoch.representations().size() == 1);
+    assert(representation_epoch.facets().size() == 1);
+    assert(representation_epoch.contains(
+        vg::core::RepresentationRef{backing_id, backing_generation, published}));
+    assert(representation_epoch.contains(sample_ref));
+    assert(!representation_epoch.contains(vg::core::FacetRef{sample_ref.index, sample_ref.generation + 1}));
+    assert(!representation_epoch.stale(epoch_arena));
+    // Seal once: a sealed builder is immutable (02 §4.1's build -> release ->
+    // immutable -> retire).
+    assert(!epoch_builder.seal(&representation_epoch, &epoch_error));
+    assert(epoch_error == "representation epoch builder is already sealed");
+    assert(!epoch_builder.add_representation({backing_id, backing_generation, published}, &epoch_error));
+    assert(epoch_error == "representation epoch is sealed");
+
+    // Another transform makes the frozen interpretation stale wholesale: every
+    // facet it authorized has to be rebuilt rather than reused (02 §10 at epoch
+    // granularity).
+    uint32_t superseding = 0;
+    assert(epoch_arena.transform(backing_id, backing_generation, &superseding) && superseding == 2);
+    assert(representation_epoch.stale(epoch_arena));
+    assert(epoch_pool.lookup(epoch_arena, sample_ref) == nullptr);
+
+    // A facet whose slot is already stale cannot be frozen: doing so would
+    // authorize a token that is dead on arrival.
+    vg::core::RepresentationEpochBuilder stale_builder(&epoch_arena);
+    assert(!stale_builder.add_facet(epoch_arena, epoch_pool, sample_ref, &epoch_error));
+    assert(epoch_error == vg::core::to_string(vg::core::FacetStatus::EpochStale));
+
+    // Without an arena the builder falls back to the next_epoch it was
+    // constructed with, rather than inventing a clock value.
+    vg::core::RepresentationEpochBuilder detached(static_cast<uint64_t>(7));
+    assert(detached.add_representation({backing_id, backing_generation, superseding}));
+    vg::core::RepresentationEpoch detached_epoch;
+    assert(detached.seal(&detached_epoch));
+    assert(detached_epoch.value() == 7);
+  }
+
+  // --- ConsumeProof (02 §4.2): none of the four obligations is observable
+  // from arena state, so they are attested rather than inferred, and the
+  // rejection names *which* proof failed. 10 §3's "ConsumeInput proof"
+  // conformance row and 10 §4's "illegal consume" negative case. ---
+  {
+    assert(vg::core::ConsumeProof{}.first_unmet() != nullptr);
+    assert(std::string(vg::core::ConsumeProof{}.first_unmet()) == "old envelope has not completed");
+    assert(std::string(vg::core::ConsumeProof{true, false, false, false}.first_unmet()) ==
+           "an external reference to the old representation still exists");
+    assert(std::string(vg::core::ConsumeProof{true, true, false, false}.first_unmet()) ==
+           "the old representation may still be replayed");
+    assert(std::string(vg::core::ConsumeProof{true, true, true, false}.first_unmet()) ==
+           "destructive-failure semantics were not accepted");
+    assert(discharged.complete());
+    assert(discharged.first_unmet() == nullptr);
+
+    vg::core::Arena consume_arena;
+    auto& consume_backing = consume_arena.allocate(64);
+    const uint64_t consume_id = consume_backing.id;
+    const uint32_t consume_generation = consume_backing.generation;
+    uint32_t consume_epoch = 0;
+    assert(consume_arena.transform(consume_id, consume_generation, &consume_epoch) && consume_epoch == 1);
+    assert(consume_arena.lookup(consume_id, consume_generation)->live_representations == 2);
+
+    // An incomplete proof is refused before any state is touched, by both
+    // destructive operations.
+    std::string consume_error;
+    uint64_t released = 0;
+    assert(!consume_arena.consume_representation(consume_id, consume_generation, consume_epoch,
+                                                 vg::core::ConsumeProof{true, true, false, true}, &released,
+                                                 &consume_error));
+    assert(consume_error ==
+           "ConsumeInput proof incomplete: the old representation may still be replayed");
+    assert(released == 0);
+    assert(!consume_arena.consume(consume_id, consume_generation, consume_epoch,
+                                  vg::core::ConsumeProof{true, true, true, false}, &consume_error));
+    assert(consume_error ==
+           "ConsumeInput proof incomplete: destructive-failure semantics were not accepted");
+    assert(consume_arena.lookup(consume_id, consume_generation, consume_epoch) != nullptr);
+
+    // consume_representation() is the transform form (06 §11): the object
+    // survives -- identity, generation and freshly published epoch all stay
+    // live, so facets acquired against the new representation keep resolving --
+    // but the superseded backing is handed back at once. That released byte
+    // count is E005's watermark reduction.
+    assert(consume_arena.consume_representation(consume_id, consume_generation, consume_epoch, discharged,
+                                                &released, &consume_error));
+    assert(released == 64);
+    const auto* survivor = consume_arena.lookup(consume_id, consume_generation, consume_epoch);
+    assert(survivor != nullptr);
+    assert(survivor->state == vg::core::ObjectState::Active);
+    assert(survivor->generation == consume_generation);
+    assert(survivor->representation_epoch == consume_epoch);
+    // The old version is no longer retained as an extra live representation.
+    assert(survivor->live_representations == 1);
+    assert(survivor->bytes.empty());
+
+    // Collapsing the two destructive operations would stale the very facet a
+    // transform just published, so consume() -- the retiring form -- is
+    // distinct: it retires the allocation and bumps its generation so no old
+    // token can ever resolve again.
+    vg::core::Arena retire_arena;
+    auto& retire_backing = retire_arena.allocate(64);
+    const uint64_t retire_id = retire_backing.id;
+    const uint32_t retire_generation = retire_backing.generation;
+    uint32_t retire_epoch = 0;
+    assert(retire_arena.transform(retire_id, retire_generation, &retire_epoch));
+    assert(retire_arena.consume(retire_id, retire_generation, retire_epoch, discharged, &consume_error));
+    const auto& retired = retire_arena.allocations().at(retire_id);
+    assert(retired.state == vg::core::ObjectState::Retired);
+    assert(retired.generation == retire_generation + 1);
+    assert(retired.live_representations == 0);
+    assert(retired.bytes.empty());
+    assert(retire_arena.lookup(retire_id, retire_generation) == nullptr);
+    // 10 §5: a retired generation is never visible again, and the bumped one
+    // was never handed out either.
+    assert(retire_arena.lookup(retire_id, retire_generation + 1) == nullptr);
+    assert(!retire_arena.consume(retire_id, retire_generation, retire_epoch, discharged, &consume_error));
+    assert(consume_error == "stale allocation or representation epoch for consume");
+
+    // 10 §4's "illegal consume": both forms require exclusive ownership, and a
+    // superseded epoch token cannot consume the current representation.
+    vg::core::Arena exclusive_arena;
+    auto& exclusive_backing = exclusive_arena.allocate(32);
+    const uint64_t exclusive_id = exclusive_backing.id;
+    const uint32_t exclusive_generation = exclusive_backing.generation;
+    uint32_t exclusive_epoch = 0;
+    assert(exclusive_arena.transform(exclusive_id, exclusive_generation, &exclusive_epoch));
+    assert(exclusive_arena.acquire(exclusive_id, exclusive_generation));
+    assert(!exclusive_arena.consume_representation(exclusive_id, exclusive_generation, exclusive_epoch,
+                                                   discharged, nullptr, &consume_error));
+    assert(consume_error == "consume requires exclusive ownership");
+    assert(!exclusive_arena.consume(exclusive_id, exclusive_generation, exclusive_epoch, discharged,
+                                    &consume_error));
+    assert(consume_error == "consume requires exclusive ownership");
+    assert(exclusive_arena.release(exclusive_id, exclusive_generation));
+    assert(!exclusive_arena.consume(exclusive_id, exclusive_generation, exclusive_epoch - 1, discharged,
+                                    &consume_error));
+    assert(consume_error == "stale allocation or representation epoch for consume");
+    assert(exclusive_arena.consume(exclusive_id, exclusive_generation, exclusive_epoch, discharged,
+                                   &consume_error));
+  }
+
+  // --- E016 backpressure: "禁止无界创建版本" and "内存不足时可预测失败而非系统
+  // 抖动". A non-zero budget makes transform() refuse with an explicit error
+  // instead of letting versions accumulate; 0 (the default) is unbounded. ---
+  {
+    vg::core::Arena budget_arena;
+    auto& budget_backing = budget_arena.allocate(32);
+    const uint64_t budget_id = budget_backing.id;
+    const uint32_t budget_generation = budget_backing.generation;
+    assert(budget_arena.max_in_flight_representations() == 0);
+    // An allocation starts at 1 live representation -- its own.
+    assert(budget_backing.live_representations == 1);
+
+    std::string budget_error;
+    budget_arena.set_max_in_flight_representations(1);
+    assert(budget_arena.max_in_flight_representations() == 1);
+    // A budget of 1 is already exhausted by the initial representation, so the
+    // first transform is refused predictably rather than blocking.
+    assert(!budget_arena.transform(budget_id, budget_generation, nullptr, &budget_error));
+    assert(budget_error == "in-flight representation budget exceeded");
+    assert(budget_arena.lookup(budget_id, budget_generation)->representation_epoch == 0);
+
+    budget_arena.set_max_in_flight_representations(2);
+    uint32_t budget_epoch = 0;
+    assert(budget_arena.transform(budget_id, budget_generation, &budget_epoch) && budget_epoch == 1);
+    assert(budget_arena.lookup(budget_id, budget_generation)->live_representations == 2);
+    // A second transform is refused until a version is released.
+    assert(!budget_arena.transform(budget_id, budget_generation, nullptr, &budget_error));
+    assert(budget_error == "in-flight representation budget exceeded");
+    assert(budget_arena.release_representation(budget_id, budget_generation, &budget_error));
+    assert(budget_arena.lookup(budget_id, budget_generation)->live_representations == 1);
+    assert(budget_arena.transform(budget_id, budget_generation, &budget_epoch) && budget_epoch == 2);
+
+    // release_representation() never drops the last version: an Active
+    // allocation always retains its current representation.
+    assert(budget_arena.release_representation(budget_id, budget_generation, &budget_error));
+    assert(budget_arena.lookup(budget_id, budget_generation)->live_representations == 1);
+    assert(!budget_arena.release_representation(budget_id, budget_generation, &budget_error));
+    assert(budget_error == "an active allocation always retains its current representation");
+    // A stale token cannot release a version either.
+    assert(!budget_arena.release_representation(budget_id, budget_generation + 1, &budget_error));
+    assert(budget_error == "stale allocation for representation release");
+
+    // Back to unbounded: the budget is a policy input, not a property of the
+    // allocation.
+    budget_arena.set_max_in_flight_representations(0);
+    assert(budget_arena.transform(budget_id, budget_generation, &budget_epoch) && budget_epoch == 3);
+    assert(budget_arena.transform(budget_id, budget_generation, &budget_epoch) && budget_epoch == 4);
+    assert(budget_arena.lookup(budget_id, budget_generation)->live_representations == 3);
+  }
+
+  // --- FacetPool::snapshot_generations()/generation_valid() (06 §6.4): a
+  // shader cannot call lookup(), so the checked profile uploads a table and
+  // the kernel compares against it. generation_valid() is the host-side mirror
+  // of that in-shader comparison and is deliberately *weaker* than lookup():
+  // it sees only what the table encodes, so it cannot observe an epoch that
+  // went stale, which is why the host-side lookup() stays authoritative. ---
+  {
+    vg::core::Arena table_arena;
+    auto& table_backing = table_arena.allocate(256);
+    const uint64_t table_id = table_backing.id;
+    const uint32_t table_generation = table_backing.generation;
+
+    vg::core::CanonicalView view;
+    view.allocation = table_id;
+    view.allocation_generation = table_generation;
+    view.width = 4;
+    view.height = 4;
+
+    vg::core::FacetPool table_pool;
+    vg::core::FacetRef live_ref;
+    std::string table_error;
+    assert(table_pool.acquire(table_arena, view, vg::core::FacetKind::Sample, &live_ref, &table_error));
+
+    std::vector<uint32_t> table;
+    table_pool.snapshot_generations(&table);
+    assert(table.size() == table_pool.slot_count());
+    assert(table.size() == 1);
+    assert(table[live_ref.index] == live_ref.generation);
+    assert(table_pool.generation_valid(live_ref));
+
+    // A representation transform stales the token host-side...
+    uint32_t table_epoch = 0;
+    assert(table_arena.transform(table_id, table_generation, &table_epoch));
+    vg::core::FacetStatus status = vg::core::FacetStatus::Ok;
+    assert(table_pool.lookup(table_arena, live_ref, &status) == nullptr);
+    assert(status == vg::core::FacetStatus::EpochStale);
+    // ...but the uploaded table encodes only the slot's generation, so a
+    // freshly pulled snapshot still shows the slot live and generation_valid()
+    // -- the in-shader verdict -- still accepts the token. This is the exact
+    // gap that makes lookup() authoritative rather than redundant.
+    table_pool.snapshot_generations(&table);
+    assert(table[live_ref.index] == live_ref.generation);
+    assert(table_pool.generation_valid(live_ref));
+
+    // Retirement is what the table *can* see: retire_stale() sweeps the
+    // epoch-stale slot, and only then does the entry read 0 and the in-shader
+    // check reject.
+    assert(table_pool.retire_stale(table_arena) == 1);
+    table_pool.snapshot_generations(&table);
+    assert(table[live_ref.index] == 0);
+    assert(!table_pool.generation_valid(live_ref));
+
+    // A recycled index carries a bumped generation, so the old token is
+    // rejected by the table while the new one is accepted -- the
+    // index+generation discipline the shader relies on.
+    vg::core::FacetRef recycled;
+    assert(table_pool.acquire(table_arena, view, vg::core::FacetKind::Sample, &recycled, &table_error));
+    assert(recycled.index == live_ref.index);
+    assert(recycled.generation != live_ref.generation);
+    table_pool.snapshot_generations(&table);
+    assert(table[recycled.index] == recycled.generation);
+    assert(table_pool.generation_valid(recycled));
+    assert(!table_pool.generation_valid(live_ref));
+
+    // A forged index is out of the table's range and rejected by both.
+    const vg::core::FacetRef forged{9999, 1};
+    assert(!table_pool.generation_valid(forged));
+    assert(table_pool.lookup(table_arena, forged, &status) == nullptr);
+    assert(status == vg::core::FacetStatus::UnknownIndex);
+  }
+
+  // --- Stage 5 (03 §7) end to end on the reference backend, driven through
+  // the device's own FacetPool (06 §2 places the pool inside the adapter).
+  //
+  // Note the ordering constraint this pins: Stage 5 runs *before* the
+  // interpreter, so it publishes a new RepresentationEpoch that the module's
+  // own instructions are then resolved against. A module compiled against the
+  // superseded epoch is stale afterwards -- 02 §8's "transform 不是纯 barrier"
+  // reaching all the way down to instruction resolution -- so the plan here
+  // declares the epoch the transform will publish. The stale case is asserted
+  // separately below rather than avoided.
+  //
+  // ConsumeInput is refused at compile() time on this backend, honestly and
+  // with a named reason: its transform is the identity, so no backing is
+  // superseded and there is nothing a consume could release. ---
+  {
+    vg::core::Arena stage_arena;
+    auto& stage_backing = stage_arena.allocate(256);
+    const uint64_t stage_id = stage_backing.id;
+    const uint32_t stage_generation = stage_backing.generation;
+
+    auto stage_module = vg::compiler::compile_c_like("@node @effects store(1,0,4,7)");
+    assert(stage_module.ok);
+    stage_module.module.instructions[0].allocation = stage_id;
+    stage_module.module.instructions[0].generation = stage_generation;
+    stage_module.module.instructions[0].representation_epoch = 1;
+    stage_module.module.declared_effects[0].allocation = stage_id;
+    stage_module.module.declared_effects[0].representation_epoch = 1;
+    stage_module.module.canonical_json = vg::ir::serialize_module(stage_module.module);
+
+    auto stage_device = vg::reference::make_device_hal();
+    assert(stage_device->capabilities().supports(vg::hal::Capability::RepresentationTransform));
+    assert(stage_device->capabilities().supports(vg::hal::Capability::CheckedFacetGeneration));
+
+    vg::core::CanonicalView stage_view;
+    stage_view.allocation = stage_id;
+    stage_view.allocation_generation = stage_generation;
+    stage_view.width = 4;
+    stage_view.height = 4;
+    assert(stage_view.byte_size() == 64);
+
+    vg::hal::RepresentationRequest request;
+    request.view = stage_view;
+    request.target_kind = vg::core::FacetKind::Sample;
+
+    vg::hal::ExecutionPlan stage_plan;
+    stage_plan.capabilities = stage_device->capabilities();
+    stage_plan.module = stage_module.module;
+    stage_plan.published = true;
+    stage_plan.representation_requests.push_back(request);
+
+    vg::hal::CompiledPlan stage_compiled;
+    std::string stage_error;
+    assert(stage_device->compile(stage_plan, &stage_compiled, &stage_error));
+    assert(stage_compiled.representation_supported);
+    assert(stage_compiled.report.supported);
+
+    vg::hal::Submission stage_submission;
+    assert(stage_device->submit(stage_compiled, stage_arena, &stage_submission, &stage_error));
+    assert(stage_submission.result.ok);
+    // Stage 5 sealed a RepresentationEpoch and published exactly one target
+    // facet, which still resolves against the epoch the transform published.
+    assert(stage_submission.representation_epoch.sealed());
+    assert(stage_submission.representation_facets.size() == 1);
+    const vg::core::FacetRef stage_facet = stage_submission.representation_facets[0];
+    assert(stage_submission.representation_epoch.contains(stage_facet));
+    const auto* stage_slot = stage_device->facet_pool().lookup(stage_arena, stage_facet);
+    assert(stage_slot != nullptr);
+    assert(stage_slot->kind == vg::core::FacetKind::Sample);
+    assert(stage_slot->representation_epoch == 1);
+    assert(stage_arena.lookup(stage_id, stage_generation)->representation_epoch == 1);
+    // 06 §11's peak-memory report: the superseded backing is counted whether
+    // or not it is released, and nothing was released here.
+    assert(stage_submission.old_backing_bytes == 256);
+    assert(stage_submission.new_backing_bytes == stage_view.byte_size());
+    assert(stage_submission.temporary_bytes == 0);
+    assert(stage_submission.released_backing_bytes == 0);
+    assert(stage_submission.consumed_allocation_count == 0);
+    assert(stage_submission.completion_delay_ns == 0);
+
+    // ConsumeInput: rejected at compile(), with representation_supported
+    // false, an Unsupported lowering event and a reason -- never accepted and
+    // quietly not performed.
+    vg::hal::ExecutionPlan consume_plan = stage_plan;
+    consume_plan.representation_requests[0].consume_input = true;
+    consume_plan.representation_requests[0].consume_proof = discharged;
+    vg::hal::CompiledPlan consume_compiled;
+    std::string consume_error;
+    assert(!stage_device->compile(consume_plan, &consume_compiled, &consume_error));
+    assert(!consume_compiled.representation_supported);
+    assert(!consume_compiled.report.supported);
+    assert(consume_compiled.report.count(vg::hal::LoweringClass::Unsupported) >= 1);
+    assert(consume_error.find("ConsumeInput is not available on the reference backend") == 0);
+    // ...and submit() refuses an unsupported compile rather than running it.
+    vg::hal::Submission refused_submission;
+    std::string refused_error;
+    assert(!stage_device->submit(consume_compiled, stage_arena, &refused_submission, &refused_error));
+
+    // An incomplete proof is rejected earlier still, by ExecutionPlan::
+    // validate(): the adapter is forbidden from inferring a destructive
+    // transform on its own (06 §11).
+    vg::hal::ExecutionPlan unproven_plan = stage_plan;
+    unproven_plan.representation_requests[0].consume_input = true;
+    vg::hal::CompiledPlan unproven_compiled;
+    std::string unproven_error;
+    assert(!stage_device->compile(unproven_plan, &unproven_compiled, &unproven_error));
+    assert(unproven_error.find("asks for ConsumeInput but its proof is incomplete") != std::string::npos);
+
+    // A Stage 5 target must be a facet a transform can produce: Address and
+    // Transfer name how an existing representation is reached.
+    vg::hal::ExecutionPlan address_plan = stage_plan;
+    address_plan.representation_requests[0].target_kind = vg::core::FacetKind::Address;
+    vg::hal::CompiledPlan address_compiled;
+    std::string address_error;
+    assert(!stage_device->compile(address_plan, &address_compiled, &address_error));
+    assert(address_error.find("must be a Sample, Storage, or Attachment facet") != std::string::npos);
+
+    // Two requests racing one allocation's representation in a single
+    // submission is rejected, not serialized behind the caller's back.
+    vg::hal::ExecutionPlan racing_plan = stage_plan;
+    racing_plan.representation_requests.push_back(request);
+    vg::hal::CompiledPlan racing_compiled;
+    std::string racing_error;
+    assert(!stage_device->compile(racing_plan, &racing_compiled, &racing_error));
+    assert(racing_error.find("must not race two transforms of a single allocation") != std::string::npos);
+
+    // A plan carrying no request runs no Stage 5 at all, so a caller that
+    // never asked cannot be handed a half-filled epoch.
+    vg::hal::ExecutionPlan plain_plan = stage_plan;
+    plain_plan.representation_requests.clear();
+    vg::hal::CompiledPlan plain_compiled;
+    assert(stage_device->compile(plain_plan, &plain_compiled, &stage_error));
+    vg::hal::Submission plain_submission;
+    assert(stage_device->submit(plain_compiled, stage_arena, &plain_submission, &stage_error));
+    assert(plain_submission.result.ok);
+    assert(!plain_submission.representation_epoch.sealed());
+    assert(plain_submission.representation_facets.empty());
+    assert(plain_submission.old_backing_bytes == 0);
+    // The facet the earlier Stage 5 published is untouched by a submission
+    // that transformed nothing.
+    assert(stage_device->facet_pool().lookup(stage_arena, stage_facet) != nullptr);
+
+    // The same plan against a module that still names the pre-transform epoch:
+    // Stage 5 really publishes the new epoch, and the interpreter then refuses
+    // the instruction as stale rather than resolving it against a version the
+    // arena has moved past. submit() still returns true -- host-side
+    // acceptance -- while result.ok reports the execution outcome.
+    vg::core::Arena stale_arena;
+    auto& stale_backing = stale_arena.allocate(256);
+    auto stale_module = stage_module;
+    stale_module.module.instructions[0].allocation = stale_backing.id;
+    stale_module.module.instructions[0].generation = stale_backing.generation;
+    stale_module.module.instructions[0].representation_epoch = 0;
+    stale_module.module.declared_effects[0].allocation = stale_backing.id;
+    stale_module.module.declared_effects[0].representation_epoch = 0;
+    stale_module.module.canonical_json = vg::ir::serialize_module(stale_module.module);
+
+    vg::hal::RepresentationRequest stale_request;
+    stale_request.view = stage_view;
+    stale_request.view.allocation = stale_backing.id;
+    stale_request.view.allocation_generation = stale_backing.generation;
+    stale_request.target_kind = vg::core::FacetKind::Sample;
+
+    vg::hal::ExecutionPlan stale_plan;
+    stale_plan.capabilities = stage_device->capabilities();
+    stale_plan.module = stale_module.module;
+    stale_plan.published = true;
+    stale_plan.representation_requests.push_back(stale_request);
+
+    vg::hal::CompiledPlan stale_compiled;
+    assert(stage_device->compile(stale_plan, &stale_compiled, &stage_error));
+    vg::hal::Submission stale_submission;
+    assert(stage_device->submit(stale_compiled, stale_arena, &stale_submission, &stage_error));
+    assert(!stale_submission.result.ok);
+    assert(stale_submission.result.fault.code == "STALE_OR_BOUNDS");
+    assert(!stale_submission.result.outputs_valid);
+    assert(stale_submission.result.poison == vg::core::PoisonState::Poisoned);
+    // 02 §9: a fault is not a transactional rollback. The transform already
+    // happened, so the sealed epoch and its facet stay reported rather than
+    // being pretended away.
+    assert(stale_submission.representation_epoch.sealed());
+    assert(stale_submission.representation_facets.size() == 1);
+    assert(stale_arena.lookup(stale_backing.id, stale_backing.generation)->representation_epoch == 1);
   }
 
   return 0;

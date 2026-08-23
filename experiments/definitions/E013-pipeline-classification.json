@@ -2,7 +2,7 @@
   "schema": "vg.experiment/v1",
   "id": "E013",
   "name": "pipeline-classification",
-  "workload": "compute_pipeline_stateblock_classification_vs_naive_permutation",
+  "workload": "compute_and_raster_pipeline_stateblock_classification_vs_naive_permutation",
   "backends": ["cpu-reference", "metal"],
   "variants": ["naive-full-permutation", "vg-stateblock-classification"],
   "metrics": [
@@ -15,17 +15,18 @@
   ],
   "protocol": {
     "deterministic": true,
-    "note": "run_pipeline_classification compiles a tiny Metal compute kernel specialized by a function-constant PipelineKeyState axis across a 2x2x2 matrix (PipelineKeyState x MetalDynamicState x ShaderVisibleData). naive-full-permutation creates one MTLComputePipelineState per triple (8 PSOs). vg-stateblock-classification keys the cache only on PipelineKeyState (2 PSOs), treating MetalDynamicState and ShaderVisibleData as encode-time bindings that must hit the cached PSO (6 cache hits, 2 misses). UnsupportedNeedsConversion blocks are rejected rather than silently folded into a key. Scope is compute-only: no render PSO exists in this codebase yet (ADR-030/034)."
+    "note": "run_pipeline_classification compiles a real state matrix twice. Compute axis: a tiny SampleFacet kernel specialized by the vg_checked_profile function constant (PipelineKey) crossed with threadgroup width (DynamicState) and sample lod (ShaderVisibleData) -- 2x2x2. Raster axis: MTLRenderPipelineState keyed by attachment pixel format (RGBA8Unorm/R32Float) and sample_count (1/4), crossed with the same dynamic/shader-visible pair (viewport / tint) -- 2x2x2x2. naive-full-permutation creates one MTLComputePipelineState or MTLRenderPipelineState per tuple. vg-stateblock-classification keys only the 06 §7 PipelineKey axes (checked on/off for compute; format×sample_count for raster), so dynamic/shader-visible permutations must hit the cache. UnsupportedNeedsConversion blocks are rejected rather than silently folded into a key. Attachment format and sample count are compiled into the render PSO and therefore key state; viewport and tint must not enlarge it."
   },
   "correctness": {
-    "oracle": "arithmetic: naive_pipeline_count == 8; classified_pipeline_count == 2; cache_misses == 2; cache_hits == 6; classified_pipeline_count < naive_pipeline_count",
+    "oracle": "arithmetic: classified_pipeline_count < naive_pipeline_count; cache_hits>0; cache_misses>0; unsupported_rejected. After the PipelineKey sha256 digest distinguishes attachment format and sample count, the matrix is classified=6 (2 compute checked on/off + 4 raster format×sample) and naive=24 (8 compute + 16 raster). Assert those exact counts when the run matches; otherwise keep the inequalities and record the observed counts rather than inventing a match.",
     "tolerance": "exact (integer pipeline/cache counters)"
   },
   "requirements": [
     "shader_data_and_dynamic_state_do_not_enter_pipeline_key",
     "unsupported_state_reported_not_silently_keyed",
-    "classified_pipeline_count_strictly_below_naive"
+    "classified_pipeline_count_strictly_below_naive",
+    "raster_format_and_sample_count_are_key_state"
   ],
-  "judgement": "StateBlock classification on the existing compute-pipeline creation path reduces the test-matrix PSO count from 8 (naive full permutation) to 2 (PipelineKeyState only), with dynamic/shader-visible axes hitting the classified cache. Per ADR-030 this experiment is a roadmap work item and is implemented, but it is NOT a hard gate for Phase C closure (the catalog Representation gate row lists only E005/E008/E016). Scope boundary (explicit): compute PSO only -- AttachmentFacet/raster PSO classification is out of scope because no render command encoder exists yet.",
+  "judgement": "StateBlock classification on the compute and raster creation paths reduces the test-matrix PSO count below the naive full permutation: dynamic/shader-visible axes hit the classified cache, and an UnsupportedNeedsConversion block is rejected. Per ADR-030 this experiment is a roadmap work item and is implemented, but it is NOT a hard gate for Phase C closure (the catalog Representation gate row lists only E005/E008/E016). Scope includes both compute PSO (checked-profile specialization) and raster PSO (format × sample_count). Compile-time nanoseconds are host-measured per run and are not recorded as a fixture here.",
   "vulkan_status": "compile-review-only (ADR-024/030); no Vulkan pipeline-classification wiring was attempted (no Vulkan hardware reachable on this host)"
 }

@@ -41,6 +41,84 @@ bool GraphEpochBuilder::seal(GraphEpoch* out, std::string* error) {
   return true;
 }
 
+const char* ConsumeProof::first_unmet() const {
+  if (!envelope_complete) return "old envelope has not completed";
+  if (!no_external_references) return "an external reference to the old representation still exists";
+  if (!no_replay_required) return "the old representation may still be replayed";
+  if (!failure_semantics_accepted) return "destructive-failure semantics were not accepted";
+  return nullptr;
+}
+
+bool RepresentationEpoch::contains(RepresentationRef reference) const {
+  return std::any_of(representations_.begin(), representations_.end(), [&](RepresentationRef candidate) {
+    return candidate.allocation == reference.allocation &&
+           candidate.allocation_generation == reference.allocation_generation &&
+           candidate.representation_epoch == reference.representation_epoch;
+  });
+}
+
+bool RepresentationEpoch::contains(FacetRef ref) const {
+  return std::any_of(facets_.begin(), facets_.end(), [&](FacetRef candidate) {
+    return candidate.index == ref.index && candidate.generation == ref.generation;
+  });
+}
+
+bool RepresentationEpoch::stale(const Arena& arena) const {
+  return std::any_of(representations_.begin(), representations_.end(), [&](RepresentationRef reference) {
+    return arena.lookup(reference.allocation, reference.allocation_generation,
+                        reference.representation_epoch) == nullptr;
+  });
+}
+
+bool RepresentationEpochBuilder::add_representation(RepresentationRef reference, std::string* error) {
+  if (sealed_) { if (error) *error = "representation epoch is sealed"; return false; }
+  if (reference.allocation_generation == 0) {
+    if (error) *error = "representation reference generation must be non-zero";
+    return false;
+  }
+  if (std::any_of(representations_.begin(), representations_.end(), [&](RepresentationRef candidate) {
+        return candidate.allocation == reference.allocation &&
+               candidate.allocation_generation == reference.allocation_generation &&
+               candidate.representation_epoch == reference.representation_epoch;
+      })) return true;
+  representations_.push_back(reference);
+  return true;
+}
+
+bool RepresentationEpochBuilder::add_representation(const Arena& arena, uint64_t allocation,
+                                                    uint32_t generation, std::string* error) {
+  const auto* record = arena.lookup(allocation, generation);
+  if (record == nullptr) {
+    if (error) *error = "representation reference is not active in arena";
+    return false;
+  }
+  if (arena_ == nullptr) arena_ = &arena;
+  return add_representation({allocation, generation, record->representation_epoch}, error);
+}
+
+bool RepresentationEpochBuilder::add_facet(const Arena& arena, const FacetPool& pool, FacetRef ref,
+                                           std::string* error) {
+  FacetStatus status = FacetStatus::Ok;
+  const FacetSlot* slot = pool.lookup(arena, ref, &status);
+  if (slot == nullptr) { if (error) *error = to_string(status); return false; }
+  if (!add_representation(arena, slot->view.allocation, slot->view.allocation_generation, error)) return false;
+  if (!std::any_of(facets_.begin(), facets_.end(), [&](FacetRef candidate) {
+        return candidate.index == ref.index && candidate.generation == ref.generation;
+      })) facets_.push_back(ref);
+  return true;
+}
+
+bool RepresentationEpochBuilder::seal(RepresentationEpoch* out, std::string* error) {
+  if (out == nullptr) { if (error) *error = "representation epoch output is required"; return false; }
+  if (sealed_) { if (error) *error = "representation epoch builder is already sealed"; return false; }
+  out->value_ = arena_ != nullptr ? arena_->representation_clock() : next_epoch_;
+  out->representations_ = representations_;
+  out->facets_ = facets_;
+  out->sealed_ = true;
+  sealed_ = true;
+  return true;
+}
+
 namespace {
 bool pointer_ref_equal(PointerRef a, PointerRef b) { return a.allocation == b.allocation && a.generation == b.generation; }
 }
@@ -233,7 +311,14 @@ bool Arena::transform(uint64_t id, uint32_t generation, uint32_t* new_epoch, std
   auto* allocation = lookup(id, generation);
   if (allocation == nullptr) { if (error) *error = "stale allocation for representation transform"; return false; }
   if (allocation->in_flight != 0) { if (error) *error = "representation epoch is referenced in flight"; return false; }
+  if (max_in_flight_representations_ != 0 &&
+      allocation->live_representations >= max_in_flight_representations_) {
+    if (error) *error = "in-flight representation budget exceeded";
+    return false;
+  }
   ++allocation->representation_epoch;
+  ++allocation->live_representations;
+  ++representation_clock_;
   if (new_epoch != nullptr) *new_epoch = allocation->representation_epoch;
   return true;
 }
@@ -243,13 +328,119 @@ bool Arena::transform(uint64_t id, uint32_t generation, uint32_t expected_epoch,
   return transform(id, generation, new_epoch, error);
 }
 
-bool Arena::consume(uint64_t id, uint32_t generation, uint32_t expected_epoch, std::string* error) {
+bool Arena::release_representation(uint64_t id, uint32_t generation, std::string* error) {
+  auto* allocation = lookup(id, generation);
+  if (allocation == nullptr) { if (error) *error = "stale allocation for representation release"; return false; }
+  if (allocation->live_representations <= 1) {
+    if (error) *error = "an active allocation always retains its current representation";
+    return false;
+  }
+  --allocation->live_representations;
+  ++representation_clock_;
+  return true;
+}
+
+bool Arena::consume_representation(uint64_t id, uint32_t generation, uint32_t expected_epoch,
+                                   const ConsumeProof& proof, uint64_t* released_bytes,
+                                   std::string* error) {
+  if (const char* unmet = proof.first_unmet()) {
+    if (error) *error = std::string("ConsumeInput proof incomplete: ") + unmet;
+    return false;
+  }
+  auto* allocation = lookup(id, generation, expected_epoch);
+  if (allocation == nullptr) {
+    if (error) *error = "stale allocation or representation epoch for consume";
+    return false;
+  }
+  if (allocation->in_flight != 0) { if (error) *error = "consume requires exclusive ownership"; return false; }
+  const uint64_t released = allocation->bytes.size();
+  allocation->bytes.clear();
+  allocation->bytes.shrink_to_fit();
+  allocation->live_representations = 1;
+  ++representation_clock_;
+  if (released_bytes != nullptr) *released_bytes = released;
+  return true;
+}
+
+bool Arena::consume(uint64_t id, uint32_t generation, uint32_t expected_epoch, const ConsumeProof& proof,
+                    std::string* error) {
+  if (const char* unmet = proof.first_unmet()) {
+    if (error) *error = std::string("ConsumeInput proof incomplete: ") + unmet;
+    return false;
+  }
   auto* allocation = lookup(id, generation, expected_epoch);
   if (allocation == nullptr) { if (error) *error = "stale allocation or representation epoch for consume"; return false; }
   if (allocation->in_flight != 0) { if (error) *error = "consume requires exclusive ownership"; return false; }
   allocation->state = ObjectState::Retired;
   ++allocation->generation;
+  allocation->live_representations = 0;
+  // The point of ConsumeInput is that the old backing stops costing memory, so
+  // the bytes are actually returned rather than left behind under a retired
+  // handle -- that is the watermark E005 measures.
+  allocation->bytes.clear();
+  allocation->bytes.shrink_to_fit();
   ++topology_epoch_;
+  ++representation_clock_;
+  return true;
+}
+
+uint32_t bytes_per_texel(PixelFormat format) {
+  switch (format) {
+    case PixelFormat::RGBA8Unorm: return 4;
+    case PixelFormat::R32Float: return 4;
+  }
+  return 0;
+}
+
+uint32_t CanonicalView::mip_width(uint32_t level) const {
+  return std::max<uint32_t>(1, width >> level);
+}
+
+uint32_t CanonicalView::mip_height(uint32_t level) const {
+  return std::max<uint32_t>(1, height >> level);
+}
+
+uint64_t CanonicalView::bytes_per_row(uint32_t level) const {
+  return static_cast<uint64_t>(mip_width(level)) * bytes_per_texel(format);
+}
+
+uint64_t CanonicalView::subresource_byte_size(uint32_t level) const {
+  return bytes_per_row(level) * mip_height(level);
+}
+
+uint64_t CanonicalView::subresource_byte_offset(uint32_t layer, uint32_t level) const {
+  uint64_t layer_bytes = 0;
+  for (uint32_t candidate = 0; candidate < mip_levels; ++candidate) {
+    layer_bytes += subresource_byte_size(candidate);
+  }
+  uint64_t offset = layer_bytes * layer;
+  for (uint32_t candidate = 0; candidate < level; ++candidate) {
+    offset += subresource_byte_size(candidate);
+  }
+  return offset;
+}
+
+uint64_t CanonicalView::byte_size() const {
+  return subresource_byte_offset(array_layers, 0);
+}
+
+bool CanonicalView::valid(std::string* error) const {
+  const auto fail = [error](const char* reason) {
+    if (error) *error = reason;
+    return false;
+  };
+  if (width == 0 || height == 0) return fail("canonical view extent must be non-zero");
+  if (array_layers == 0) return fail("canonical view must name at least one array layer");
+  if (mip_levels == 0) return fail("canonical view must name at least one mip level");
+  if (dimension == ViewDimension::Texture2D && array_layers != 1) {
+    return fail("Texture2D canonical view cannot name multiple array layers");
+  }
+  // A level whose predecessor already reached 1x1 would alias it rather than
+  // describe new texels, so a chain longer than the extent supports is a
+  // malformed contract, not something to clamp.
+  uint32_t deepest = 1;
+  while (mip_width(deepest - 1) > 1 || mip_height(deepest - 1) > 1) ++deepest;
+  if (mip_levels > deepest) return fail("canonical view mip chain is longer than its extent supports");
   return true;
 }
 
@@ -268,8 +459,13 @@ const char* to_string(FacetStatus status) {
 bool FacetPool::acquire(const Arena& arena, const CanonicalView& view, FacetKind kind, FacetRef* out,
                         std::string* error) {
   if (out == nullptr) { if (error) *error = "facet ref output is required"; return false; }
+  if (!view.valid(error)) return false;
   const auto* allocation = arena.lookup(view.allocation, view.allocation_generation);
   if (allocation == nullptr) { if (error) *error = "canonical view allocation is not active in arena"; return false; }
+  if (allocation->size < view.byte_size()) {
+    if (error) *error = "canonical view describes more texels than its allocation backs";
+    return false;
+  }
   FacetSlot slot;
   slot.active = true;
   slot.kind = kind;
@@ -359,6 +555,19 @@ uint32_t FacetPool::in_flight(FacetRef ref) const {
   if (ref.index >= slots_.size()) return 0;
   const FacetSlot& slot = slots_[ref.index];
   return slot.in_flight_generation == ref.generation ? slot.in_flight : 0;
+}
+
+void FacetPool::snapshot_generations(std::vector<uint32_t>* out) const {
+  if (out == nullptr) return;
+  out->clear();
+  out->reserve(slots_.size());
+  for (const FacetSlot& slot : slots_) out->push_back(slot.active ? slot.generation : 0);
+}
+
+bool FacetPool::generation_valid(FacetRef ref) const {
+  if (ref.index >= slots_.size()) return false;
+  const FacetSlot& slot = slots_[ref.index];
+  return slot.active && slot.generation == ref.generation;
 }
 
 void FacetPool::retire_slot(uint32_t index) {
