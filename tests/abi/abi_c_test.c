@@ -12,6 +12,14 @@ _Static_assert(sizeof(VgFacetRef) == 8, "VgFacetRef is a 64-bit capability token
 _Static_assert(_Alignof(VgFacetRef) == 4, "VgFacetRef must not gain padding");
 _Static_assert(offsetof(VgFacetRef, index) == 0, "VgFacetRef.index must be first");
 _Static_assert(offsetof(VgFacetRef, generation) == 4, "VgFacetRef.generation follows index");
+_Static_assert(offsetof(VgRegionDesc, header) == 0, "header must be first");
+_Static_assert(offsetof(VgRegionDesc, byte_offset) == offsetof(VgRegionDesc, allocation) + sizeof(VgAllocation),
+               "VgRegionDesc byte_offset follows allocation with no padding");
+_Static_assert(sizeof(((VgRegionDesc*)0)->shape) == 32, "VgRegionDesc.shape is 4 x uint64");
+_Static_assert(sizeof(((VgRegionDesc*)0)->strides) == 32, "VgRegionDesc.strides is 4 x uint64");
+_Static_assert(offsetof(VgRegionDesc, rank) == offsetof(VgRegionDesc, layout_class) + 4,
+               "VgRegionDesc.rank follows layout_class");
+_Static_assert(sizeof(VgRegionDesc) % 8 == 0, "VgRegionDesc must stay 8-byte aligned for capture ABI");
 
 static unsigned g_logs;
 static void VG_CALL log_callback(void* user, uint32_t severity, uint32_t category, const char* message) {

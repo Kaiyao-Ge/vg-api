@@ -69,6 +69,46 @@ std::string cull_compact_metal_source();
 // and is not wired into any Vulkan dispatch call.
 std::string cull_compact_vulkan_source();
 
+// Binding ABI shared by every sample-facet kernel below, declared here so the
+// Metal backend and the vertical-slice tests bind the same slots without
+// re-deriving them from the emitted MSL text. Buffer indices 0/1 keep their
+// historical meaning (uv coordinates, float4 output); everything added for
+// explicit LOD, array slices and the 06 §6.4 generation guard occupies
+// strictly higher indices. Index 3 (array slices) is only present in
+// sample_facet_array_metal_source(); the 2D kernel leaves that slot unused
+// rather than renumbering the shared table.
+constexpr uint32_t kSampleFacetTextureIndex = 0;
+constexpr uint32_t kSampleFacetSamplerIndex = 0;
+constexpr uint32_t kSampleFacetUvBufferIndex = 0;
+constexpr uint32_t kSampleFacetOutputBufferIndex = 1;
+constexpr uint32_t kSampleFacetLodBufferIndex = 2;
+constexpr uint32_t kSampleFacetArraySliceBufferIndex = 3;
+constexpr uint32_t kSampleFacetTokenBufferIndex = 4;
+constexpr uint32_t kSampleFacetGenerationTableBufferIndex = 5;
+constexpr uint32_t kSampleFacetSlotCountBufferIndex = 6;
+constexpr uint32_t kSampleFacetViolationCounterBufferIndex = 7;
+
+// 03 §12: a profile changes instrumentation, never meaning. The facet-
+// generation guard 06 §6.4 requires ("checked profile 在 shader 中验证
+// generation") is therefore gated on an MSL function constant / GLSL
+// specialization constant rather than a uniform branch, so a `fast-native`
+// pipeline compiles the guard, its four extra bindings and its atomic away
+// entirely and pays nothing for a check it did not ask for. A pipeline that
+// leaves the constant undefined behaves exactly like `fast-native`: the
+// kernels use is_function_constant_defined() so an unset constant means
+// "guard off", never a pipeline compile failure.
+constexpr uint32_t kFacetCheckedProfileFunctionConstant = 0;
+
+// Written to every channel of the failing thread's output slot when the
+// checked-profile guard rejects the facet token. Chosen finite (not NaN) so
+// it survives readback and byte-comparison unchanged, and far outside the
+// range any format this project samples can produce -- RGBA8Unorm yields
+// [0,1] and the R32Float fixtures are small integers -- so a poisoned slot
+// can never be confused with a legitimately sampled value. A poisoned
+// thread does not sample at all, matching 02's rule that a rejected access
+// produces poison rather than a plausible-looking substitute.
+constexpr float kFacetGenerationPoisonValue = -3.0e38f;
+
 // Standalone SampleFacet readback kernel, same "independent hand-written
 // kernel + dedicated pipeline" precedent as cull_compact_metal_source()
 // above -- texture/sampler binding is a different resource class than the
@@ -76,19 +116,97 @@ std::string cull_compact_vulkan_source();
 // is backend-private infrastructure rather than a new IR opcode with a
 // single consumer.
 // One thread per uv coordinate: samples `tex` at `uv_coords[gid]` through
-// `samp` and writes the result to `output[gid]` as a float4, so a host-side
-// readback can compare it against the reference CPU oracle
-// (reference::sample_facet). The MTLSamplerState itself (filter/wrap mode)
-// is configured host-side when the sampler is created, not by this kernel.
+// `samp` at the explicit level(lod) taken from buffer(2) and writes the
+// result to `output[gid]` as a float4, so a host-side readback can compare
+// it against the reference CPU oracle (reference::sample_facet). The
+// MTLSamplerState itself (filter/wrap mode) is configured host-side when the
+// sampler is created, not by this kernel. LOD is explicit because a compute
+// kernel has no implicit derivatives -- with lod == 0 this samples exactly
+// what the pre-mip version of this kernel sampled, so the existing Metal
+// vertical-slice oracle comparison is unaffected; a non-zero lod is what
+// gives E008's "2D/array/mip" input axis a real mip path instead of a
+// silently level-0-only one.
+// Under the checked profile (kFacetCheckedProfileFunctionConstant) the
+// kernel first validates the caller's facet token against the host-supplied
+// generation table: `index < slot_count && table[index] != 0 &&
+// table[index] == generation`, i.e. exactly core::FacetPool's own
+// generation_valid() predicate evaluated on the GPU. A thread that fails it
+// does not sample; it writes kFacetGenerationPoisonValue to its output slot
+// and atomically increments the violation counter at buffer(7), so the host
+// can prove the shader itself rejected a stale token rather than inferring
+// it from a suspicious-looking sampled value.
 std::string sample_facet_metal_source();
+// texture2d_array<float> analogue of sample_facet_metal_source(), taking a
+// per-coordinate `array_slices[gid]` at buffer(3) in addition to the shared
+// uv/lod inputs. It exists so CanonicalView's Texture2DArray dimension has a
+// real sampling path (E008 explicitly lists array inputs) instead of being
+// rejected by the backend for want of a kernel -- a rejection would have been
+// an honest but avoidable Unsupported, and 05 §9 asks facet lowering to reach
+// the specialized hardware unit, not to narrow what the unified Region can
+// express. Same checked-profile guard, same poison value, same violation
+// counter as the 2D kernel.
+std::string sample_facet_array_metal_source();
 // GLSL analogue of sample_facet_metal_source(). Deliberately NOT
 // buffer_reference/push-constant-addressed like the other *_vulkan_source()
 // functions above -- combined image samplers are always descriptor-set
 // bound in Vulkan regardless of BDA use elsewhere, so a push-constant-only
-// scheme cannot express this kernel's inputs honestly. Compile-review-only
-// on this project (no Vulkan hardware reachable here); not wired into any
-// Vulkan dispatch call.
+// scheme cannot express this kernel's inputs honestly. The generation guard
+// is gated on a `layout(constant_id = 0)` specialization constant, the GLSL
+// equivalent of the MSL function constant, and defaults to false so an
+// unspecialized module is the fast-native shape. Compile-review-only on this
+// project (no Vulkan hardware reachable here); not wired into any Vulkan
+// dispatch call.
 std::string sample_facet_vulkan_source();
+// GLSL analogue of sample_facet_array_metal_source(), sampler2DArray-based.
+// Compile-review-only on this project (no Vulkan hardware reachable here);
+// not wired into any Vulkan dispatch call.
+std::string sample_facet_array_vulkan_source();
+
+// Binding ABI of the basic raster pair below. Metal keeps a separate binding
+// table per stage, so vertex buffer(0) and fragment buffer(0) are different
+// slots and both may legitimately be index 0.
+constexpr uint32_t kRasterVertexBufferIndex = 0;
+constexpr uint32_t kRasterTintBufferIndex = 0;
+constexpr uint32_t kRasterTextureIndex = 0;
+constexpr uint32_t kRasterSamplerIndex = 0;
+
+// Phase C basic raster path: the minimal vertex+fragment pair that lowers
+// 05 §9's `region.attachment.store` onto a real Metal render attachment
+// (06 §6.3), giving the software-rasterizer oracle a GPU counterpart to be
+// compared against instead of a semantics-only reference.
+// Vertex stage `vg_raster_vertex` reads an interleaved
+// `struct { float2 position; float2 uv; }` array (clip-space position in
+// [-1,1], uv in [0,1]) from a `device` buffer at vertex buffer(0), indexed
+// by [[vertex_id]]. Deliberately no [[stage_in]] / MTLVertexDescriptor on
+// the vertex *input* side: pointer-indexed root data is this project's
+// addressing philosophy (04 §8, 06 §5), it keeps vertex layout out of the
+// pipeline cache key (06 §7), and it spares the host an entire vertex-
+// descriptor object. Fragment varyings still arrive via [[stage_in]] --
+// interpolation is a fixed-function stage interface, not a resource binding,
+// and there is no pointer-shaped way to express it.
+// Fragment stage `vg_raster_fragment` samples `texture(0)` through
+// `sampler(0)`, multiplies by the per-draw `float4` tint at fragment
+// buffer(0), and returns it through a struct member tagged [[color(0)]].
+// Deliberately out of scope: depth/stencil, blending, MSAA resolve and
+// instancing -- 06 §7's raster-state-in-key question is answered by
+// pipeline_classification.h, not by growing this shader.
+std::string raster_facet_metal_source();
+// GLSL analogue of raster_facet_metal_source(). Both stages live in one
+// string guarded by VG_RASTER_VERTEX_STAGE / VG_RASTER_FRAGMENT_STAGE,
+// because a GLSL translation unit has exactly one entry point and this
+// project's *_source() functions return exactly one string; the host
+// compiles it twice with the matching define and --stage. Like
+// sample_facet_vulkan_source() the combined image sampler is descriptor-set
+// bound rather than BDA-addressed, and the tint is a plain uniform block for
+// the same reason. The vertex array is declared as `vec4[]` (xy = clip
+// position, zw = uv), which is the identical 16-byte stride std430 gives the
+// two-vec2 struct, so host data is byte-compatible with the MSL side.
+// Honest discrepancy, not compensated here: Vulkan's clip space has +Y
+// pointing down where Metal's points up, so identical vertex data draws
+// vertically mirrored between the two backends unless the host flips the
+// viewport. Compile-review-only on this project (no Vulkan hardware
+// reachable here); not wired into any Vulkan draw call.
+std::string raster_facet_vulkan_source();
 
 // TASK-B15 (E002): typed pointer graph. Only load_ref/load_via/store_via.
 // This is the CachedObject lowering (ADR-028): a load_via/store_via's

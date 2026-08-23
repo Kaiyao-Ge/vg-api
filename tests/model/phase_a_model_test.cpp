@@ -54,7 +54,8 @@ int main() {
       assert(arena.transform(id, generation, nullptr));
       const auto* current = arena.lookup(id, generation);
       assert(current != nullptr);
-      assert(arena.consume(id, generation, current->representation_epoch, &error));
+      assert(arena.consume(id, generation, current->representation_epoch,
+                           vg::core::ConsumeProof{true, true, true, true}, &error));
       assert(arena.lookup(id, generation) == nullptr);
     }
   }

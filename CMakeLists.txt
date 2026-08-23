@@ -52,7 +52,11 @@ target_compile_features(vg_capture PUBLIC cxx_std_20)
 target_include_directories(vg_capture PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(vg_capture PUBLIC vg_core vg_ir)
 
-add_library(vg_compiler STATIC src/compiler/compiler.cpp src/compiler/compute_package.cpp)
+add_library(vg_compiler STATIC
+    src/compiler/compiler.cpp
+    src/compiler/compute_package.cpp
+    src/compiler/pipeline_classification.cpp
+)
 target_compile_features(vg_compiler PUBLIC cxx_std_20)
 target_include_directories(vg_compiler PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(vg_compiler PUBLIC vg_ir)
@@ -190,6 +194,17 @@ if(BUILD_TESTING)
   target_compile_features(vg_compute_package_test PRIVATE cxx_std_20)
   add_test(NAME compiler.compute-package COMMAND vg_compute_package_test)
 
+  # pipeline_classification lives in vg_compiler, so this needs nothing else.
+  add_executable(vg_pipeline_classification_test tests/unit/pipeline_classification_test.cpp)
+  target_link_libraries(vg_pipeline_classification_test PRIVATE vg_compiler)
+  target_compile_features(vg_pipeline_classification_test PRIVATE cxx_std_20)
+  add_test(NAME compiler.pipeline-classification COMMAND vg_pipeline_classification_test)
+
+  add_executable(vg_reference_raster_test tests/unit/reference_raster_test.cpp)
+  target_link_libraries(vg_reference_raster_test PRIVATE vg_backend_reference)
+  target_compile_features(vg_reference_raster_test PRIVATE cxx_std_20)
+  add_test(NAME reference.facet-oracles COMMAND vg_reference_raster_test)
+
   add_executable(vg_compute_package_golden_test tests/fixtures/compute_package_golden_test.cpp)
   target_link_libraries(vg_compute_package_golden_test PRIVATE vg_compiler vg_ir)
   target_include_directories(vg_compute_package_golden_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
@@ -245,7 +260,8 @@ if(BUILD_TESTING)
     add_test(NAME vertical-slice.metal COMMAND vg_metal_vertical_slice_test ${CMAKE_CURRENT_SOURCE_DIR})
 
     add_executable(vg_metal_task_timeline_test tests/vertical_slice/metal_task_timeline_test.cpp)
-    target_link_libraries(vg_metal_task_timeline_test PRIVATE vg_backend_metal vg_backend_reference vg_core)
+    target_link_libraries(vg_metal_task_timeline_test PRIVATE vg_backend_metal vg_backend_reference vg_core
+                          vg_capture)
     target_include_directories(vg_metal_task_timeline_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
     target_compile_features(vg_metal_task_timeline_test PRIVATE cxx_std_20)
     add_test(NAME vertical-slice.metal.task-tier0 COMMAND vg_metal_task_timeline_test task-tier0 ${CMAKE_CURRENT_SOURCE_DIR})
@@ -257,6 +273,12 @@ if(BUILD_TESTING)
     add_test(NAME vertical-slice.metal.pointer-graph COMMAND vg_metal_task_timeline_test pointer-graph ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.indexed-binding COMMAND vg_metal_task_timeline_test indexed-binding ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.representation-layer COMMAND vg_metal_task_timeline_test representation-layer ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.metal.sample-facet COMMAND vg_metal_task_timeline_test sample-facet ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.metal.checked-facet-generation COMMAND vg_metal_task_timeline_test checked-facet-generation ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.metal.basic-raster COMMAND vg_metal_task_timeline_test basic-raster ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.metal.pipeline-classification COMMAND vg_metal_task_timeline_test pipeline-classification ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.metal.consume-input COMMAND vg_metal_task_timeline_test consume-input ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.metal.representation-churn COMMAND vg_metal_task_timeline_test representation-churn ${CMAKE_CURRENT_SOURCE_DIR})
 
     # TASK-B17: the Phase B gate runner drives ctest names registered above
     # (vertical-slice.metal.*), so it is only meaningful -- and only

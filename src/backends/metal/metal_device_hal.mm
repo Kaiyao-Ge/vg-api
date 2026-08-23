@@ -1,6 +1,8 @@
 #include "backends/metal/metal_device_hal.h"
 
 #include "backends/reference/reference_executor.h"
+#include "compiler/pipeline_classification.h"
+#include "ir/sha256.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -8,9 +10,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -107,8 +112,21 @@ hal::CapabilitySnapshot make_hal_snapshot(id<MTLDevice> device, DeviceSnapshot* 
   // every Metal device this backend targets supports. So unlike Timeline/
   // IndirectTier1 (genuinely optional hardware features), this bit is set
   // unconditionally, matching EffectDag.
+  //
+  // Raster, RepresentationTransform and CheckedFacetGeneration join it for the
+  // same reason, and are deliberately *not* probed: each is an obligation this
+  // adapter now meets in software, not an optional hardware feature. Raster is
+  // a real MTLRenderPipelineState draw (06 §1 "render attachment 与基础
+  // raster"), RepresentationTransform is a real linear->Private-optimal blit
+  // that publishes a new epoch (02 §8), and CheckedFacetGeneration is the
+  // in-shader generation guard of 06 §6.4 specialized through an MSL function
+  // constant. A device that could not do one of them would have to leave the
+  // bit clear, but every Metal device this backend runs on can do all three.
   uint64_t bits = static_cast<uint64_t>(hal::Capability::EffectDag) |
-                   static_cast<uint64_t>(hal::Capability::TaskPublication);
+                   static_cast<uint64_t>(hal::Capability::TaskPublication) |
+                   static_cast<uint64_t>(hal::Capability::Raster) |
+                   static_cast<uint64_t>(hal::Capability::RepresentationTransform) |
+                   static_cast<uint64_t>(hal::Capability::CheckedFacetGeneration);
   if (shared_events) bits |= static_cast<uint64_t>(hal::Capability::Timeline);
   if (indirect) bits |= static_cast<uint64_t>(hal::Capability::IndirectTier1);
   if (gpu_addresses) bits |= static_cast<uint64_t>(hal::Capability::LinearAddress);
@@ -137,7 +155,10 @@ struct MetalAllocationRecord {
 };
 
 // Keyed by FacetRef index+generation (06 §6.4). Invalidated when the live
-// FacetPool slot's epoch/kind/size/swizzle no longer match.
+// FacetPool slot's epoch/kind/size/swizzle no longer match. 06 §6.1 lists
+// dimension, levels and slices among the inputs a SampleFacet compiles from, so
+// they belong in the invalidation comparison too: two views differing only in
+// mip_levels are different contracts and must not share a cached MTLTexture.
 struct MetalFacetRecord {
   // Shader-visible object: a swizzled texture view when the view asks for one,
   // otherwise the same object as `storage_texture`.
@@ -151,6 +172,9 @@ struct MetalFacetRecord {
   core::FacetKind kind{};
   uint32_t width{};
   uint32_t height{};
+  core::ViewDimension dimension{};
+  uint32_t array_layers{};
+  uint32_t mip_levels{};
   core::PixelFormat format{};
   core::SwizzleChannels swizzle{};
 };
@@ -158,6 +182,13 @@ struct MetalFacetRecord {
 bool same_swizzle(const core::SwizzleChannels& lhs, const core::SwizzleChannels& rhs) {
   return lhs.red == rhs.red && lhs.green == rhs.green && lhs.blue == rhs.blue &&
          lhs.alpha == rhs.alpha;
+}
+
+bool same_shape(const MetalFacetRecord& record, const core::CanonicalView& view) {
+  return record.width == view.width && record.height == view.height &&
+         record.dimension == view.dimension && record.array_layers == view.array_layers &&
+         record.mip_levels == view.mip_levels && record.format == view.format &&
+         same_swizzle(record.swizzle, view.swizzle);
 }
 
 MTLTextureSwizzle to_mtl_swizzle(core::Swizzle swizzle) {
@@ -174,6 +205,99 @@ MTLTextureSwizzle to_mtl_swizzle(core::Swizzle swizzle) {
 
 MTLPixelFormat to_mtl_pixel_format(core::PixelFormat format) {
   return format == core::PixelFormat::RGBA8Unorm ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatR32Float;
+}
+
+// A Texture2DArray view lowers to MTLTextureType2DArray even when it names a
+// single layer: the shader-side type (texture2d vs texture2d_array) is part of
+// the contract the view declares, and silently collapsing a one-layer array to
+// a plain 2D texture would bind the wrong kernel.
+MTLTextureType to_mtl_texture_type(core::ViewDimension dimension) {
+  return dimension == core::ViewDimension::Texture2DArray ? MTLTextureType2DArray : MTLTextureType2D;
+}
+
+// Which MTLTextureUsage a facet kind needs. Sample additionally asks for
+// PixelFormatView because a SampleFacet is exactly the kind that gets
+// reinterpreted: a non-identity swizzle needs a swizzled view, and the raster
+// path needs a single-slice 2D view over an array source to reach the
+// texture2d<float> the shared raster fragment shader declares. Storage and
+// Attachment get it only when the view really asks for a swizzle, so nothing
+// pays for a reinterpretation it cannot use.
+MTLTextureUsage facet_texture_usage(core::FacetKind kind, const core::CanonicalView& view) {
+  MTLTextureUsage usage = 0;
+  switch (kind) {
+    case core::FacetKind::Sample:
+      usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+      break;
+    case core::FacetKind::Storage:
+      usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      break;
+    case core::FacetKind::Attachment:
+      usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+      break;
+    default:
+      return 0;
+  }
+  if (!view.swizzle.identity()) usage |= MTLTextureUsagePixelFormatView;
+  return usage;
+}
+
+// One descriptor shape for every texture this backend mints from a
+// CanonicalView, so the Shared upload path and the Private transform path
+// cannot drift on dimension, mip count or array length.
+MTLTextureDescriptor* make_texture_descriptor(const core::CanonicalView& view, core::FacetKind kind,
+                                              MTLStorageMode storage_mode) {
+  MTLTextureDescriptor* descriptor = [MTLTextureDescriptor new];
+  descriptor.textureType = to_mtl_texture_type(view.dimension);
+  descriptor.pixelFormat = to_mtl_pixel_format(view.format);
+  descriptor.width = view.width;
+  descriptor.height = view.height;
+  descriptor.depth = 1;
+  descriptor.mipmapLevelCount = view.mip_levels;
+  descriptor.arrayLength = view.array_layers;
+  descriptor.sampleCount = 1;
+  descriptor.storageMode = storage_mode;
+  descriptor.usage = facet_texture_usage(kind, view);
+  return descriptor;
+}
+
+// 05 §14: a rejection speaks VG concepts. Every caller that hands a view to
+// Metal funnels its shape checks through here so the diagnostics are one text,
+// not one per entry point.
+bool view_expressible(const core::CanonicalView& view, core::FacetKind kind, uint64_t backing_bytes,
+                      std::string* error) {
+  if (!view.valid(error)) return false;
+  if (kind != core::FacetKind::Sample && kind != core::FacetKind::Storage &&
+      kind != core::FacetKind::Attachment) {
+    if (error) *error = "Unsupported: Address/Transfer facets have no Metal texture representation";
+    return false;
+  }
+  // Swizzle reinterprets a shader read. Metal applies no such remap to a render
+  // target or to an image write, so rather than quietly dropping the channel
+  // mapping the caller asked for, those kinds are refused.
+  if (!view.swizzle.identity() && kind != core::FacetKind::Sample) {
+    if (error) *error = "Unsupported: non-identity swizzle applies to SampleFacet only";
+    return false;
+  }
+  if (backing_bytes < view.byte_size()) {
+    if (error)
+      *error = "canonical view declares " + std::to_string(view.byte_size()) +
+               " bytes of subresources but its allocation holds only " + std::to_string(backing_bytes);
+    return false;
+  }
+  return true;
+}
+
+bool subresource_in_range(const core::CanonicalView& view, const AttachmentSubresource& subresource,
+                          std::string* error) {
+  if (subresource.layer >= view.array_layers || subresource.level >= view.mip_levels) {
+    if (error)
+      *error = "render pass targets layer " + std::to_string(subresource.layer) + " level " +
+               std::to_string(subresource.level) + " of a canonical view declaring " +
+               std::to_string(view.array_layers) + " layer(s) and " + std::to_string(view.mip_levels) +
+               " mip level(s)";
+    return false;
+  }
+  return true;
 }
 
 // Holds a FacetPool GPU-use bracket for as long as a command buffer may still
@@ -207,7 +331,7 @@ hal::LoweringReport make_facet_report() {
   return report;
 }
 
-std::array<float, 4> decode_first_texel(const void* bytes, MTLPixelFormat format) {
+std::array<float, 4> decode_texel(const void* bytes, MTLPixelFormat format) {
   if (format == MTLPixelFormatRGBA8Unorm) {
     const uint8_t* rgba = static_cast<const uint8_t*>(bytes);
     return {rgba[0] / 255.0f, rgba[1] / 255.0f, rgba[2] / 255.0f, rgba[3] / 255.0f};
@@ -216,6 +340,20 @@ std::array<float, 4> decode_first_texel(const void* bytes, MTLPixelFormat format
   std::memcpy(&value, bytes, sizeof(value));
   return {value, 0.0f, 0.0f, 1.0f};
 }
+
+// Both formats this milestone models are 4 bytes wide, but they reach that
+// width differently, so the width is asked for rather than assumed
+// (core::bytes_per_texel is the single answer both backends encode against).
+constexpr uint32_t kBytesPerTexel = 4;
+
+// Clip-space -> pixel-space is Metal's own convention and the reference
+// rasterizer documents matching it exactly: px = (x * 0.5 + 0.5) * width,
+// py = (0.5 - y * 0.5) * height, i.e. +Y up in clip space and down in the
+// image. Nothing here compensates for anything -- Metal already does this --
+// but stating it keeps the two rasterizers' agreement a written contract
+// rather than a coincidence.
+constexpr const char* kRasterClipSpaceNote =
+    "Metal clip space, +Y up: px = (x * 0.5 + 0.5) * width, py = (0.5 - y * 0.5) * height";
 
 // TASK-B12: real host-side wall-clock timing and structural counts for one
 // dispatch_and_wait()/dispatch_task_publish() call, accumulated by the
@@ -245,6 +383,74 @@ struct DispatchStats {
 }  // namespace
 
 struct DeviceHal::Impl {
+  ~Impl() {
+    for (auto& entry : allocation_map) release_buffer(entry.second.buffer);
+    for (auto& entry : facet_map) release_facet_textures(entry.second);
+  }
+
+  static void release_buffer(id<MTLBuffer>& buffer) {
+    if (buffer != nil) {
+      [buffer release];
+      buffer = nil;
+    }
+  }
+
+  static void release_facet_textures(MetalFacetRecord& record) {
+    if (record.texture != nil && record.texture != record.storage_texture) [record.texture release];
+    if (record.storage_texture != nil) [record.storage_texture release];
+    record.texture = nil;
+    record.storage_texture = nil;
+  }
+
+  // Only slots the pool has already stopped resolving, and only after this
+  // backend's own waitUntilCompleted (every path here submits-and-waits), so
+  // no texture is destroyed under work still in flight (06 §11).
+  uint32_t retire_stale_facet_textures(const core::Arena& arena, const core::FacetPool& pool) {
+    uint32_t retired = 0;
+    for (auto it = facet_map.begin(); it != facet_map.end();) {
+      const core::FacetRef ref{it->second.facet_index, it->second.facet_generation};
+      if (pool.in_flight(ref) != 0) {
+        ++it;
+        continue;
+      }
+      core::FacetStatus status = core::FacetStatus::Ok;
+      if (pool.lookup(arena, ref, &status) != nullptr) {
+        ++it;
+        continue;
+      }
+      release_facet_textures(it->second);
+      it = facet_map.erase(it);
+      ++retired;
+    }
+    return retired;
+  }
+
+  // A ConsumeInput has cleared the allocation's host bytes (or the allocation
+  // is gone). Leaving the Shared MTLBuffer would mean the peak-memory saving
+  // E005 measures never materializes on the device side (06 §11).
+  uint64_t release_empty_linear_buffers(const core::Arena& arena) {
+    uint64_t released = 0;
+    for (auto it = allocation_map.begin(); it != allocation_map.end();) {
+      const core::Allocation* allocation = arena.lookup(it->first, it->second.generation);
+      if (allocation != nullptr && !allocation->bytes.empty()) {
+        ++it;
+        continue;
+      }
+      released += it->second.byte_size;
+      release_buffer(it->second.buffer);
+      it = allocation_map.erase(it);
+    }
+    return released;
+  }
+
+  void reclaim_released_backing(const core::Arena& arena, const core::FacetPool& pool,
+                                uint32_t* retired_textures, uint64_t* released_linear) {
+    const uint32_t textures = retire_stale_facet_textures(arena, pool);
+    const uint64_t linear = release_empty_linear_buffers(arena);
+    if (retired_textures != nullptr) *retired_textures = textures;
+    if (released_linear != nullptr) *released_linear = linear;
+  }
+
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> command_queue = nil;
   DeviceSnapshot snapshot{};
@@ -263,15 +469,34 @@ struct DeviceHal::Impl {
   id<MTLComputePipelineState> task_ring_pipeline = nil;
   id<MTLLibrary> cull_compact_library = nil;
   id<MTLComputePipelineState> cull_compact_pipeline = nil;
-  id<MTLLibrary> sample_facet_library = nil;
-  id<MTLComputePipelineState> sample_facet_pipeline = nil;
   id<MTLLibrary> storage_facet_library = nil;
   id<MTLComputePipelineState> storage_facet_pipeline = nil;
+  id<MTLComputePipelineState> storage_array_facet_pipeline = nil;
   id<MTLComputePipelineState> storage_buffer_facet_pipeline = nil;
   std::unordered_map<uint64_t, MetalFacetRecord> facet_map;
-  // Only 4 real combinations (Nearest/Bilinear x Clamp/Repeat) ever occur;
-  // keyed by (filter << 1 | wrap) so lookup stays a plain integer compare.
-  std::unordered_map<uint32_t, id<MTLSamplerState>> sampler_cache;
+  // Keyed by (filter, wrap, lod_min bits, lod_max bits). The first two are the
+  // 4 sampler-policy combinations 06 §6.1 names; the lod clamps exist because
+  // the raster fragment stage has no explicit-level sample call, so pinning the
+  // level a RasterDesc asks for is a sampler property there rather than a
+  // shader argument. Never invalidated -- unlike textures, an MTLSamplerState
+  // carries no allocation-derived state to go stale.
+  std::map<std::array<uint32_t, 4>, id<MTLSamplerState>> sampler_cache;
+
+  // 06 §7's pipeline cache, driven through the backend-neutral
+  // compiler::PipelineClassificationCache so this adapter's hit/miss/compile_ns
+  // accounting is the same discipline E013 compares across variants and
+  // backends. The cache stores only measurements (vg_compiler cannot name an
+  // MTLComputePipelineState), so the objects themselves live in the two maps
+  // beside it, keyed by the very same PipelineKey::hash().
+  compiler::PipelineClassificationCache pipeline_cache;
+  std::unordered_map<uint64_t, id<MTLComputePipelineState>> compute_pipeline_by_key;
+  std::unordered_map<uint64_t, id<MTLRenderPipelineState>> render_pipeline_by_key;
+  std::unordered_map<std::string, id<MTLLibrary>> library_by_hash;
+  // Bound only on the path where the in-shader guard is expected to reject the
+  // token before the kernel's first sample (see run_sample_facet). It is never
+  // read by a shader; it exists because MSL requires a texture argument to be
+  // bound even when the specialized function returns before touching it.
+  id<MTLTexture> guard_placeholder_texture = nil;
   // TASK-B13: debug/test introspection only, see DeviceHal::last_tier1_indirect_dims().
   std::vector<std::array<uint32_t, 3>> last_tier1_indirect_dims;
 
@@ -376,10 +601,21 @@ struct DeviceHal::Impl {
   // reference oracle would. Shared storage keeps this vertical slice on the
   // M1 unified-memory fast path without an explicit blit.
   id<MTLBuffer> ensure_buffer(const core::Allocation& allocation) {
-    const size_t needed = std::max<size_t>(allocation.bytes.size(), 1);
     auto it = allocation_map.find(allocation.id);
+    // ConsumeInput has already handed the linear representation back. A dummy
+    // 1-byte buffer here would keep a device allocation the host just released
+    // and let a later dispatch write into empty host bytes.
+    if (allocation.bytes.empty()) {
+      if (it != allocation_map.end()) {
+        release_buffer(it->second.buffer);
+        allocation_map.erase(it);
+      }
+      return nil;
+    }
+    const size_t needed = allocation.bytes.size();
     if (it != allocation_map.end() &&
         (it->second.generation != allocation.generation || it->second.byte_size < needed)) {
+      release_buffer(it->second.buffer);
       allocation_map.erase(it);
       it = allocation_map.end();
     }
@@ -389,8 +625,7 @@ struct DeviceHal::Impl {
       MetalAllocationRecord record{buffer, allocation.id, allocation.generation, needed};
       it = allocation_map.emplace(allocation.id, record).first;
     }
-    if (!allocation.bytes.empty())
-      std::memcpy([it->second.buffer contents], allocation.bytes.data(), allocation.bytes.size());
+    std::memcpy([it->second.buffer contents], allocation.bytes.data(), allocation.bytes.size());
     return it->second.buffer;
   }
 
@@ -436,45 +671,69 @@ struct DeviceHal::Impl {
     return buffer;
   }
 
-  // Host readback of texel (0,0). Once a representation transform has moved a
-  // facet to Private storage there is no host-visible mapping left, so that
-  // case has to go back through a blit rather than getBytes.
-  bool read_first_texel(id<MTLTexture> texture, std::array<float, 4>* out, std::string* error) {
-    const size_t texel_bytes = texture.pixelFormat == MTLPixelFormatRGBA8Unorm ? 4 : sizeof(float);
+  // Host readback of a `width` x `height` window at (origin_x, origin_y) of one
+  // (slice, level) subresource, decoded to float4 row-major. Once a
+  // representation transform has moved a facet to Private storage there is no
+  // host-visible mapping left, so that case has to go back through a blit
+  // rather than getBytes -- one function for both so the two paths cannot
+  // disagree about layout.
+  bool read_texture_region(id<MTLTexture> texture, uint32_t slice, uint32_t level, uint32_t origin_x,
+                           uint32_t origin_y, uint32_t width, uint32_t height,
+                           std::vector<std::array<float, 4>>* out, std::string* error) {
+    if (width == 0 || height == 0) { if (error) *error = "facet readback window is empty"; return false; }
+    const size_t row_bytes = static_cast<size_t>(width) * kBytesPerTexel;
+    const size_t image_bytes = row_bytes * height;
+    std::vector<uint8_t> bytes(image_bytes);
     if (texture.storageMode != MTLStorageModePrivate) {
-      uint8_t bytes[sizeof(float) * 4] = {};
-      [texture getBytes:bytes
-            bytesPerRow:texel_bytes
-             fromRegion:MTLRegionMake2D(0, 0, 1, 1)
-            mipmapLevel:0];
-      *out = decode_first_texel(bytes, texture.pixelFormat);
-      return true;
+      [texture getBytes:bytes.data()
+            bytesPerRow:row_bytes
+          bytesPerImage:image_bytes
+             fromRegion:MTLRegionMake2D(origin_x, origin_y, width, height)
+            mipmapLevel:level
+                  slice:slice];
+    } else {
+      id<MTLBuffer> readback = [device newBufferWithLength:image_bytes options:MTLResourceStorageModeShared];
+      if (readback == nil) { if (error) *error = "facet readback buffer allocation failed"; return false; }
+      id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
+      if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
+      id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+      if (blit == nil) { if (error) *error = "failed to create Metal blit encoder"; return false; }
+      [blit copyFromTexture:texture
+                  sourceSlice:slice
+                  sourceLevel:level
+                 sourceOrigin:MTLOriginMake(origin_x, origin_y, 0)
+                   sourceSize:MTLSizeMake(width, height, 1)
+                     toBuffer:readback
+            destinationOffset:0
+       destinationBytesPerRow:row_bytes
+     destinationBytesPerImage:image_bytes];
+      [blit endEncoding];
+      [command_buffer commit];
+      [command_buffer waitUntilCompleted];
+      if (command_buffer.status == MTLCommandBufferStatusError || command_buffer.error != nil) {
+        if (error)
+          *error = command_buffer.error != nil ? [[command_buffer.error localizedDescription] UTF8String]
+                                                : "facet readback blit failed";
+        return false;
+      }
+      std::memcpy(bytes.data(), [readback contents], image_bytes);
     }
-    id<MTLBuffer> readback = [device newBufferWithLength:texel_bytes options:MTLResourceStorageModeShared];
-    if (readback == nil) { if (error) *error = "facet readback buffer allocation failed"; return false; }
-    id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
-    if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
-    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
-    if (blit == nil) { if (error) *error = "failed to create Metal blit encoder"; return false; }
-    [blit copyFromTexture:texture
-                sourceSlice:0
-                sourceLevel:0
-               sourceOrigin:MTLOriginMake(0, 0, 0)
-                 sourceSize:MTLSizeMake(1, 1, 1)
-                   toBuffer:readback
-          destinationOffset:0
-     destinationBytesPerRow:texel_bytes
-   destinationBytesPerImage:texel_bytes];
-    [blit endEncoding];
-    [command_buffer commit];
-    [command_buffer waitUntilCompleted];
-    if (command_buffer.status == MTLCommandBufferStatusError || command_buffer.error != nil) {
-      if (error)
-        *error = command_buffer.error != nil ? [[command_buffer.error localizedDescription] UTF8String]
-                                              : "facet readback blit failed";
-      return false;
+    out->resize(static_cast<size_t>(width) * height);
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        (*out)[static_cast<size_t>(y) * width + x] =
+            decode_texel(bytes.data() + static_cast<size_t>(y) * row_bytes + x * kBytesPerTexel,
+                         texture.pixelFormat);
+      }
     }
-    *out = decode_first_texel([readback contents], texture.pixelFormat);
+    return true;
+  }
+
+  bool read_texel(id<MTLTexture> texture, uint32_t slice, uint32_t level, uint32_t x, uint32_t y,
+                  std::array<float, 4>* out, std::string* error) {
+    std::vector<std::array<float, 4>> texels;
+    if (!read_texture_region(texture, slice, level, x, y, 1, 1, &texels, error)) return false;
+    *out = texels[0];
     return true;
   }
 
@@ -491,10 +750,13 @@ struct DeviceHal::Impl {
       const MTLTextureSwizzleChannels channels =
           MTLTextureSwizzleChannelsMake(to_mtl_swizzle(view.swizzle.red), to_mtl_swizzle(view.swizzle.green),
                                         to_mtl_swizzle(view.swizzle.blue), to_mtl_swizzle(view.swizzle.alpha));
+      // The swizzle applies to the whole view contract, so the view must cover
+      // every level and slice the CanonicalView declares. A (0,1)/(0,1) range
+      // would silently narrow a mip/array facet to its first subresource.
       shader_texture = [storage_texture newTextureViewWithPixelFormat:to_mtl_pixel_format(view.format)
-                                                          textureType:MTLTextureType2D
-                                                               levels:NSMakeRange(0, 1)
-                                                               slices:NSMakeRange(0, 1)
+                                                          textureType:to_mtl_texture_type(view.dimension)
+                                                               levels:NSMakeRange(0, view.mip_levels)
+                                                               slices:NSMakeRange(0, view.array_layers)
                                                               swizzle:channels];
       if (shader_texture == nil) {
         if (error) *error = "Metal facet swizzle texture view creation failed";
@@ -510,10 +772,44 @@ struct DeviceHal::Impl {
     record.kind = kind;
     record.width = view.width;
     record.height = view.height;
+    record.dimension = view.dimension;
+    record.array_layers = view.array_layers;
+    record.mip_levels = view.mip_levels;
     record.format = view.format;
     record.swizzle = view.swizzle;
-    facet_map[facet_cache_key(ref)] = record;
+    const uint64_t key = facet_cache_key(ref);
+    auto existing = facet_map.find(key);
+    if (existing != facet_map.end()) {
+      release_facet_textures(existing->second);
+      facet_map.erase(existing);
+    }
+    facet_map[key] = record;
     return shader_texture;
+  }
+
+  // Uploads every subresource the view declares, decoded through
+  // CanonicalView's own linear layout contract (slice-major, then ascending
+  // mip level, each level tightly packed at bytes_per_row(level)). This is the
+  // same contract reference::sample_facet decodes, so an image comparison
+  // between the two backends is comparing sampling, not two disagreeing
+  // opinions about byte layout.
+  void upload_view_subresources(id<MTLTexture> texture, const core::CanonicalView& view,
+                                const core::Allocation& allocation) {
+    if (allocation.bytes.empty()) return;
+    const uint8_t* base = allocation.bytes.data();
+    for (uint32_t layer = 0; layer < view.array_layers; ++layer) {
+      for (uint32_t level = 0; level < view.mip_levels; ++level) {
+        const uint64_t offset = view.subresource_byte_offset(layer, level);
+        const uint64_t row_bytes = view.bytes_per_row(level);
+        const MTLRegion region = MTLRegionMake2D(0, 0, view.mip_width(level), view.mip_height(level));
+        [texture replaceRegion:region
+                   mipmapLevel:level
+                         slice:layer
+                     withBytes:base + offset
+                   bytesPerRow:row_bytes
+                 bytesPerImage:0];
+      }
+    }
   }
 
   // FacetPool::lookup first; cache keyed by FacetRef index+generation.
@@ -526,59 +822,41 @@ struct DeviceHal::Impl {
     const core::FacetSlot* slot = resolve_facet(arena, pool, ref, expected_kind, error);
     if (slot == nullptr) return nil;
     const core::CanonicalView& view = slot->view;
-    if (view.dimension != core::ViewDimension::Texture2D || view.array_layers != 1 ||
-        view.mip_levels != 1) {
-      if (error) *error = "Unsupported for now: only Texture2D with array_layers=1 and mip_levels=1";
-      return nil;
-    }
-    // Swizzle reinterprets a shader read. Metal applies no such remap to a
-    // render target or to an image write, so rather than quietly dropping the
-    // channel mapping the caller asked for, those kinds are refused.
-    if (!view.swizzle.identity() && expected_kind != core::FacetKind::Sample) {
-      if (error) *error = "Unsupported: non-identity swizzle applies to SampleFacet only";
-      return nil;
-    }
     const core::Allocation* allocation = arena.lookup(view.allocation, view.allocation_generation);
     if (allocation == nullptr) {
       if (error) *error = "facet backing allocation not found in arena";
       return nil;
     }
-
+    // The cache is consulted before the backing is examined, and deliberately
+    // so. After a Stage 5 ConsumeInput the linear bytes this facet was built
+    // from are gone -- that is the whole point of reporting distinct_backing
+    // (02 §4.2, 06 §11): the Private texture is independent storage, and the
+    // facet the transform published "stays live across a ConsumeInput". Asking
+    // the allocation how many bytes it still holds before answering would
+    // retire exactly the facet a consume is supposed to leave usable.
     const uint64_t key = facet_cache_key(ref);
     auto it = facet_map.find(key);
     if (it != facet_map.end() &&
         it->second.representation_epoch == slot->representation_epoch &&
-        it->second.kind == slot->kind &&
-        it->second.width == view.width && it->second.height == view.height &&
-        it->second.format == view.format &&
-        same_swizzle(it->second.swizzle, view.swizzle) &&
+        it->second.kind == slot->kind && same_shape(it->second, view) &&
         it->second.facet_index == ref.index &&
         it->second.facet_generation == ref.generation) {
       if (cache_hit) *cache_hit = true;
       if (out_storage) *out_storage = it->second.storage_texture;
       return it->second.texture;
     }
-    if (it != facet_map.end()) facet_map.erase(it);
-
-    const MTLPixelFormat mtl_format = to_mtl_pixel_format(view.format);
-    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mtl_format
-                                                                                            width:view.width
-                                                                                           height:view.height
-                                                                                        mipmapped:NO];
-    descriptor.storageMode = MTLStorageModeShared;
-    if (expected_kind == core::FacetKind::Sample) {
-      descriptor.usage = MTLTextureUsageShaderRead;
-    } else if (expected_kind == core::FacetKind::Storage) {
-      descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    } else if (expected_kind == core::FacetKind::Attachment) {
-      descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    } else {
-      if (error) *error = "Unsupported: Address/Transfer facets have no Metal texture representation";
-      return nil;
+    if (it != facet_map.end()) {
+      release_facet_textures(it->second);
+      facet_map.erase(it);
     }
-    if (!view.swizzle.identity()) descriptor.usage |= MTLTextureUsagePixelFormatView;
 
-    id<MTLTexture> storage_texture = [device newTextureWithDescriptor:descriptor];
+    // Creating one, on the other hand, means seeding it from host bytes, so
+    // here the backing really does have to cover every subresource the view
+    // declares.
+    if (!view_expressible(view, expected_kind, allocation->bytes.size(), error)) return nil;
+
+    id<MTLTexture> storage_texture =
+        [device newTextureWithDescriptor:make_texture_descriptor(view, expected_kind, MTLStorageModeShared)];
     if (storage_texture == nil) {
       if (error)
         *error = expected_kind == core::FacetKind::Storage
@@ -588,15 +866,12 @@ struct DeviceHal::Impl {
       return nil;
     }
 
-    if ((expected_kind == core::FacetKind::Sample || expected_kind == core::FacetKind::Storage) &&
-        !allocation->bytes.empty()) {
-      constexpr size_t kBytesPerPixel = 4;
-      const MTLRegion region = MTLRegionMake2D(0, 0, view.width, view.height);
-      [storage_texture replaceRegion:region
-                         mipmapLevel:0
-                           withBytes:allocation->bytes.data()
-                         bytesPerRow:view.width * kBytesPerPixel];
-    }
+    // Every kind is seeded from the allocation, including Attachment: a
+    // load-action pass must see the bytes the CanonicalView names, which is
+    // also what the Private transform path produces for an Attachment target,
+    // so the two ways of reaching an attachment texture agree on its initial
+    // contents.
+    upload_view_subresources(storage_texture, view, *allocation);
 
     id<MTLTexture> shader_texture = install_facet_record(ref, view, slot->kind, slot->representation_epoch,
                                                          storage_texture, error);
@@ -606,22 +881,38 @@ struct DeviceHal::Impl {
     return shader_texture;
   }
 
-  // Only 4 real (filter, wrap) combinations ever occur, so this is a small
-  // permanent cache, never invalidated -- unlike textures,
-  // an MTLSamplerState carries no allocation-derived state to go stale.
-  id<MTLSamplerState> ensure_sampler_state(core::FilterMode filter, core::WrapMode wrap) {
-    const uint32_t key = (static_cast<uint32_t>(filter) << 1) | static_cast<uint32_t>(wrap);
+  // Small permanent cache, never invalidated -- unlike textures, an
+  // MTLSamplerState carries no allocation-derived state to go stale.
+  //
+  // mipFilter follows the same FilterMode the min/mag filters do, which is what
+  // makes an explicit level(lod) actually select a mip: with the default
+  // MTLSamplerMipFilterNotMipmapped Metal samples level 0 whatever level the
+  // shader asks for, i.e. it would silently ignore the coordinate. Nearest maps
+  // to MipFilterNearest (the GL/Vulkan round-half-down level rule the reference
+  // oracle documents) and Bilinear to MipFilterLinear (full trilinear on a
+  // fractional lod, again matching the oracle).
+  id<MTLSamplerState> ensure_sampler_state(core::FilterMode filter, core::WrapMode wrap,
+                                           float lod_min = 0.0f,
+                                           float lod_max = std::numeric_limits<float>::max()) {
+    std::array<uint32_t, 4> key{static_cast<uint32_t>(filter), static_cast<uint32_t>(wrap), 0, 0};
+    std::memcpy(&key[2], &lod_min, sizeof(float));
+    std::memcpy(&key[3], &lod_max, sizeof(float));
     auto it = sampler_cache.find(key);
     if (it != sampler_cache.end()) return it->second;
     MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
+    const bool nearest = filter == core::FilterMode::Nearest;
     const MTLSamplerMinMagFilter mtl_filter =
-        filter == core::FilterMode::Nearest ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+        nearest ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
     descriptor.minFilter = mtl_filter;
     descriptor.magFilter = mtl_filter;
+    descriptor.mipFilter = nearest ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
+    descriptor.lodMinClamp = lod_min;
+    descriptor.lodMaxClamp = lod_max;
     const MTLSamplerAddressMode mtl_wrap =
         wrap == core::WrapMode::Clamp ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
     descriptor.sAddressMode = mtl_wrap;
     descriptor.tAddressMode = mtl_wrap;
+    descriptor.rAddressMode = mtl_wrap;
     descriptor.normalizedCoordinates = YES;
     id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:descriptor];
     if (sampler != nil) sampler_cache.emplace(key, sampler);
@@ -974,44 +1265,255 @@ struct DeviceHal::Impl {
     return true;
   }
 
-  // Compiles compiler::sample_facet_metal_source() into its own pipeline,
-  // mirroring ensure_cull_compact_pipeline()'s pattern exactly.
-  bool ensure_sample_facet_pipeline(std::string* error) {
-    if (sample_facet_pipeline != nil) return true;
+  // ---- 06 §7 pipeline cache -------------------------------------------------
+  //
+  // "Pipeline cache key 包含：CodeObject hash、entry、function constants、
+  // attachment formats/sample count、raster state 中 Metal 必须编译固定的部分、
+  // OS/GPU/compiler identity。小的动态状态不应无故扩大 key." Every pipeline this
+  // backend builds for a facet or raster use goes through the four helpers
+  // below, so no entry point can quietly invent its own key discipline.
+  //
+  // target_identity is deliberately one opaque string that is only ever hashed:
+  // 05 §10 makes a backend binary cache explicitly non-portable, and a key that
+  // pretended to interpret the driver/compiler identity would be claiming
+  // portability the artifact does not have.
+  std::string target_identity() const {
+    return std::string([[device name] UTF8String]) + "|" +
+           [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String] + "|MSL";
+  }
+
+  compiler::PipelineKey make_pipeline_key(const std::string& source, const std::string& entry,
+                                          std::vector<std::pair<std::string, uint64_t>> constants,
+                                          std::vector<uint32_t> attachment_formats,
+                                          uint32_t sample_count) const {
+    compiler::PipelineKey key;
+    key.code_object_hash = ir::sha256_hex(source);
+    key.entry = entry;
+    key.function_constants = std::move(constants);
+    key.attachment_formats = std::move(attachment_formats);
+    key.sample_count = sample_count;
+    key.target_identity = target_identity();
+    return key;
+  }
+
+  // One MTLLibrary per distinct MSL text, so two specializations of the same
+  // source share the compiled library and differ only in the function constant
+  // values applied to it.
+  id<MTLLibrary> ensure_library(const std::string& source, const std::string& hash, std::string* error) {
+    auto it = library_by_hash.find(hash);
+    if (it != library_by_hash.end()) return it->second;
     NSError* compile_error = nil;
     MTLCompileOptions* options = [MTLCompileOptions new];
-    const std::string source = compiler::sample_facet_metal_source();
-    id<MTLLibrary> new_library = [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
-                                                        options:options
-                                                          error:&compile_error];
-    if (new_library == nil) {
+    id<MTLLibrary> library_object =
+        [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+                             options:options
+                               error:&compile_error];
+    if (library_object == nil) {
       if (error) *error = compile_error != nil ? [[compile_error localizedDescription] UTF8String]
-                                                : "unknown sample facet MSL compile error";
+                                                : "unknown MSL compile error";
+      return nil;
+    }
+    library_by_hash.emplace(hash, library_object);
+    return library_object;
+  }
+
+  // A function specialized by the function constants a PipelineKey already
+  // names. An unset constant is legal and means fast-native: the kernels read
+  // it through is_function_constant_defined(), so a pipeline that leaves it
+  // undefined compiles the guard away rather than failing to build.
+  //
+  // Always the constantValues: form, even for an empty constant set. Metal
+  // refuses to build a pipeline from a function that declares any function
+  // constant unless it was fetched through this selector, so the guard-off
+  // specialization is "fetched with no values supplied", not "fetched
+  // unspecialized" -- and a source with no constants at all is unaffected by
+  // being asked the same way.
+  id<MTLFunction> ensure_function(id<MTLLibrary> library_object, const compiler::PipelineKey& key,
+                                  std::string* error) {
+    NSString* name = [NSString stringWithUTF8String:key.entry.c_str()];
+    MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+    for (const auto& constant : key.function_constants) {
+      // Every function constant this backend specializes on is the MSL `bool`
+      // of 06 §6.4; a wider constant would need its own type here rather than
+      // being coerced into this one.
+      const bool value = constant.second != 0;
+      [values setConstantValue:&value
+                          type:MTLDataTypeBool
+                       atIndex:compiler::kFacetCheckedProfileFunctionConstant];
+    }
+    NSError* function_error = nil;
+    id<MTLFunction> function = [library_object newFunctionWithName:name
+                                                    constantValues:values
+                                                             error:&function_error];
+    if (function == nil && error)
+      *error = function_error != nil ? [[function_error localizedDescription] UTF8String]
+                                     : "MSL specialization of " + key.entry + " failed";
+    return function;
+  }
+
+  bool acquire_compute_pipeline(compiler::PipelineClassificationCache& cache,
+                                std::unordered_map<uint64_t, id<MTLComputePipelineState>>& objects,
+                                const std::string& source, const compiler::PipelineKey& key,
+                                const std::string& trigger, id<MTLComputePipelineState>* out,
+                                compiler::SpecializationReport* report, std::string* error) {
+    const uint64_t digest = key.hash();
+    compiler::SpecializationReport local;
+    id<MTLComputePipelineState> created = nil;
+    const bool ok = cache.acquire(
+        key, trigger,
+        [&](uint64_t* binary_size, std::string* create_error) {
+          id<MTLLibrary> library_object = ensure_library(source, key.code_object_hash, create_error);
+          if (library_object == nil) return false;
+          id<MTLFunction> function = ensure_function(library_object, key, create_error);
+          if (function == nil) return false;
+          NSError* pipeline_error = nil;
+          created = [device newComputePipelineStateWithFunction:function error:&pipeline_error];
+          if (created == nil) {
+            if (create_error)
+              *create_error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
+                                                    : "unknown compute pipeline creation error";
+            return false;
+          }
+          // Metal exposes no compiled binary size for a pipeline built from
+          // source, and 10 §12 forbids writing an unobservable cost as a real
+          // number, so it stays 0 rather than becoming a guess.
+          *binary_size = 0;
+          return true;
+        },
+        &local, error);
+    if (!ok) return false;
+    if (created != nil) objects[digest] = created;
+    auto it = objects.find(digest);
+    if (it == objects.end()) {
+      if (error) *error = "pipeline cache reported a hit for a Metal object this device never created";
       return false;
     }
-    id<MTLFunction> function = [new_library newFunctionWithName:@"vg_sample_facet"];
-    if (function == nil) {
-      if (error) *error = "sample facet MSL library missing vg_sample_facet entry point";
-      return false;
-    }
-    NSError* pipeline_error = nil;
-    id<MTLComputePipelineState> new_pipeline = [device newComputePipelineStateWithFunction:function
-                                                                                       error:&pipeline_error];
-    if (new_pipeline == nil) {
-      if (error) *error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
-                                                 : "unknown sample facet pipeline creation error";
-      return false;
-    }
-    sample_facet_library = new_library;
-    sample_facet_pipeline = new_pipeline;
+    if (out) *out = it->second;
+    if (report) *report = local;
     return true;
   }
 
-  // StorageFacet write, one texel, in both shapes 06 §6.2 allows: a writable
-  // texture2d and a linear device buffer. Both entry points come from one
-  // library so the two targets can never drift to different write semantics.
+  bool acquire_render_pipeline(compiler::PipelineClassificationCache& cache,
+                               std::unordered_map<uint64_t, id<MTLRenderPipelineState>>& objects,
+                               const std::string& source, const compiler::PipelineKey& key,
+                               const std::string& vertex_entry, MTLPixelFormat color_format,
+                               const std::string& trigger, id<MTLRenderPipelineState>* out,
+                               compiler::SpecializationReport* report, std::string* error) {
+    const uint64_t digest = key.hash();
+    compiler::SpecializationReport local;
+    id<MTLRenderPipelineState> created = nil;
+    const bool ok = cache.acquire(
+        key, trigger,
+        [&](uint64_t* binary_size, std::string* create_error) {
+          id<MTLLibrary> library_object = ensure_library(source, key.code_object_hash, create_error);
+          if (library_object == nil) return false;
+          compiler::PipelineKey vertex_key = key;
+          vertex_key.entry = vertex_entry;
+          id<MTLFunction> vertex_function = ensure_function(library_object, vertex_key, create_error);
+          if (vertex_function == nil) return false;
+          id<MTLFunction> fragment_function = ensure_function(library_object, key, create_error);
+          if (fragment_function == nil) return false;
+          MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
+          descriptor.vertexFunction = vertex_function;
+          descriptor.fragmentFunction = fragment_function;
+          descriptor.colorAttachments[0].pixelFormat = color_format;
+          descriptor.rasterSampleCount = key.sample_count;
+          // No MTLVertexDescriptor on purpose: the vertex stage indexes a
+          // `device const VgRasterVertex*` at buffer(0) by [[vertex_id]].
+          // Pointer-indexed root data is this project's addressing philosophy
+          // (04 §8, 06 §5) and it keeps vertex layout out of the key (06 §7).
+          NSError* pipeline_error = nil;
+          created = [device newRenderPipelineStateWithDescriptor:descriptor error:&pipeline_error];
+          if (created == nil) {
+            if (create_error)
+              *create_error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
+                                                    : "unknown render pipeline creation error";
+            return false;
+          }
+          *binary_size = 0;
+          return true;
+        },
+        &local, error);
+    if (!ok) return false;
+    if (created != nil) objects[digest] = created;
+    auto it = objects.find(digest);
+    if (it == objects.end()) {
+      if (error) *error = "pipeline cache reported a hit for a Metal object this device never created";
+      return false;
+    }
+    if (out) *out = it->second;
+    if (report) *report = local;
+    return true;
+  }
+
+  // The SampleFacet kernel 06 §6.1 asks for, in the four shapes that actually
+  // differ: texture2d vs texture2d_array (a CanonicalView's declared dimension,
+  // not a host convenience) crossed with the 06 §6.4 generation guard being
+  // compiled in or specialized away. `checked` is the only piece of state that
+  // has to enter the pipeline key here; the lod value, the array slices and the
+  // sampler are per-use data and bindings that must not.
+  bool ensure_sample_facet_pipeline(bool array_dimension, bool checked,
+                                    id<MTLComputePipelineState>* out, std::string* error) {
+    const std::string source = array_dimension ? compiler::sample_facet_array_metal_source()
+                                               : compiler::sample_facet_metal_source();
+    const std::string entry = array_dimension ? "vg_sample_facet_array" : "vg_sample_facet";
+    std::vector<std::pair<std::string, uint64_t>> constants;
+    if (checked) constants.emplace_back("vg_checked_profile", 1);
+    const compiler::PipelineKey key = make_pipeline_key(source, entry, constants, {}, 1);
+    return acquire_compute_pipeline(pipeline_cache, compute_pipeline_by_key, source, key,
+                                    checked ? "checked-profile facet generation guard (06 §6.4)"
+                                            : "fast-native SampleFacet kernel",
+                                    out, nullptr, error);
+  }
+
+  // Real MTLRenderPipelineState for the shared raster pair. Only the attachment
+  // format and the sample count reach the key; viewport and tint are dynamic
+  // state and shader-visible data respectively, and stay out of it.
+  bool ensure_raster_pipeline(core::PixelFormat format, uint32_t sample_count,
+                              id<MTLRenderPipelineState>* out, std::string* error) {
+    const std::string source = compiler::raster_facet_metal_source();
+    const compiler::PipelineKey key = make_pipeline_key(source, "vg_raster_fragment", {},
+                                                        {static_cast<uint32_t>(format)}, sample_count);
+    return acquire_render_pipeline(pipeline_cache, render_pipeline_by_key, source, key, "vg_raster_vertex",
+                                   to_mtl_pixel_format(format),
+                                   "basic raster attachment store (05 §9 region.attachment.store)", out,
+                                   nullptr, error);
+  }
+
+  // 1x1 stand-in bound on the path where the checked-profile guard is expected
+  // to reject the token before the kernel's first sample. It carries no facet's
+  // pixels and is never read; binding the rejected facet's last-known texture
+  // instead would be exactly the "resolve a stale token to its last-known
+  // object" behaviour 02 §10 forbids.
+  id<MTLTexture> ensure_guard_placeholder_texture(std::string* error) {
+    if (guard_placeholder_texture != nil) return guard_placeholder_texture;
+    MTLTextureDescriptor* descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:1
+                                                          height:1
+                                                       mipmapped:NO];
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    guard_placeholder_texture = [device newTextureWithDescriptor:descriptor];
+    if (guard_placeholder_texture == nil && error)
+      *error = "Metal guard placeholder texture creation failed";
+    return guard_placeholder_texture;
+  }
+
+  // StorageFacet write of one texel of one named subresource, in both shapes
+  // 06 §6.2 allows: a writable texture and a linear device buffer. All three
+  // entry points come from one library so the targets can never drift to
+  // different write semantics.
+  //
+  // `target` is uint4 {x, y, layer, level}. The image forms address (x, y) of a
+  // named layer/level rather than always texel 0, and the linear form lands at
+  // that subresource's own byte offset -- a write that always hit texel 0 would
+  // silently ignore the caller's coordinate, which is the shape of bug
+  // START.md §4 invariant 10 exists to forbid.
   bool ensure_storage_facet_pipelines(std::string* error) {
-    if (storage_facet_pipeline != nil && storage_buffer_facet_pipeline != nil) return true;
+    if (storage_facet_pipeline != nil && storage_array_facet_pipeline != nil &&
+        storage_buffer_facet_pipeline != nil)
+      return true;
     NSError* compile_error = nil;
     MTLCompileOptions* options = [MTLCompileOptions new];
     const char* source =
@@ -1019,22 +1521,34 @@ struct DeviceHal::Impl {
         "using namespace metal;\n"
         "kernel void vg_storage_facet_write(texture2d<float, access::write> tex [[texture(0)]],\n"
         "                                   constant float4& rgba [[buffer(0)]],\n"
+        "                                   constant uint4& target [[buffer(1)]],\n"
         "                                   uint2 gid [[thread_position_in_grid]]) {\n"
-        "  if (gid.x == 0 && gid.y == 0) tex.write(rgba, gid);\n"
+        "  if (gid.x != 0 || gid.y != 0) return;\n"
+        "  tex.write(rgba, uint2(target.x, target.y), target.w);\n"
+        "}\n"
+        "kernel void vg_storage_facet_write_array(texture2d_array<float, access::write> tex [[texture(0)]],\n"
+        "                                         constant float4& rgba [[buffer(0)]],\n"
+        "                                         constant uint4& target [[buffer(1)]],\n"
+        "                                         uint2 gid [[thread_position_in_grid]]) {\n"
+        "  if (gid.x != 0 || gid.y != 0) return;\n"
+        "  tex.write(rgba, uint2(target.x, target.y), target.z, target.w);\n"
         "}\n"
         // format: 0 = RGBA8Unorm, 1 = R32Float, matching core::PixelFormat.
         // The write is encoded in the view's own format so the linear target
-        // never silently changes precision (06 §6.2).
+        // never silently changes precision (06 §6.2). texel_index is the
+        // caller's texel offset in units of core::bytes_per_texel, which is 4
+        // for both formats this milestone models.
         "kernel void vg_storage_facet_write_buffer(device uint* texels [[buffer(0)]],\n"
         "                                          constant float4& rgba [[buffer(1)]],\n"
         "                                          constant uint& format [[buffer(2)]],\n"
+        "                                          constant uint& texel_index [[buffer(3)]],\n"
         "                                          uint gid [[thread_position_in_grid]]) {\n"
         "  if (gid != 0) return;\n"
         "  if (format == 0) {\n"
-        "    texels[0] = pack_float_to_unorm4x8(rgba);\n"
+        "    texels[texel_index] = pack_float_to_unorm4x8(rgba);\n"
         "  } else {\n"
         "    device float* floats = (device float*)texels;\n"
-        "    floats[0] = rgba.x;\n"
+        "    floats[texel_index] = rgba.x;\n"
         "  }\n"
         "}\n";
     id<MTLLibrary> new_library = [device newLibraryWithSource:@(source)
@@ -1045,9 +1559,10 @@ struct DeviceHal::Impl {
                                                 : "unknown storage facet MSL compile error";
       return false;
     }
-    id<MTLComputePipelineState> new_pipelines[2] = {nil, nil};
-    const char* entry_points[2] = {"vg_storage_facet_write", "vg_storage_facet_write_buffer"};
-    for (int i = 0; i < 2; ++i) {
+    id<MTLComputePipelineState> new_pipelines[3] = {nil, nil, nil};
+    const char* entry_points[3] = {"vg_storage_facet_write", "vg_storage_facet_write_array",
+                                   "vg_storage_facet_write_buffer"};
+    for (int i = 0; i < 3; ++i) {
       id<MTLFunction> function = [new_library newFunctionWithName:@(entry_points[i])];
       if (function == nil) {
         if (error) *error = std::string("storage facet MSL library missing ") + entry_points[i] + " entry point";
@@ -1063,7 +1578,161 @@ struct DeviceHal::Impl {
     }
     storage_facet_library = new_library;
     storage_facet_pipeline = new_pipelines[0];
-    storage_buffer_facet_pipeline = new_pipelines[1];
+    storage_array_facet_pipeline = new_pipelines[1];
+    storage_buffer_facet_pipeline = new_pipelines[2];
+    return true;
+  }
+
+  // 06 §6.3's load/store/resolve, lowered onto one subresource of `texture`.
+  // Shared by the draw-free attachment probe and by the raster draw so the two
+  // cannot drift on what a store or a resolve means, and so the multisample
+  // rule (a transient MS target resolving into the facet's own texture) is
+  // stated once.
+  MTLRenderPassDescriptor* make_render_pass(id<MTLTexture> texture, const AttachmentFacetDesc& desc,
+                                            const core::CanonicalView& view,
+                                            bool* store_traffic_avoided, std::string* error) {
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor new];
+    MTLRenderPassColorAttachmentDescriptor* color = rp.colorAttachments[0];
+    color.clearColor =
+        MTLClearColorMake(desc.clear_rgba[0], desc.clear_rgba[1], desc.clear_rgba[2], desc.clear_rgba[3]);
+    switch (desc.load) {
+      case AttachmentLoadAction::Clear: color.loadAction = MTLLoadActionClear; break;
+      case AttachmentLoadAction::Load: color.loadAction = MTLLoadActionLoad; break;
+      case AttachmentLoadAction::DontCare: color.loadAction = MTLLoadActionDontCare; break;
+    }
+    const uint32_t level = desc.subresource.level;
+    if (desc.sample_count > 1) {
+      MTLTextureDescriptor* ms = [MTLTextureDescriptor new];
+      ms.textureType = MTLTextureType2DMultisample;
+      ms.pixelFormat = texture.pixelFormat;
+      // The transient target is sized for the subresource being rendered, not
+      // for mip 0: rendering into level N of a mip chain is a smaller pass.
+      ms.width = view.mip_width(level);
+      ms.height = view.mip_height(level);
+      ms.sampleCount = desc.sample_count;
+      ms.usage = MTLTextureUsageRenderTarget;
+      // Memoryless keeps the per-sample data on-tile, so the only external
+      // write is the resolved single-sample result. Where that is unavailable
+      // the samples really do go to device memory, and the result says so
+      // rather than claiming an optimization the device did not perform.
+      const bool memoryless = [device supportsFamily:MTLGPUFamilyApple1];
+      ms.storageMode = memoryless ? MTLStorageModeMemoryless : MTLStorageModePrivate;
+      id<MTLTexture> ms_texture = [device newTextureWithDescriptor:ms];
+      if (ms_texture == nil) {
+        if (error) *error = "Unsupported: device rejected a multisample render target for this format";
+        return nil;
+      }
+      color.texture = ms_texture;
+      color.resolveTexture = texture;
+      color.resolveLevel = level;
+      color.resolveSlice = desc.subresource.layer;
+      color.storeAction = MTLStoreActionMultisampleResolve;
+      if (store_traffic_avoided) *store_traffic_avoided = memoryless;
+    } else {
+      color.texture = texture;
+      color.level = level;
+      color.slice = desc.subresource.layer;
+      color.storeAction =
+          desc.store == AttachmentStoreAction::Store ? MTLStoreActionStore : MTLStoreActionDontCare;
+      if (store_traffic_avoided) *store_traffic_avoided = desc.store == AttachmentStoreAction::DontCare;
+    }
+    return rp;
+  }
+
+  // ---- Representation transform, shared by both paths that perform one ------
+  //
+  // 02 §8: `retile`/format conversion is a representation transform, not a
+  // barrier. Both the standalone run_representation_transform() and submit()'s
+  // Stage 5 physical callback build their Private optimal texture here, so the
+  // two cannot drift on which subresources get copied or on what the transform
+  // costs.
+  struct TransformCost {
+    uint64_t new_backing_bytes{};
+    uint64_t temporary_bytes{};
+    uint32_t encoder_count{};
+  };
+
+  // Blits every subresource of `view` out of its linear backing into a fresh
+  // Private texture and installs that texture as the backend object behind
+  // `target_facet`. The blit source is reached through a TransferFacet over the
+  // same CanonicalView, so even the transform's own read is a pool-resolved
+  // capability and not a raw buffer handle -- and reusing the existing linear
+  // backing means the transform needs no staging copy at all, which is why
+  // temporary_bytes is honestly 0 rather than an assumed staging figure.
+  bool transform_into_private_facet(core::Arena& arena, core::FacetPool& pool,
+                                    const core::CanonicalView& view, core::FacetKind target_kind,
+                                    core::FacetRef target_facet, TransformCost* cost, std::string* error) {
+    const core::Allocation* allocation = arena.lookup(view.allocation, view.allocation_generation);
+    if (allocation == nullptr) {
+      if (error) *error = "representation transform: backing allocation not found in arena";
+      return false;
+    }
+    if (!view_expressible(view, target_kind, allocation->bytes.size(), error)) return false;
+
+    id<MTLTexture> private_texture =
+        [device newTextureWithDescriptor:make_texture_descriptor(view, target_kind, MTLStorageModePrivate)];
+    if (private_texture == nil) {
+      if (error) *error = "representation transform: Private MTLTexture creation failed";
+      return false;
+    }
+
+    core::FacetRef transfer_ref{};
+    if (!pool.acquire(arena, view, core::FacetKind::Transfer, &transfer_ref, error)) return false;
+    bool blit_ok = false;
+    {
+      FacetUseGuard use(pool, transfer_ref);
+      if (!use.begin(arena, error)) return false;
+      id<MTLBuffer> source = ensure_facet_buffer(arena, pool, transfer_ref, core::FacetKind::Transfer, error);
+      if (source == nil) return false;
+
+      id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
+      if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
+      id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+      if (blit == nil) { if (error) *error = "failed to create Metal blit encoder"; return false; }
+      for (uint32_t layer = 0; layer < view.array_layers; ++layer) {
+        for (uint32_t level = 0; level < view.mip_levels; ++level) {
+          const uint64_t offset = view.subresource_byte_offset(layer, level);
+          const uint64_t row_bytes = view.bytes_per_row(level);
+          [blit copyFromBuffer:source
+                  sourceOffset:offset
+             sourceBytesPerRow:row_bytes
+           sourceBytesPerImage:row_bytes * view.mip_height(level)
+                    sourceSize:MTLSizeMake(view.mip_width(level), view.mip_height(level), 1)
+                     toTexture:private_texture
+              destinationSlice:layer
+              destinationLevel:level
+             destinationOrigin:MTLOriginMake(0, 0, 0)];
+        }
+      }
+      [blit endEncoding];
+      [command_buffer commit];
+      [command_buffer waitUntilCompleted];
+      if (command_buffer.status == MTLCommandBufferStatusError || command_buffer.error != nil) {
+        if (error)
+          *error = command_buffer.error != nil ? [[command_buffer.error localizedDescription] UTF8String]
+                                                : "representation transform blit failed";
+        return false;
+      }
+      blit_ok = true;
+    }
+    // The TransferFacet existed only to give the blit a pool-resolved source;
+    // its purpose is spent, so its slot goes back rather than being left to
+    // linger until some later epoch happens to stale it.
+    if (blit_ok) pool.retire(transfer_ref);
+
+    if (install_facet_record(target_facet, view, target_kind, allocation->representation_epoch,
+                             private_texture, error) == nil)
+      return false;
+
+    if (cost != nullptr) {
+      // The device's own accounting for the texture it just created, not the
+      // view's logical extent: alignment and tiling padding are real bytes the
+      // peak-memory report of 06 §11 has to include.
+      const uint64_t allocated = [private_texture allocatedSize];
+      cost->new_backing_bytes = allocated != 0 ? allocated : view.byte_size();
+      cost->temporary_bytes = 0;
+      cost->encoder_count = 1;
+    }
     return true;
   }
 
@@ -1150,6 +1819,23 @@ bool has_host_assisted_pipeline(const hal::LoweringReport& report) {
   });
 }
 
+bool module_touches_allocation(const ir::Module& module, uint64_t allocation) {
+  return std::any_of(module.instructions.begin(), module.instructions.end(),
+                     [allocation](const ir::Instruction& instruction) {
+                       return instruction.allocation == allocation;
+                     });
+}
+
+// Stage 5 consume releases the allocation's linear representation before
+// Stage 6/7 dispatch (03 §7). A plan that also computes over that same
+// allocation is asking for two incompatible things.
+bool plan_computes_over_allocation(const hal::ExecutionPlan& plan, uint64_t allocation) {
+  if (module_touches_allocation(plan.module, allocation)) return true;
+  for (const auto& pass : plan.effect_dag_passes)
+    if (module_touches_allocation(pass, allocation)) return true;
+  return false;
+}
+
 // E004: shared by both the host-assisted and GPU-dispatch submit() paths.
 // `touched` is derived from the module's static instruction list rather than
 // the dispatch loop's runtime buffer bindings, so this works identically
@@ -1173,6 +1859,10 @@ void attach_access_certificate(const hal::CompiledPlan& compiled, const core::Ar
 
 DeviceHal::DeviceHal(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 DeviceHal::~DeviceHal() = default;
+
+void DeviceHal::reclaim_released_backing(const core::Arena& arena) const {
+  impl_->reclaim_released_backing(arena, facet_pool(), nullptr, nullptr);
+}
 
 const hal::CapabilitySnapshot& DeviceHal::capabilities() const { return impl_->snapshot.hal; }
 const DeviceSnapshot& DeviceHal::snapshot() const { return impl_->snapshot; }
@@ -1265,6 +1955,62 @@ bool DeviceHal::compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compi
                          1, package.package.bindings.size(),
                          pointer_graph ? "MSL source generated by B15 (CachedObject: static index binding, no device pointer chase)"
                                        : "MSL source generated by B4");
+  }
+
+  // Stage 5's input (03 §7/§8: "每个 Region 的所需 facet 与 representation
+  // version 已固定"). This backend has a real transform -- a linear ->
+  // Private-optimal blit that publishes a new RepresentationEpoch (02 §8) --
+  // so a request it can express is accepted here and actually performed by
+  // submit(). What compile() must not do is perform it: a ConsumeInput is a
+  // destructive act on the live arena, and compile() is handed no arena at
+  // all. So a request carrying consume_input is recorded as work submit() will
+  // do, never consumed at compile time, and never inferred by the adapter on
+  // its own (06 §11: "adapter 不自行推断破坏性转换").
+  //
+  // A request whose shape this device cannot express is reported Unsupported
+  // with the VG-concept reason and fails the compile, rather than being dropped
+  // while compile() reports success as if none had been asked for (START.md §4
+  // invariant 10).
+  for (size_t index = 0; index < plan.representation_requests.size(); ++index) {
+    const auto& request = plan.representation_requests[index];
+    std::string request_error;
+    if (!view_expressible(request.view, request.target_kind, request.view.byte_size(), &request_error)) {
+      compiled->representation_supported = false;
+      compiled->report.supported = false;
+      compiled->report.diagnostic = "representation request " + std::to_string(index) +
+                                    " is not expressible on this Metal device: " + request_error;
+      compiled->report.add("representation_transform", hal::LoweringClass::Unsupported, 1,
+                           request.view.byte_size(), compiled->report.diagnostic);
+      if (error) *error = compiled->report.diagnostic;
+      return false;
+    }
+    // Same refusal Vulkan's can_lower_representation_requests makes: ConsumeInput
+    // releases the linear backing at once, and Stage 5 runs before this
+    // submission's compute. Computing over that same allocation would dispatch
+    // against a buffer whose bytes were just handed back (START.md §4, invariant 10).
+    if (request.consume_input && plan_computes_over_allocation(plan, request.view.allocation)) {
+      compiled->representation_supported = false;
+      compiled->report.supported = false;
+      compiled->report.diagnostic =
+          "representation request " + std::to_string(index) +
+          " is Unsupported: it asks for ConsumeInput on allocation " +
+          std::to_string(request.view.allocation) +
+          ", whose linear representation this plan's compute module also reads or writes; the "
+          "consume releases that backing before the dispatch could run";
+      compiled->report.add("consume_input", hal::LoweringClass::Unsupported, 1, 0,
+                           compiled->report.diagnostic);
+      if (error) *error = compiled->report.diagnostic;
+      return false;
+    }
+    compiled->report.add("representation_transform", hal::LoweringClass::DevicePass, 1,
+                         request.view.byte_size(),
+                         "blit every subresource of the linear backing into a Private device-optimal "
+                         "MTLTexture and publish a new RepresentationEpoch at submit()");
+    if (request.consume_input)
+      compiled->report.add("consume_input", hal::LoweringClass::Direct, 1, 0,
+                           "recorded for submit(): the Private texture is storage distinct from the linear "
+                           "backing it supersedes, so a complete ConsumeProof can release that backing at "
+                           "once instead of holding it to command-buffer completion (06 §11)");
   }
 
   // A timeline wait/signal that this device cannot honor natively must be
@@ -1408,6 +2154,69 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
 
   submission->abi_version = hal::kDeviceHalAbiVersion;
   submission->report = compiled.report;
+
+  // Stage 5 precedes Stage 6/7 (03 §7): the Region representations a
+  // submission depends on are published, and the facets that depend on them
+  // acquired, before any dispatch encodes against them. The epoch/facet/consume
+  // bookkeeping itself is the shared helper's -- if each backend kept its own,
+  // the two could disagree about when a token goes stale and the cross-backend
+  // differential of 10 §6 would be comparing two different semantics. Only the
+  // physical step below is this backend's, and it is a real device pass.
+  //
+  // distinct_backing is true because it is true: the Private texture is storage
+  // independent of the linear allocation it supersedes, so releasing that
+  // backing under a ConsumeInput really does hand memory back (the reference
+  // backend reports false for the opposite, equally honest reason -- its
+  // transform is the identity). This flag is the whole Metal-side obligation
+  // ConsumeInput has, besides genuinely not needing the old linear bytes once
+  // the blit has completed, which it does not.
+  //
+  // A plan carrying no request leaves every Stage 5 field of `submission` at
+  // its default and costs nothing, so every pre-Stage-5 caller is unaffected.
+  {
+    std::string representation_error;
+    if (!hal::run_representation_stage(
+            compiled.plan.representation_requests, arena, facet_pool(),
+            [&](const hal::RepresentationRequest& request, core::FacetRef facet,
+                hal::RepresentationTransformCost* cost, std::string* physical_error) {
+              Impl::TransformCost transform_cost;
+              if (!impl_->transform_into_private_facet(arena, facet_pool(), request.view,
+                                                       request.target_kind, facet, &transform_cost,
+                                                       physical_error))
+                return false;
+              cost->new_backing_bytes = transform_cost.new_backing_bytes;
+              cost->temporary_bytes = transform_cost.temporary_bytes;
+              // No MTLHeap is involved on this path -- the texture comes
+              // straight from the device -- so there is no fragmentation this
+              // backend can observe, and 0 is the measurement rather than a
+              // placeholder.
+              cost->heap_fragmentation_bytes = 0;
+              cost->used_device_optimal = true;
+              cost->distinct_backing = true;
+              return true;
+            },
+            submission, &representation_error)) {
+      if (error) *error = representation_error;
+      return false;
+    }
+    // The helper owns the host-side consume; this backend must actually drop
+    // the Shared blit source and any MTLTexture whose FacetRef no longer
+    // resolves, or released_backing_bytes would describe a saving that never
+    // happened on the device (06 §11, Vulkan 07 §14's same follow-through).
+    uint32_t retired_textures = 0;
+    uint64_t released_linear = 0;
+    impl_->reclaim_released_backing(arena, facet_pool(), &retired_textures, &released_linear);
+    if (retired_textures != 0) {
+      submission->report.add("facet_texture_retire", hal::LoweringClass::Direct, retired_textures, 0,
+                             "MTLTextures belonging to retired facet slots or superseded "
+                             "RepresentationEpochs destroyed after the stage");
+    }
+    if (released_linear != 0) {
+      submission->report.add("consume_input_backing_release", hal::LoweringClass::Direct, 1, released_linear,
+                             "the superseded linear representation's device buffer was destroyed at once "
+                             "rather than retained to command-buffer completion (06 §11, E005)");
+    }
+  }
 
   const uint64_t wait_value = compiled.plan.timeline_wait;
   const uint64_t signal_value = compiled.plan.timeline_signal;
@@ -1934,48 +2743,243 @@ bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool
                                  core::FilterMode filter, core::WrapMode wrap,
                                  const std::vector<std::array<float, 2>>& uv_coords,
                                  SampleFacetResult* result, std::string* error) const {
+  std::vector<SampleCoord> coords;
+  coords.reserve(uv_coords.size());
+  for (const auto& uv : uv_coords) coords.push_back(SampleCoord{uv[0], uv[1], 0.0f, 0});
+  // FastNative, not CheckedNative: this overload names no subresource and no
+  // profile, so it means exactly what it meant before the guard existed --
+  // level 0 of slice 0, sampled by a pipeline with the guard specialized away,
+  // with FacetPool::lookup() as the authority on the token's liveness.
+  return run_sample_facet(arena, pool, ref, filter, wrap, coords, core::ValidationProfile::FastNative,
+                          result, error);
+}
+
+bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool, core::FacetRef ref,
+                                 core::FilterMode filter, core::WrapMode wrap,
+                                 const std::vector<SampleCoord>& coords, core::ValidationProfile profile,
+                                 SampleFacetResult* result, std::string* error) const {
   if (result == nullptr) { if (error) *error = "sample facet result output is required"; return false; }
-  FacetUseGuard use(pool, ref);
-  if (!use.begin(arena, error)) return false;
+  // 03 §12's profiles change diagnosis and instrumentation, never meaning --
+  // but only two of the four have a Metal meaning at all. ReferenceStrict asks
+  // for the reference interpreter's own byte-exact judgement and Capture for a
+  // canonical capture stream; this adapter is neither, and silently running one
+  // of them as CheckedNative would let a caller believe a guarantee it never
+  // got (START.md §4 invariant 10).
+  if (profile != core::ValidationProfile::CheckedNative &&
+      profile != core::ValidationProfile::FastNative) {
+    if (error)
+      *error = "Unsupported: this Metal adapter implements the CheckedNative and FastNative profiles; "
+               "ReferenceStrict and Capture have no Metal lowering and must run on the reference backend";
+    return false;
+  }
+  const bool checked = profile == core::ValidationProfile::CheckedNative;
+  const uint32_t count = static_cast<uint32_t>(coords.size());
+
+  // The generation table is a snapshot of what the pool currently resolves
+  // (core::FacetPool::snapshot_generations), which is exactly what the kernel's
+  // guard compares against. Taken before anything else so the host-side verdict
+  // below and the in-shader verdict are formed from the same state.
+  std::vector<uint32_t> generations;
+  pool.snapshot_generations(&generations);
+
+  std::string lookup_error;
+  const core::FacetSlot* slot = impl_->resolve_facet(arena, pool, ref, core::FacetKind::Sample, &lookup_error);
+
+  // A token the host cannot resolve, whose failure the uploaded table *can*
+  // encode (a retired or generation-mismatched slot), is precisely the case
+  // 06 §6.4's in-shader check exists for: under the checked profile the shader
+  // itself rejects it, writes poison and counts the violation, rather than the
+  // host inferring the rejection on its behalf. Nothing of the dead facet is
+  // resurrected to make that happen -- a 1x1 placeholder is bound purely to
+  // satisfy MSL's texture argument, and the guard returns before any sample.
+  //
+  // A token whose failure the table cannot encode (an epoch that went stale
+  // after the snapshot, or a lost allocation) is refused host-side with that
+  // reason, because pretending the guard caught it would misreport which check
+  // actually fired.
+  const bool guard_rejects = checked && slot == nullptr && !pool.generation_valid(ref);
+  if (slot == nullptr && !guard_rejects) {
+    if (error)
+      *error = checked ? lookup_error +
+                             " (the checked-profile generation table encodes slot liveness only, so this "
+                             "staleness is caught host-side rather than in the shader)"
+                       : lookup_error;
+    return false;
+  }
+
+  const bool array_dimension = slot != nullptr && slot->view.dimension == core::ViewDimension::Texture2DArray;
+  if (slot != nullptr) {
+    for (uint32_t i = 0; i < count; ++i) {
+      // Neither an out-of-range slice nor an out-of-range level is clamped:
+      // clamping would turn a caller's indexing bug into a plausible-looking
+      // sampled value, and the reference oracle refuses the same coordinates
+      // for the same reason.
+      if (coords[i].array_slice >= slot->view.array_layers) {
+        if (error)
+          *error = "sample coordinate " + std::to_string(i) + " names array slice " +
+                   std::to_string(coords[i].array_slice) + " of a canonical view declaring " +
+                   std::to_string(slot->view.array_layers) + " layer(s)";
+        return false;
+      }
+      // Mixing the two kernels is Unsupported rather than approximated: a
+      // Texture2D view has no slice axis, so a non-zero slice on one is a
+      // contract error, not something the texture2d_array kernel should be
+      // substituted in to satisfy.
+      if (!array_dimension && coords[i].array_slice != 0) {
+        if (error)
+          *error = "Unsupported: sample coordinate " + std::to_string(i) +
+                   " names a non-zero array slice on a Texture2D canonical view; declare the view as "
+                   "Texture2DArray instead of relying on the array sampling kernel";
+        return false;
+      }
+      if (!(coords[i].lod >= 0.0f) || coords[i].lod > static_cast<float>(slot->view.mip_levels - 1)) {
+        if (error)
+          *error = "sample coordinate " + std::to_string(i) + " names lod " +
+                   std::to_string(coords[i].lod) + " of a canonical view declaring " +
+                   std::to_string(slot->view.mip_levels) + " mip level(s)";
+        return false;
+      }
+    }
+  }
+
   std::string pipeline_error;
-  if (!impl_->ensure_sample_facet_pipeline(&pipeline_error)) {
+  id<MTLComputePipelineState> pipeline_state = nil;
+  if (!impl_->ensure_sample_facet_pipeline(array_dimension, checked, &pipeline_state, &pipeline_error)) {
     if (error) *error = "Metal sample facet pipeline compile failed: " + pipeline_error;
     return false;
   }
+
   bool cache_hit = false;
-  std::string tex_error;
-  id<MTLTexture> texture =
-      impl_->ensure_facet_texture(arena, pool, ref, core::FacetKind::Sample, &cache_hit, nullptr, &tex_error);
-  if (texture == nil) {
-    if (error) *error = tex_error.empty() ? "Metal sample facet texture creation failed" : tex_error;
-    return false;
+  id<MTLTexture> texture = nil;
+  // The GPU-use bracket only exists for a token that resolves; there is nothing
+  // to hold out of the free list for a slot the pool has already retired.
+  FacetUseGuard use(pool, ref);
+  if (slot != nullptr) {
+    if (!use.begin(arena, error)) return false;
+    std::string tex_error;
+    texture = impl_->ensure_facet_texture(arena, pool, ref, core::FacetKind::Sample, &cache_hit, nullptr,
+                                          &tex_error);
+    if (texture == nil) {
+      if (error) *error = tex_error.empty() ? "Metal sample facet texture creation failed" : tex_error;
+      return false;
+    }
+  } else {
+    texture = impl_->ensure_guard_placeholder_texture(error);
+    if (texture == nil) return false;
   }
   id<MTLSamplerState> sampler = impl_->ensure_sampler_state(filter, wrap);
   if (sampler == nil) { if (error) *error = "Metal sample facet sampler creation failed"; return false; }
 
-  const uint32_t count = static_cast<uint32_t>(uv_coords.size());
-  id<MTLBuffer> uv_buffer = [impl_->device newBufferWithLength:std::max<size_t>(count * sizeof(float) * 2, 1)
-                                                        options:MTLResourceStorageModeShared];
-  id<MTLBuffer> output_buffer = [impl_->device newBufferWithLength:std::max<size_t>(count * sizeof(float) * 4, 1)
-                                                            options:MTLResourceStorageModeShared];
-  if (uv_buffer == nil || output_buffer == nil) {
-    if (error) *error = "Metal sample facet buffer allocation failed";
-    return false;
+  // The kernels take one `constant float& lod` per dispatch, not one per
+  // thread, so a batch carrying several distinct levels is genuinely several
+  // dispatches. They are grouped by exact lod value and scattered back into
+  // the caller's coordinate order afterwards, which keeps every coordinate's
+  // own level rather than picking one level for the batch (an approximation
+  // START.md §4 invariant 10 forbids). All groups share one encoder and one
+  // command buffer.
+  std::vector<std::pair<float, std::vector<uint32_t>>> lod_groups;
+  for (uint32_t i = 0; i < count; ++i) {
+    const float lod = coords[i].lod;
+    auto group = std::find_if(lod_groups.begin(), lod_groups.end(),
+                              [lod](const std::pair<float, std::vector<uint32_t>>& entry) {
+                                return entry.first == lod;
+                              });
+    if (group == lod_groups.end()) {
+      lod_groups.push_back({lod, {i}});
+    } else {
+      group->second.push_back(i);
+    }
   }
-  if (!uv_coords.empty())
-    std::memcpy([uv_buffer contents], uv_coords.data(), uv_coords.size() * sizeof(float) * 2);
+
+  id<MTLBuffer> token_buffer = nil;
+  id<MTLBuffer> table_buffer = nil;
+  id<MTLBuffer> slot_count_buffer = nil;
+  id<MTLBuffer> violation_buffer = nil;
+  if (checked) {
+    const uint32_t token[2] = {ref.index, ref.generation};
+    const uint32_t slot_count = static_cast<uint32_t>(generations.size());
+    token_buffer = [impl_->device newBufferWithLength:sizeof(token) options:MTLResourceStorageModeShared];
+    table_buffer =
+        [impl_->device newBufferWithLength:std::max<size_t>(generations.size() * sizeof(uint32_t), 1)
+                                   options:MTLResourceStorageModeShared];
+    slot_count_buffer = [impl_->device newBufferWithLength:sizeof(uint32_t)
+                                                  options:MTLResourceStorageModeShared];
+    violation_buffer = [impl_->device newBufferWithLength:sizeof(uint32_t)
+                                                 options:MTLResourceStorageModeShared];
+    if (token_buffer == nil || table_buffer == nil || slot_count_buffer == nil || violation_buffer == nil) {
+      if (error) *error = "Metal checked-profile facet guard buffer allocation failed";
+      return false;
+    }
+    std::memcpy([token_buffer contents], token, sizeof(token));
+    if (!generations.empty())
+      std::memcpy([table_buffer contents], generations.data(), generations.size() * sizeof(uint32_t));
+    std::memcpy([slot_count_buffer contents], &slot_count, sizeof(slot_count));
+    std::memset([violation_buffer contents], 0, sizeof(uint32_t));
+  }
+
+  struct SampleGroupBuffers {
+    id<MTLBuffer> uv = nil;
+    id<MTLBuffer> slices = nil;
+    id<MTLBuffer> lod = nil;
+    id<MTLBuffer> output = nil;
+    const std::vector<uint32_t>* indices = nullptr;
+  };
+  std::vector<SampleGroupBuffers> group_buffers;
+  group_buffers.reserve(lod_groups.size());
 
   id<MTLCommandBuffer> command_buffer = [impl_->command_queue commandBuffer];
   if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
   id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
   if (encoder == nil) { if (error) *error = "failed to create Metal compute encoder"; return false; }
-  [encoder setComputePipelineState:impl_->sample_facet_pipeline];
-  [encoder setTexture:texture atIndex:0];
-  [encoder setSamplerState:sampler atIndex:0];
-  [encoder setBuffer:uv_buffer offset:0 atIndex:0];
-  [encoder setBuffer:output_buffer offset:0 atIndex:1];
-  [encoder dispatchThreadgroups:MTLSizeMake(std::max<uint32_t>(count, 1), 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  [encoder setComputePipelineState:pipeline_state];
+  [encoder setTexture:texture atIndex:compiler::kSampleFacetTextureIndex];
+  [encoder setSamplerState:sampler atIndex:compiler::kSampleFacetSamplerIndex];
+  uint32_t descriptor_writes = 2;  // setTexture + setSamplerState
+  if (checked) {
+    [encoder setBuffer:token_buffer offset:0 atIndex:compiler::kSampleFacetTokenBufferIndex];
+    [encoder setBuffer:table_buffer offset:0 atIndex:compiler::kSampleFacetGenerationTableBufferIndex];
+    [encoder setBuffer:slot_count_buffer offset:0 atIndex:compiler::kSampleFacetSlotCountBufferIndex];
+    [encoder setBuffer:violation_buffer offset:0 atIndex:compiler::kSampleFacetViolationCounterBufferIndex];
+    descriptor_writes += 4;
+  }
+
+  for (const auto& group : lod_groups) {
+    const std::vector<uint32_t>& indices = group.second;
+    SampleGroupBuffers buffers;
+    buffers.indices = &indices;
+    buffers.uv = [impl_->device newBufferWithLength:indices.size() * sizeof(float) * 2
+                                            options:MTLResourceStorageModeShared];
+    buffers.output = [impl_->device newBufferWithLength:indices.size() * sizeof(float) * 4
+                                                options:MTLResourceStorageModeShared];
+    buffers.lod = [impl_->device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
+    if (array_dimension)
+      buffers.slices = [impl_->device newBufferWithLength:indices.size() * sizeof(uint32_t)
+                                                 options:MTLResourceStorageModeShared];
+    if (buffers.uv == nil || buffers.output == nil || buffers.lod == nil ||
+        (array_dimension && buffers.slices == nil)) {
+      if (error) *error = "Metal sample facet buffer allocation failed";
+      return false;
+    }
+    float* uv = static_cast<float*>([buffers.uv contents]);
+    uint32_t* slices = array_dimension ? static_cast<uint32_t*>([buffers.slices contents]) : nullptr;
+    for (size_t i = 0; i < indices.size(); ++i) {
+      uv[i * 2 + 0] = coords[indices[i]].u;
+      uv[i * 2 + 1] = coords[indices[i]].v;
+      if (slices != nullptr) slices[i] = coords[indices[i]].array_slice;
+    }
+    const float lod = group.first;
+    std::memcpy([buffers.lod contents], &lod, sizeof(lod));
+
+    [encoder setBuffer:buffers.uv offset:0 atIndex:compiler::kSampleFacetUvBufferIndex];
+    [encoder setBuffer:buffers.output offset:0 atIndex:compiler::kSampleFacetOutputBufferIndex];
+    [encoder setBuffer:buffers.lod offset:0 atIndex:compiler::kSampleFacetLodBufferIndex];
+    if (array_dimension)
+      [encoder setBuffer:buffers.slices offset:0 atIndex:compiler::kSampleFacetArraySliceBufferIndex];
+    descriptor_writes += array_dimension ? 4 : 3;
+    [encoder dispatchThreadgroups:MTLSizeMake(indices.size(), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    group_buffers.push_back(buffers);
+  }
   [encoder endEncoding];
   [command_buffer commit];
   [command_buffer waitUntilCompleted];
@@ -1986,31 +2990,76 @@ bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool
     return false;
   }
 
-  const float* output = static_cast<const float*>([output_buffer contents]);
-  result->sampled_rgba.resize(count);
-  for (uint32_t i = 0; i < count; ++i)
-    result->sampled_rgba[i] = {output[i * 4 + 0], output[i * 4 + 1], output[i * 4 + 2], output[i * 4 + 3]};
+  result->sampled_rgba.assign(count, {0.0f, 0.0f, 0.0f, 0.0f});
+  for (const auto& buffers : group_buffers) {
+    const float* output = static_cast<const float*>([buffers.output contents]);
+    for (size_t i = 0; i < buffers.indices->size(); ++i) {
+      const uint32_t destination = (*buffers.indices)[i];
+      result->sampled_rgba[destination] = {output[i * 4 + 0], output[i * 4 + 1], output[i * 4 + 2],
+                                           output[i * 4 + 3]};
+    }
+  }
+  result->generation_violations =
+      checked ? *static_cast<const uint32_t*>([violation_buffer contents]) : 0;
+  result->checked_profile = checked;
   result->facet_cache_hit = cache_hit;
-  result->descriptor_write_count = 2;  // setTexture + setSamplerState
+  result->descriptor_write_count = descriptor_writes;
   result->report = make_facet_report();
   result->report.encoder_count = 1;
   result->report.command_buffer_count = 1;
   result->report.queue_wait_count = 1;
-  result->report.add("sample_facet",
-                     cache_hit ? hal::LoweringClass::CachedObject : hal::LoweringClass::DevicePass, count, 0,
-                     cache_hit ? "facet cache hit; no MTLTexture created for this use"
-                               : "facet cache miss; MTLTexture and sampler compiled for this view");
+  if (guard_rejects) {
+    result->report.add("facet_generation_guard", hal::LoweringClass::DevicePass, count, 0,
+                       "the checked-profile shader rejected the facet token itself; every output slot is "
+                       "poison and no sample was taken");
+  } else {
+    result->report.add("sample_facet",
+                       cache_hit ? hal::LoweringClass::CachedObject : hal::LoweringClass::DevicePass, count,
+                       0,
+                       cache_hit ? "facet cache hit; no MTLTexture created for this use"
+                                 : "facet cache miss; MTLTexture and sampler compiled for this view");
+    result->report.add("facet_generation_guard", hal::LoweringClass::Direct, count, 0,
+                       checked ? "in-shader generation check compiled in (06 §6.4)"
+                               : "fast-native: the guard, its four bindings and its atomic are specialized "
+                                 "away entirely");
+  }
+  if (lod_groups.size() > 1)
+    result->report.add("sample_facet_lod_groups", hal::LoweringClass::Direct, lod_groups.size(), 0,
+                       "one dispatch per distinct explicit level; the kernel's lod is per-dispatch state");
   return true;
 }
 
 bool DeviceHal::run_storage_facet(const core::Arena& arena, core::FacetPool& pool, core::FacetRef ref,
                                   StorageFacetTarget target, const std::array<float, 4>& write_rgba,
                                   StorageFacetResult* result, std::string* error) const {
+  // Texel (0,0) of subresource (layer 0, level 0) is what every pre-mip caller
+  // meant, so the defaulted StorageTexel is exactly the old behaviour.
+  return run_storage_facet(arena, pool, ref, target, write_rgba, StorageTexel{}, result, error);
+}
+
+bool DeviceHal::run_storage_facet(const core::Arena& arena, core::FacetPool& pool, core::FacetRef ref,
+                                  StorageFacetTarget target, const std::array<float, 4>& write_rgba,
+                                  StorageTexel texel, StorageFacetResult* result,
+                                  std::string* error) const {
   if (result == nullptr) { if (error) *error = "storage facet result output is required"; return false; }
   FacetUseGuard use(pool, ref);
   if (!use.begin(arena, error)) return false;
   const core::FacetSlot* slot = impl_->resolve_facet(arena, pool, ref, core::FacetKind::Storage, error);
   if (slot == nullptr) return false;
+  const core::CanonicalView& view = slot->view;
+  // Out-of-range coordinates are refused, never clamped: a clamped write lands
+  // somewhere real and looks like it worked.
+  if (texel.layer >= view.array_layers || texel.level >= view.mip_levels ||
+      texel.x >= view.mip_width(texel.level) || texel.y >= view.mip_height(texel.level)) {
+    if (error)
+      *error = "storage facet target texel (" + std::to_string(texel.x) + ", " + std::to_string(texel.y) +
+               ") of layer " + std::to_string(texel.layer) + " level " + std::to_string(texel.level) +
+               " lies outside the subresources this canonical view declares";
+    return false;
+  }
+  const uint64_t texel_byte_offset = view.subresource_byte_offset(texel.layer, texel.level) +
+                                     static_cast<uint64_t>(texel.y) * view.bytes_per_row(texel.level) +
+                                     static_cast<uint64_t>(texel.x) * kBytesPerTexel;
   std::string pipeline_error;
   if (!impl_->ensure_storage_facet_pipelines(&pipeline_error)) {
     if (error) *error = "Metal storage facet pipeline compile failed: " + pipeline_error;
@@ -2029,6 +3078,9 @@ bool DeviceHal::run_storage_facet(const core::Arena& arena, core::FacetPool& poo
   id<MTLTexture> texture = nil;
   id<MTLBuffer> linear = nil;
   id<MTLBuffer> format_buffer = nil;
+  id<MTLBuffer> target_buffer = nil;
+  id<MTLBuffer> texel_index_buffer = nil;
+  const bool array_dimension = view.dimension == core::ViewDimension::Texture2DArray;
   if (target == StorageFacetTarget::Texture) {
     std::string tex_error;
     texture = impl_->ensure_facet_texture(arena, pool, ref, core::FacetKind::Storage, &cache_hit, nullptr,
@@ -2037,19 +3089,37 @@ bool DeviceHal::run_storage_facet(const core::Arena& arena, core::FacetPool& poo
       if (error) *error = tex_error.empty() ? "Metal storage facet texture creation failed" : tex_error;
       return false;
     }
+    target_buffer = [impl_->device newBufferWithLength:sizeof(uint32_t) * 4
+                                                options:MTLResourceStorageModeShared];
+    if (target_buffer == nil) {
+      if (error) *error = "Metal storage facet target buffer allocation failed";
+      return false;
+    }
+    const uint32_t words[4] = {texel.x, texel.y, texel.layer, texel.level};
+    std::memcpy([target_buffer contents], words, sizeof(words));
   } else {
     linear = impl_->ensure_facet_buffer(arena, pool, ref, core::FacetKind::Storage, error);
     if (linear == nil) return false;
+    if ([linear length] < texel_byte_offset + kBytesPerTexel) {
+      if (error) *error = "storage facet linear backing is smaller than the addressed subresource";
+      return false;
+    }
     // The write lands in the view's own format, so the buffer path never
     // trades away precision the caller asked for (06 §6.2).
     format_buffer = [impl_->device newBufferWithLength:sizeof(uint32_t)
                                                 options:MTLResourceStorageModeShared];
-    if (format_buffer == nil) {
+    texel_index_buffer = [impl_->device newBufferWithLength:sizeof(uint32_t)
+                                                    options:MTLResourceStorageModeShared];
+    if (format_buffer == nil || texel_index_buffer == nil) {
       if (error) *error = "Metal storage facet format buffer allocation failed";
       return false;
     }
-    const uint32_t format_code = static_cast<uint32_t>(slot->view.format);
+    const uint32_t format_code = static_cast<uint32_t>(view.format);
     std::memcpy([format_buffer contents], &format_code, sizeof(format_code));
+    // The kernel indexes in texels, not bytes; core::bytes_per_texel is 4 for
+    // both formats this milestone models, which is what makes that exact.
+    const uint32_t texel_index = static_cast<uint32_t>(texel_byte_offset / kBytesPerTexel);
+    std::memcpy([texel_index_buffer contents], &texel_index, sizeof(texel_index));
   }
 
   id<MTLCommandBuffer> command_buffer = [impl_->command_queue commandBuffer];
@@ -2057,16 +3127,19 @@ bool DeviceHal::run_storage_facet(const core::Arena& arena, core::FacetPool& poo
   id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
   if (encoder == nil) { if (error) *error = "failed to create Metal compute encoder"; return false; }
   if (target == StorageFacetTarget::Texture) {
-    [encoder setComputePipelineState:impl_->storage_facet_pipeline];
+    [encoder setComputePipelineState:array_dimension ? impl_->storage_array_facet_pipeline
+                                                     : impl_->storage_facet_pipeline];
     [encoder setTexture:texture atIndex:0];
     [encoder setBuffer:rgba_buffer offset:0 atIndex:0];
-    result->descriptor_write_count = 2;  // setTexture + setBuffer
+    [encoder setBuffer:target_buffer offset:0 atIndex:1];
+    result->descriptor_write_count = 3;  // setTexture + rgba + target subresource
   } else {
     [encoder setComputePipelineState:impl_->storage_buffer_facet_pipeline];
     [encoder setBuffer:linear offset:0 atIndex:0];
     [encoder setBuffer:rgba_buffer offset:0 atIndex:1];
     [encoder setBuffer:format_buffer offset:0 atIndex:2];
-    result->descriptor_write_count = 3;  // three buffer bindings, no texture
+    [encoder setBuffer:texel_index_buffer offset:0 atIndex:3];
+    result->descriptor_write_count = 4;  // four buffer bindings, no texture
   }
   [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
   [encoder endEncoding];
@@ -2080,13 +3153,16 @@ bool DeviceHal::run_storage_facet(const core::Arena& arena, core::FacetPool& poo
   }
 
   if (target == StorageFacetTarget::Texture) {
-    if (!impl_->read_first_texel(texture, &result->written_rgba, error)) return false;
-  } else if (slot->view.format == core::PixelFormat::RGBA8Unorm) {
-    const uint8_t* bytes = static_cast<const uint8_t*>([linear contents]);
+    if (!impl_->read_texel(texture, texel.layer, texel.level, texel.x, texel.y, &result->written_rgba,
+                           error))
+      return false;
+  } else if (view.format == core::PixelFormat::RGBA8Unorm) {
+    const uint8_t* bytes = static_cast<const uint8_t*>([linear contents]) + texel_byte_offset;
     result->written_rgba = {bytes[0] / 255.0f, bytes[1] / 255.0f, bytes[2] / 255.0f, bytes[3] / 255.0f};
   } else {
-    const float* texel = static_cast<const float*>([linear contents]);
-    result->written_rgba = {texel[0], 0.0f, 0.0f, 0.0f};
+    float value{};
+    std::memcpy(&value, static_cast<const uint8_t*>([linear contents]) + texel_byte_offset, sizeof(value));
+    result->written_rgba = {value, 0.0f, 0.0f, 0.0f};
   }
   result->target = target;
   result->facet_cache_hit = cache_hit;
@@ -2122,6 +3198,9 @@ bool DeviceHal::run_attachment_facet(const core::Arena& arena, core::FacetPool& 
   }
   FacetUseGuard use(pool, ref);
   if (!use.begin(arena, error)) return false;
+  const core::FacetSlot* slot = impl_->resolve_facet(arena, pool, ref, core::FacetKind::Attachment, error);
+  if (slot == nullptr) return false;
+  if (!subresource_in_range(slot->view, desc.subresource, error)) return false;
   bool cache_hit = false;
   std::string tex_error;
   id<MTLTexture> texture = impl_->ensure_facet_texture(arena, pool, ref, core::FacetKind::Attachment,
@@ -2133,47 +3212,12 @@ bool DeviceHal::run_attachment_facet(const core::Arena& arena, core::FacetPool& 
 
   // No draw and no fragment shader: this exercises the load/store/resolve
   // lowering itself, which is where 06 §6.3's "not public object state"
-  // constraint actually lives.
-  MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor new];
-  MTLRenderPassColorAttachmentDescriptor* color = rp.colorAttachments[0];
-  color.clearColor =
-      MTLClearColorMake(desc.clear_rgba[0], desc.clear_rgba[1], desc.clear_rgba[2], desc.clear_rgba[3]);
-  switch (desc.load) {
-    case AttachmentLoadAction::Clear: color.loadAction = MTLLoadActionClear; break;
-    case AttachmentLoadAction::Load: color.loadAction = MTLLoadActionLoad; break;
-    case AttachmentLoadAction::DontCare: color.loadAction = MTLLoadActionDontCare; break;
-  }
-
+  // constraint actually lives. run_raster_triangles() below is the same
+  // lowering with a draw in it, built from the same helper.
   bool store_traffic_avoided = false;
-  if (multisampled) {
-    MTLTextureDescriptor* ms = [MTLTextureDescriptor new];
-    ms.textureType = MTLTextureType2DMultisample;
-    ms.pixelFormat = texture.pixelFormat;
-    ms.width = texture.width;
-    ms.height = texture.height;
-    ms.sampleCount = desc.sample_count;
-    ms.usage = MTLTextureUsageRenderTarget;
-    // Memoryless keeps the per-sample data on-tile, so the only external
-    // write is the resolved single-sample result. Where that is unavailable
-    // the samples really do go to device memory, and the result says so
-    // rather than claiming an optimization the device did not perform.
-    const bool memoryless = [impl_->device supportsFamily:MTLGPUFamilyApple1];
-    ms.storageMode = memoryless ? MTLStorageModeMemoryless : MTLStorageModePrivate;
-    id<MTLTexture> ms_texture = [impl_->device newTextureWithDescriptor:ms];
-    if (ms_texture == nil) {
-      if (error) *error = "Unsupported: device rejected a multisample render target for this format";
-      return false;
-    }
-    color.texture = ms_texture;
-    color.resolveTexture = texture;
-    color.storeAction = MTLStoreActionMultisampleResolve;
-    store_traffic_avoided = memoryless;
-  } else {
-    color.texture = texture;
-    color.storeAction =
-        desc.store == AttachmentStoreAction::Store ? MTLStoreActionStore : MTLStoreActionDontCare;
-    store_traffic_avoided = desc.store == AttachmentStoreAction::DontCare;
-  }
+  MTLRenderPassDescriptor* rp = impl_->make_render_pass(texture, desc, slot->view,
+                                                        &store_traffic_avoided, error);
+  if (rp == nil) return false;
 
   id<MTLCommandBuffer> command_buffer = [impl_->command_queue commandBuffer];
   if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
@@ -2189,7 +3233,9 @@ bool DeviceHal::run_attachment_facet(const core::Arena& arena, core::FacetPool& 
     return false;
   }
 
-  if (!impl_->read_first_texel(texture, &result->resolved_rgba, error)) return false;
+  if (!impl_->read_texel(texture, desc.subresource.layer, desc.subresource.level, 0, 0,
+                         &result->resolved_rgba, error))
+    return false;
   result->facet_cache_hit = cache_hit;
   result->encoder_count = 1;
   result->sample_count = desc.sample_count;
@@ -2213,122 +3259,530 @@ bool DeviceHal::run_representation_transform(core::Arena& arena, core::FacetPool
     if (error) *error = "representation transform result output is required";
     return false;
   }
-  if (target_kind != core::FacetKind::Sample && target_kind != core::FacetKind::Storage &&
-      target_kind != core::FacetKind::Attachment) {
-    if (error) *error = "representation transform target_kind must be Sample, Storage, or Attachment";
-    return false;
-  }
-  if (view.dimension != core::ViewDimension::Texture2D || view.array_layers != 1 || view.mip_levels != 1) {
-    if (error) *error = "Unsupported: representation transform currently requires Texture2D 1x1 layers/mips";
-    return false;
-  }
-  auto* allocation = arena.lookup(view.allocation, view.allocation_generation);
+  const core::Allocation* allocation = arena.lookup(view.allocation, view.allocation_generation);
   if (allocation == nullptr) {
     if (error) *error = "representation transform: backing allocation not found in arena";
     return false;
   }
+  if (!view_expressible(view, target_kind, allocation->bytes.size(), error)) return false;
   const uint64_t old_bytes = allocation->bytes.size();
-  constexpr uint64_t kBytesPerPixel = 4;
-  const uint64_t new_bytes = static_cast<uint64_t>(view.width) * view.height * kBytesPerPixel;
-  if (old_bytes < new_bytes) {
-    if (error) *error = "representation transform: linear backing smaller than view extent";
-    return false;
-  }
-  if (!view.swizzle.identity() && target_kind != core::FacetKind::Sample) {
-    if (error) *error = "Unsupported: non-identity swizzle applies to SampleFacet only";
-    return false;
-  }
 
-  const MTLPixelFormat mtl_format = to_mtl_pixel_format(view.format);
-  MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mtl_format
-                                                                                          width:view.width
-                                                                                         height:view.height
-                                                                                      mipmapped:NO];
-  descriptor.storageMode = MTLStorageModePrivate;
-  if (target_kind == core::FacetKind::Sample) {
-    descriptor.usage = MTLTextureUsageShaderRead;
-  } else if (target_kind == core::FacetKind::Storage) {
-    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-  } else {
-    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-  }
-  if (!view.swizzle.identity()) descriptor.usage |= MTLTextureUsagePixelFormatView;
-  id<MTLTexture> private_texture = [impl_->device newTextureWithDescriptor:descriptor];
-  if (private_texture == nil) {
-    if (error) *error = "representation transform: Private MTLTexture creation failed";
-    return false;
-  }
-
-  // Real transform pass (02 §8: a transform is not a barrier). The blit source
-  // is the linear representation reached through a TransferFacet over the same
-  // CanonicalView, so even the transform's own read is a pool-resolved
-  // capability and not a raw buffer handle -- and reusing the existing linear
-  // backing means the transform needs no staging copy at all.
-  core::FacetRef transfer_ref{};
-  if (!pool.acquire(arena, view, core::FacetKind::Transfer, &transfer_ref, error)) return false;
-  {
-    FacetUseGuard use(pool, transfer_ref);
-    if (!use.begin(arena, error)) return false;
-    id<MTLBuffer> source = impl_->ensure_facet_buffer(arena, pool, transfer_ref, core::FacetKind::Transfer, error);
-    if (source == nil) return false;
-
-    id<MTLCommandBuffer> command_buffer = [impl_->command_queue commandBuffer];
-    if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
-    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
-    if (blit == nil) { if (error) *error = "failed to create Metal blit encoder"; return false; }
-    [blit copyFromBuffer:source
-            sourceOffset:0
-           sourceBytesPerRow:view.width * kBytesPerPixel
-         sourceBytesPerImage:new_bytes
-                  sourceSize:MTLSizeMake(view.width, view.height, 1)
-                   toTexture:private_texture
-            destinationSlice:0
-            destinationLevel:0
-           destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [blit endEncoding];
-    [command_buffer commit];
-    [command_buffer waitUntilCompleted];
-    if (command_buffer.status == MTLCommandBufferStatusError || command_buffer.error != nil) {
-      if (error)
-        *error = command_buffer.error != nil ? [[command_buffer.error localizedDescription] UTF8String]
-                                              : "representation transform blit failed";
-      return false;
-    }
-  }
-
+  // Real transform pass (02 §8: a transform is not a barrier). Publishing the
+  // new epoch first invalidates every facet minted against the old one;
+  // retire_stale is what actually returns their slots, and only for slots with
+  // no work still in flight.
   uint32_t new_epoch = 0;
   if (!arena.transform(view.allocation, view.allocation_generation, &new_epoch, error)) return false;
-  // Publishing the new epoch invalidates every facet minted against the old
-  // one, including the TransferFacet above; retire_stale is what actually
-  // returns their slots, and only for slots with no work still in flight.
   const uint32_t retired = static_cast<uint32_t>(pool.retire_stale(arena));
 
   core::FacetRef out_facet{};
   if (!pool.acquire(arena, view, target_kind, &out_facet, error)) return false;
-  // Install the Private texture so subsequent facet uses resolve through
-  // FacetPool onto the optimal representation instead of recreating a Shared
-  // texture from host bytes.
-  if (impl_->install_facet_record(out_facet, view, target_kind, new_epoch, private_texture, error) == nil)
+  // Same helper submit()'s Stage 5 physical callback uses, so the standalone
+  // entry point and the ExecutionPlan path cannot drift on which subresources
+  // get copied or on what the transform costs.
+  Impl::TransformCost cost;
+  if (!impl_->transform_into_private_facet(arena, pool, view, target_kind, out_facet, &cost, error))
     return false;
 
   result->new_epoch = new_epoch;
   result->old_backing_bytes = old_bytes;
-  result->new_backing_bytes = new_bytes;
-  result->temporary_bytes = 0;
-  result->encoder_count = 1;
+  result->new_backing_bytes = cost.new_backing_bytes;
+  result->temporary_bytes = cost.temporary_bytes;
+  result->encoder_count = cost.encoder_count;
   result->used_private_optimal = true;
   result->retired_facet_count = retired;
   result->out_facet = out_facet;
   result->report = make_facet_report();
+  result->report.encoder_count = cost.encoder_count;
+  result->report.command_buffer_count = 1;
+  result->report.queue_wait_count = 1;
+  result->report.add("representation_transform", hal::LoweringClass::DevicePass, view.subresource_count(),
+                     cost.new_backing_bytes,
+                     "blit every subresource from the TransferFacet's linear buffer into a Private "
+                     "optimal texture");
+  result->report.add("representation_transform_peak", hal::LoweringClass::Direct, 1,
+                     old_bytes + cost.new_backing_bytes,
+                     "old linear backing retained alongside the new texture; no staging copy. This entry "
+                     "point never consumes it: 02 §4.2 makes ConsumeInput a proven exclusive consume, and "
+                     "06 §11 forbids the adapter inferring a destructive transform on its own, so the "
+                     "watermark is only reduced through ExecutionPlan::representation_requests");
+  result->report.add("facet_retire_stale", hal::LoweringClass::Direct, retired, 0,
+                     "facets invalidated by the new RepresentationEpoch");
+  const uint32_t retired_textures = impl_->retire_stale_facet_textures(arena, pool);
+  if (retired_textures != 0) {
+    result->report.add("facet_texture_retire", hal::LoweringClass::Direct, retired_textures, 0,
+                       "MTLTextures belonging to retired facet slots destroyed after the transform");
+  }
+  return true;
+}
+
+bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& pool,
+                                     core::FacetRef source_ref, core::FacetRef target_ref,
+                                     const RasterDesc& desc, const std::vector<RasterVertex>& vertices,
+                                     RasterResult* result, std::string* error) const {
+  if (result == nullptr) { if (error) *error = "raster result output is required"; return false; }
+  if (vertices.empty() || vertices.size() % 3 != 0) {
+    if (error) *error = "raster vertex count must be a non-zero multiple of 3 (triangle list)";
+    return false;
+  }
+  const bool multisampled = desc.attachment.sample_count > 1;
+  if (multisampled != (desc.attachment.store == AttachmentStoreAction::MultisampleResolve)) {
+    if (error) *error = "raster: MultisampleResolve and sample_count > 1 must be requested together";
+    return false;
+  }
+  if (multisampled && desc.attachment.load == AttachmentLoadAction::Load) {
+    if (error) *error = "Unsupported: a transient multisample attachment has no prior contents to load";
+    return false;
+  }
+
+  // Both refs are capability tokens and both are bracketed: a pass reads one
+  // facet and writes another, so neither slot may be recycled under work still
+  // in flight (06 §6.4, §11).
+  FacetUseGuard source_use(pool, source_ref);
+  if (!source_use.begin(arena, error)) return false;
+  FacetUseGuard target_use(pool, target_ref);
+  if (!target_use.begin(arena, error)) return false;
+
+  const core::FacetSlot* source_slot =
+      impl_->resolve_facet(arena, pool, source_ref, core::FacetKind::Sample, error);
+  if (source_slot == nullptr) return false;
+  const core::FacetSlot* target_slot =
+      impl_->resolve_facet(arena, pool, target_ref, core::FacetKind::Attachment, error);
+  if (target_slot == nullptr) return false;
+  const core::CanonicalView& source_view = source_slot->view;
+  const core::CanonicalView& target_view = target_slot->view;
+  if (!subresource_in_range(target_view, desc.attachment.subresource, error)) return false;
+  if (desc.source_array_slice >= source_view.array_layers) {
+    if (error)
+      *error = "raster source names array slice " + std::to_string(desc.source_array_slice) +
+               " of a canonical view declaring " + std::to_string(source_view.array_layers) + " layer(s)";
+    return false;
+  }
+  if (!(desc.source_lod >= 0.0f) || desc.source_lod > static_cast<float>(source_view.mip_levels - 1)) {
+    if (error)
+      *error = "raster source names lod " + std::to_string(desc.source_lod) +
+               " of a canonical view declaring " + std::to_string(source_view.mip_levels) + " mip level(s)";
+    return false;
+  }
+  // Reading the very subresource being written has no defined result, and a
+  // pass that returned an order-dependent image for it would be worse than
+  // useless as a differential against the oracle, which refuses it for exactly
+  // this reason. Sharing an allocation is fine as long as the subresource
+  // differs, so generating one mip level from another stays expressible.
+  if (source_view.allocation == target_view.allocation &&
+      desc.source_array_slice == desc.attachment.subresource.layer &&
+      static_cast<uint32_t>(desc.source_lod) == desc.attachment.subresource.level &&
+      desc.source_lod == static_cast<float>(static_cast<uint32_t>(desc.source_lod))) {
+    if (error)
+      *error = "raster source and target name the same subresource of the same allocation; a read of the "
+               "surface being written has no defined result";
+    return false;
+  }
+
+  bool source_cache_hit = false;
+  std::string tex_error;
+  id<MTLTexture> source_texture = impl_->ensure_facet_texture(arena, pool, source_ref,
+                                                              core::FacetKind::Sample, &source_cache_hit,
+                                                              nullptr, &tex_error);
+  if (source_texture == nil) {
+    if (error) *error = tex_error.empty() ? "Metal raster source texture creation failed" : tex_error;
+    return false;
+  }
+  // The shared fragment stage declares `texture2d<float>` and takes no slice or
+  // level argument, so an array source reaches it as a single-slice 2D view
+  // over the whole mip chain -- a real reinterpretation of the same storage,
+  // not a copy and not a silently ignored slice. The requested level is then
+  // pinned through the sampler's lod clamps below, which is exact for a
+  // fractional lod too because MipFilterLinear blends the two levels the clamp
+  // lands between.
+  if (source_view.dimension == core::ViewDimension::Texture2DArray) {
+    source_texture = [source_texture newTextureViewWithPixelFormat:source_texture.pixelFormat
+                                                       textureType:MTLTextureType2D
+                                                            levels:NSMakeRange(0, source_view.mip_levels)
+                                                            slices:NSMakeRange(desc.source_array_slice, 1)];
+    if (source_texture == nil) {
+      if (error) *error = "Metal raster source array-slice texture view creation failed";
+      return false;
+    }
+  }
+  id<MTLSamplerState> sampler =
+      impl_->ensure_sampler_state(desc.filter, desc.wrap, desc.source_lod, desc.source_lod);
+  if (sampler == nil) { if (error) *error = "Metal raster sampler creation failed"; return false; }
+
+  bool target_cache_hit = false;
+  id<MTLTexture> target_texture = impl_->ensure_facet_texture(arena, pool, target_ref,
+                                                              core::FacetKind::Attachment,
+                                                              &target_cache_hit, nullptr, &tex_error);
+  if (target_texture == nil) {
+    if (error) *error = tex_error.empty() ? "Metal raster target texture creation failed" : tex_error;
+    return false;
+  }
+
+  // Attachment format and sample count are compiled into the pipeline and are
+  // therefore key state (06 §7); the viewport set below and the tint bound at
+  // fragment buffer(0) are not, and must not enlarge the key.
+  std::string pipeline_error;
+  id<MTLRenderPipelineState> pipeline_state = nil;
+  if (!impl_->ensure_raster_pipeline(target_view.format, desc.attachment.sample_count, &pipeline_state,
+                                     &pipeline_error)) {
+    if (error) *error = "Metal raster pipeline compile failed: " + pipeline_error;
+    return false;
+  }
+
+  id<MTLBuffer> vertex_buffer =
+      [impl_->device newBufferWithLength:vertices.size() * sizeof(RasterVertex)
+                                 options:MTLResourceStorageModeShared];
+  id<MTLBuffer> tint_buffer = [impl_->device newBufferWithLength:sizeof(float) * 4
+                                                         options:MTLResourceStorageModeShared];
+  if (vertex_buffer == nil || tint_buffer == nil) {
+    if (error) *error = "Metal raster buffer allocation failed";
+    return false;
+  }
+  // RasterVertex is {x, y, u, v} and the MSL side is
+  // `struct VgRasterVertex { float2 position; float2 uv; }`: the same 16 bytes
+  // in the same order, so the host array uploads without a repack.
+  std::memcpy([vertex_buffer contents], vertices.data(), vertices.size() * sizeof(RasterVertex));
+  std::memcpy([tint_buffer contents], desc.tint.data(), sizeof(float) * 4);
+
+  const uint32_t level = desc.attachment.subresource.level;
+  const uint32_t width = target_view.mip_width(level);
+  const uint32_t height = target_view.mip_height(level);
+  bool store_traffic_avoided = false;
+  MTLRenderPassDescriptor* rp = impl_->make_render_pass(target_texture, desc.attachment, target_view,
+                                                        &store_traffic_avoided, error);
+  if (rp == nil) return false;
+
+  id<MTLCommandBuffer> command_buffer = [impl_->command_queue commandBuffer];
+  if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
+  id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:rp];
+  if (encoder == nil) { if (error) *error = "failed to create Metal render encoder"; return false; }
+  [encoder setRenderPipelineState:pipeline_state];
+  // Dynamic state, deliberately: a viewport change must not compile a second
+  // pipeline (06 §7's "小的动态状态不应无故扩大 key").
+  [encoder setViewport:(MTLViewport){0.0, 0.0, static_cast<double>(width), static_cast<double>(height),
+                                     0.0, 1.0}];
+  [encoder setVertexBuffer:vertex_buffer offset:0 atIndex:compiler::kRasterVertexBufferIndex];
+  [encoder setFragmentTexture:source_texture atIndex:compiler::kRasterTextureIndex];
+  [encoder setFragmentSamplerState:sampler atIndex:compiler::kRasterSamplerIndex];
+  [encoder setFragmentBuffer:tint_buffer offset:0 atIndex:compiler::kRasterTintBufferIndex];
+  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices.size()];
+  [encoder endEncoding];
+  [command_buffer commit];
+  [command_buffer waitUntilCompleted];
+  if (command_buffer.status == MTLCommandBufferStatusError || command_buffer.error != nil) {
+    if (error)
+      *error = command_buffer.error != nil ? [[command_buffer.error localizedDescription] UTF8String]
+                                            : "Metal raster pass failed";
+    return false;
+  }
+
+  const bool stored = desc.attachment.store == AttachmentStoreAction::Store ||
+                      desc.attachment.store == AttachmentStoreAction::MultisampleResolve;
+  // The whole target subresource, not texel (0,0): an image-correctness
+  // differential against reference::raster_triangles needs every pixel, and a
+  // single-texel readback would let a coverage or interpolation regression pass
+  // unnoticed.
+  if (!impl_->read_texture_region(target_texture, desc.attachment.subresource.layer, level, 0, 0, width,
+                                  height, &result->resolved_rgba, error))
+    return false;
+
+  result->width = width;
+  result->height = height;
+  result->sample_count = desc.attachment.sample_count;
+  result->covered_fragment_count = 0;
+  result->stored = stored;
+  // A DontCare load leaves the previous bytes visible and a DontCare store
+  // leaves memory untouched; in both cases the contract does not define what a
+  // reader sees, so the values returned must not be used as an expectation.
+  result->contents_defined = stored && desc.attachment.load != AttachmentLoadAction::DontCare;
+  result->facet_cache_hit = source_cache_hit && target_cache_hit;
+  result->encoder_count = 1;
+  result->report = make_facet_report();
   result->report.encoder_count = 1;
   result->report.command_buffer_count = 1;
   result->report.queue_wait_count = 1;
-  result->report.add("representation_transform", hal::LoweringClass::DevicePass, 1, new_bytes,
-                     "blit from the TransferFacet's linear buffer into a Private optimal texture");
-  result->report.add("representation_transform_peak", hal::LoweringClass::Direct, 1, old_bytes + new_bytes,
-                     "old linear backing retained alongside the new texture; no staging copy");
-  result->report.add("facet_retire_stale", hal::LoweringClass::Direct, retired, 0,
-                     "facets invalidated by the new RepresentationEpoch");
+  result->report.add("raster_attachment_store", hal::LoweringClass::Direct, vertices.size() / 3, 0,
+                     std::string("real MTLRenderPipelineState triangle-list draw into a render "
+                                 "attachment; ") +
+                         kRasterClipSpaceNote);
+  result->report.add("raster_source_sample",
+                     source_cache_hit ? hal::LoweringClass::CachedObject : hal::LoweringClass::DevicePass, 1,
+                     0,
+                     "SampleFacet read through a texture2d view of the requested array slice, level pinned "
+                     "by the sampler's lod clamps");
+  result->report.add(multisampled ? "raster_resolve" : "raster_store", hal::LoweringClass::Direct, 1, 0,
+                     store_traffic_avoided ? "attachment samples never reached device memory"
+                                           : "attachment contents written to device memory");
+  return true;
+}
+
+bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, std::string* error) const {
+  if (result == nullptr) {
+    if (error) *error = "pipeline classification result output is required";
+    return false;
+  }
+  *result = PipelineClassificationRun{};
+
+  // E013's three axes, one per 07 §9 fate that is allowed to exist, plus the
+  // two raster parameters E013 names by hand. Every axis carries two values so
+  // the matrix is exactly the 2x2x2 the experiment asks for and the expected
+  // counts are arithmetic rather than a judgement call.
+  //
+  //  - checked profile: a function constant. 06 §6.4 compiles the generation
+  //    guard in or specializes it away, so it genuinely cannot be anything but
+  //    PipelineKey state.
+  //  - threadgroup width / viewport: set on the encoder. 06 §7's "小的动态状态
+  //    不应无故扩大 key" is precisely about this one.
+  //  - sample lod / tint: bytes the shader reads from a binding. Changing them
+  //    changes the image, not the program.
+  static constexpr std::array<uint64_t, 2> kCheckedValues{0, 1};
+  static constexpr std::array<uint64_t, 2> kDynamicValues{32, 64};
+  static constexpr std::array<uint64_t, 2> kShaderValues{0, 1};
+  static constexpr std::array<core::PixelFormat, 2> kFormats{core::PixelFormat::RGBA8Unorm,
+                                                             core::PixelFormat::R32Float};
+  static constexpr std::array<uint32_t, 2> kSampleCounts{1, 4};
+
+  const std::string compute_source = compiler::sample_facet_metal_source();
+  const std::string raster_source = compiler::raster_facet_metal_source();
+  const std::string compute_entry = "vg_sample_facet";
+  const std::string raster_fragment_entry = "vg_raster_fragment";
+  const std::string raster_vertex_entry = "vg_raster_vertex";
+
+  auto compute_constants = [](uint64_t checked) {
+    std::vector<std::pair<std::string, uint64_t>> constants;
+    // An unset constant is fast-native (is_function_constant_defined() is
+    // false in the kernel), so the guard-off variant names nothing rather than
+    // naming a false.
+    if (checked != 0) constants.emplace_back("vg_checked_profile", 1);
+    return constants;
+  };
+
+  // ---- Naive variant -------------------------------------------------------
+  //
+  // What a backend does when it has no state taxonomy: every permutation of
+  // every piece of pipeline-adjacent state is assumed to need its own compiled
+  // object, so it compiles one. Nothing here consults a cache, and the count is
+  // of MTLComputePipelineState / MTLRenderPipelineState objects this device
+  // really created -- not of permutations enumerated.
+  std::vector<id<MTLComputePipelineState>> naive_compute;
+  std::vector<id<MTLRenderPipelineState>> naive_render;
+  const auto release_naive = [&]() {
+    for (id<MTLComputePipelineState> pipeline : naive_compute) [pipeline release];
+    for (id<MTLRenderPipelineState> pipeline : naive_render) [pipeline release];
+  };
+  uint64_t naive_ns = 0;
+  for (uint64_t checked : kCheckedValues) {
+    for (uint64_t dynamic_value : kDynamicValues) {
+      for (uint64_t shader_value : kShaderValues) {
+        (void)dynamic_value;
+        (void)shader_value;
+        const auto start = std::chrono::steady_clock::now();
+        compiler::PipelineKey key =
+            impl_->make_pipeline_key(compute_source, compute_entry, compute_constants(checked), {}, 1);
+        id<MTLLibrary> library_object =
+            impl_->ensure_library(compute_source, key.code_object_hash, error);
+        if (library_object == nil) { release_naive(); return false; }
+        id<MTLFunction> function = impl_->ensure_function(library_object, key, error);
+        if (function == nil) { release_naive(); return false; }
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            [impl_->device newComputePipelineStateWithFunction:function error:&pipeline_error];
+        naive_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                .count());
+        if (pipeline == nil) {
+          if (error)
+            *error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
+                                           : "naive compute pipeline creation failed";
+          release_naive();
+          return false;
+        }
+        naive_compute.push_back(pipeline);
+      }
+    }
+  }
+  for (core::PixelFormat format : kFormats) {
+    for (uint32_t sample_count : kSampleCounts) {
+      for (uint64_t dynamic_value : kDynamicValues) {
+        for (uint64_t shader_value : kShaderValues) {
+          (void)dynamic_value;
+          (void)shader_value;
+          const auto start = std::chrono::steady_clock::now();
+          const compiler::PipelineKey key =
+              impl_->make_pipeline_key(raster_source, raster_fragment_entry, {},
+                                       {static_cast<uint32_t>(format)}, sample_count);
+          id<MTLLibrary> library_object =
+              impl_->ensure_library(raster_source, key.code_object_hash, error);
+          if (library_object == nil) { release_naive(); return false; }
+          compiler::PipelineKey vertex_key = key;
+          vertex_key.entry = raster_vertex_entry;
+          id<MTLFunction> vertex_function = impl_->ensure_function(library_object, vertex_key, error);
+          id<MTLFunction> fragment_function = impl_->ensure_function(library_object, key, error);
+          if (vertex_function == nil || fragment_function == nil) { release_naive(); return false; }
+          MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
+          descriptor.vertexFunction = vertex_function;
+          descriptor.fragmentFunction = fragment_function;
+          descriptor.colorAttachments[0].pixelFormat = to_mtl_pixel_format(format);
+          descriptor.rasterSampleCount = sample_count;
+          NSError* pipeline_error = nil;
+          id<MTLRenderPipelineState> pipeline =
+              [impl_->device newRenderPipelineStateWithDescriptor:descriptor error:&pipeline_error];
+          naive_ns += static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                  .count());
+          if (pipeline == nil) {
+            if (error)
+              *error = pipeline_error != nil ? [[pipeline_error localizedDescription] UTF8String]
+                                             : "naive render pipeline creation failed";
+            release_naive();
+            return false;
+          }
+          naive_render.push_back(pipeline);
+        }
+      }
+    }
+  }
+  result->naive_pipeline_count =
+      static_cast<uint32_t>(naive_compute.size() + naive_render.size());
+  result->naive_compile_ns = naive_ns;
+  release_naive();
+
+  // ---- VG classified variant ----------------------------------------------
+  //
+  // The cache and the object maps are local to this run so the numbers below
+  // describe this experiment only. Reusing impl_->pipeline_cache would fold in
+  // every pipeline the rest of the session happened to compile first, and a
+  // hit/miss ratio measured against unrelated history is not the ratio E013
+  // asks about.
+  compiler::PipelineClassificationCache cache;
+  std::unordered_map<uint64_t, id<MTLComputePipelineState>> compute_objects;
+  std::unordered_map<uint64_t, id<MTLRenderPipelineState>> render_objects;
+  const auto release_classified = [&]() {
+    for (auto& entry : compute_objects) [entry.second release];
+    for (auto& entry : render_objects) [entry.second release];
+  };
+
+  for (uint64_t checked : kCheckedValues) {
+    for (uint64_t dynamic_value : kDynamicValues) {
+      for (uint64_t shader_value : kShaderValues) {
+        const compiler::PipelineKey base =
+            impl_->make_pipeline_key(compute_source, compute_entry, compute_constants(checked), {}, 1);
+        const std::vector<compiler::StateBlock> blocks{
+            {"facet_generation_guard", compiler::StateBlockKind::PipelineKey, checked},
+            {"threadgroup_width", compiler::StateBlockKind::DynamicState, dynamic_value},
+            {"sample_lod", compiler::StateBlockKind::ShaderVisibleData, shader_value},
+        };
+        const compiler::PipelineClassification classification = classify_pipeline_state(base, blocks);
+        if (!classification.ok) {
+          if (error) *error = "pipeline classification rejected a supported compute permutation: " +
+                              classification.message;
+          release_classified();
+          return false;
+        }
+        if (!impl_->acquire_compute_pipeline(cache, compute_objects, compute_source, classification.key,
+                                             "E013 classified SampleFacet permutation", nullptr, nullptr,
+                                             error)) {
+          release_classified();
+          return false;
+        }
+      }
+    }
+  }
+  for (core::PixelFormat format : kFormats) {
+    for (uint32_t sample_count : kSampleCounts) {
+      for (uint64_t dynamic_value : kDynamicValues) {
+        for (uint64_t shader_value : kShaderValues) {
+          const compiler::PipelineKey base =
+              impl_->make_pipeline_key(raster_source, raster_fragment_entry, {},
+                                       {static_cast<uint32_t>(format)}, sample_count);
+          const std::vector<compiler::StateBlock> blocks{
+              {"viewport", compiler::StateBlockKind::DynamicState, dynamic_value},
+              {"tint", compiler::StateBlockKind::ShaderVisibleData, shader_value},
+          };
+          const compiler::PipelineClassification classification = classify_pipeline_state(base, blocks);
+          if (!classification.ok) {
+            if (error) *error = "pipeline classification rejected a supported raster permutation: " +
+                                classification.message;
+            release_classified();
+            return false;
+          }
+          if (!impl_->acquire_render_pipeline(cache, render_objects, raster_source, classification.key,
+                                              raster_vertex_entry, to_mtl_pixel_format(format),
+                                              "E013 classified raster permutation", nullptr, nullptr,
+                                              error)) {
+            release_classified();
+            // The two raster axes are the only key state that lives late in
+            // PipelineKey::canonical(), so a digest that cannot separate them
+            // surfaces here first. Say so, rather than letting the caller read
+            // a bare "collision" and conclude the classification is wrong: the
+            // classification is right, and the key it produced is distinct
+            // text. Reporting the failure is the only honest option, since
+            // serving one pipeline for two attachment formats would be a
+            // silently wrong PSO (START.md invariant 10).
+            if (error)
+              *error += ". The two keys differ in attachment format or sample count, which 06 §7 makes "
+                        "key state; a digest that cannot separate them cannot answer E013";
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  // A state block this device cannot express must stop the classification, not
+  // become another key bit (START.md invariant 10, 06 §6.2). The probe is a
+  // real call with a real rejection, so "we reject it" is measured here rather
+  // than asserted in a comment.
+  const compiler::PipelineKey unsupported_base =
+      impl_->make_pipeline_key(raster_source, raster_fragment_entry, {},
+                               {static_cast<uint32_t>(core::PixelFormat::RGBA8Unorm)}, 1);
+  const compiler::PipelineClassification unsupported = classify_pipeline_state(
+      unsupported_base,
+      {{"viewport", compiler::StateBlockKind::DynamicState, kDynamicValues[0]},
+       {"attachment_format_needs_conversion", compiler::StateBlockKind::UnsupportedNeedsConversion, 0}});
+  if (unsupported.ok) {
+    if (error)
+      *error = "an UnsupportedNeedsConversion state block was folded into a pipeline key instead of "
+               "being rejected";
+    release_classified();
+    return false;
+  }
+  result->unsupported_rejected = true;
+
+  result->classified_pipeline_count = cache.pipeline_count();
+  result->cache_hits = cache.cache_hits();
+  result->cache_misses = cache.cache_misses();
+  result->reports = cache.reports();
+  uint64_t classified_ns = 0;
+  for (const compiler::SpecializationReport& report : result->reports) classified_ns += report.compile_ns;
+  result->classified_compile_ns = classified_ns;
+  release_classified();
+
+  if (result->classified_pipeline_count >= result->naive_pipeline_count) {
+    if (error)
+      *error = "classification produced " + std::to_string(result->classified_pipeline_count) +
+               " pipelines against a naive " + std::to_string(result->naive_pipeline_count) +
+               "; E013 only has an answer if keeping dynamic and shader-visible state out of the key "
+               "actually removes permutations";
+    return false;
+  }
+
+  result->report = make_facet_report();
+  result->report.add("pipeline_key_state", hal::LoweringClass::Direct,
+                     result->classified_pipeline_count, 0,
+                     "function constants, attachment format and sample count are compiled in and are the "
+                     "only state that reached the key (06 §7)");
+  result->report.add("pipeline_dynamic_state", hal::LoweringClass::Direct,
+                     static_cast<uint32_t>(kDynamicValues.size()), 0,
+                     "threadgroup width and viewport are set on the encoder and compiled no pipeline");
+  result->report.add("pipeline_shader_visible_data", hal::LoweringClass::Direct,
+                     static_cast<uint32_t>(kShaderValues.size()), 0,
+                     "sample lod and tint are bytes the shader reads and compiled no pipeline");
+  result->report.add("pipeline_permutations_avoided", hal::LoweringClass::Direct,
+                     result->naive_pipeline_count - result->classified_pipeline_count, 0,
+                     "permutations a taxonomy-free backend would have compiled");
+  result->report.add("pipeline_unsupported_rejected", hal::LoweringClass::Unsupported, 1, 0,
+                     "a state block requiring conversion was reported, never folded into a key");
   return true;
 }
 

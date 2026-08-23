@@ -27,7 +27,9 @@ std::string sha256_hex(const std::string& input) {
   std::array<uint32_t, 8> h = {0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u};
   for (size_t block = 0; block < data.size(); block += 64) {
     uint32_t w[64]{};
-    for (int i = 0; i < 16; ++i) for (int j = 0; j < 4; ++j) w[i * 4 + j] = (w[i * 4 + j] << 8) | static_cast<unsigned char>(data[block + i * 4 + j]);
+    for (int i = 0; i < 16; ++i)
+      for (int j = 0; j < 4; ++j)
+        w[i] = (w[i] << 8) | static_cast<unsigned char>(data[block + i * 4 + j]);
     for (int i = 16; i < 64; ++i) {
       uint32_t s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >> 3);
       uint32_t s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >> 10);

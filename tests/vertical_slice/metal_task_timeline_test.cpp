@@ -2,6 +2,8 @@
 #include "backends/metal/metal_device_hal.h"
 #include "backends/reference/reference_device_hal.h"
 #include "backends/reference/reference_executor.h"
+#include "capture/capture.h"
+#include "compiler/compiler.h"
 #include "ir/ir.h"
 
 #include <algorithm>
@@ -1272,13 +1274,1225 @@ bool run_indexed_binding(const std::string& root) {
   return true;
 }
 
+// One 8-bit quantization step, the tightest tolerance an RGBA8Unorm round
+// trip can honestly hold (E008 nearest). Bilinear/edge pixels use the
+// registered blend tolerance rather than pretending GPU and CPU rounding agree.
+constexpr float kNearestTol = 1.0f / 255.0f + 1e-4f;
+
+bool channels_close(const std::array<float, 4>& got, const std::array<float, 4>& want, float tol,
+                    const char* label, const char* what) {
+  for (int c = 0; c < 4; ++c) {
+    if (std::fabs(got[c] - want[c]) <= tol) continue;
+    std::cerr << label << ": " << what << " channel " << c << " got " << got[c] << " expected "
+              << want[c] << "\n";
+    return false;
+  }
+  return true;
+}
+
+void fill_subresource(vg::core::Allocation& allocation, const vg::core::CanonicalView& view,
+                      uint32_t layer, uint32_t level, const std::array<uint8_t, 4>& rgba) {
+  const uint64_t offset = view.subresource_byte_offset(layer, level);
+  const uint32_t width = view.mip_width(level);
+  const uint32_t height = view.mip_height(level);
+  const uint64_t row = view.bytes_per_row(level);
+  for (uint32_t y = 0; y < height; ++y) {
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint64_t texel = offset + static_cast<uint64_t>(y) * row + static_cast<uint64_t>(x) * 4;
+      allocation.bytes[texel + 0] = rgba[0];
+      allocation.bytes[texel + 1] = rgba[1];
+      allocation.bytes[texel + 2] = rgba[2];
+      allocation.bytes[texel + 3] = rgba[3];
+    }
+  }
+}
+
+std::vector<vg::reference::SampleCoord> to_reference_coords(
+    const std::vector<vg::metal::SampleCoord>& coords) {
+  std::vector<vg::reference::SampleCoord> out;
+  out.reserve(coords.size());
+  for (const auto& coord : coords)
+    out.push_back({coord.u, coord.v, coord.lod, coord.array_slice});
+  return out;
+}
+
+std::vector<vg::reference::RasterVertex> to_reference_vertices(
+    const std::vector<vg::metal::RasterVertex>& vertices) {
+  std::vector<vg::reference::RasterVertex> out;
+  out.reserve(vertices.size());
+  for (const auto& vertex : vertices)
+    out.push_back({vertex.x, vertex.y, vertex.u, vertex.v});
+  return out;
+}
+
+vg::reference::RasterDesc to_reference_desc(const vg::metal::RasterDesc& desc) {
+  vg::reference::RasterDesc out;
+  out.attachment.load = static_cast<vg::reference::AttachmentLoadAction>(desc.attachment.load);
+  out.attachment.store = static_cast<vg::reference::AttachmentStoreAction>(desc.attachment.store);
+  out.attachment.clear_rgba = desc.attachment.clear_rgba;
+  out.attachment.sample_count = desc.attachment.sample_count;
+  out.attachment.subresource = {desc.attachment.subresource.layer, desc.attachment.subresource.level};
+  out.filter = desc.filter;
+  out.wrap = desc.wrap;
+  out.source_lod = desc.source_lod;
+  out.source_array_slice = desc.source_array_slice;
+  out.tint = desc.tint;
+  return out;
+}
+
+vg::core::ConsumeProof complete_consume_proof() {
+  vg::core::ConsumeProof proof;
+  proof.envelope_complete = true;
+  proof.no_external_references = true;
+  proof.no_replay_required = true;
+  proof.failure_semantics_accepted = true;
+  return proof;
+}
+
+vg::core::CanonicalView make_rgba8_view(const vg::core::Allocation& allocation, uint32_t width,
+                                        uint32_t height) {
+  vg::core::CanonicalView view;
+  view.allocation = allocation.id;
+  view.allocation_generation = allocation.generation;
+  view.format = vg::core::PixelFormat::RGBA8Unorm;
+  view.dimension = vg::core::ViewDimension::Texture2D;
+  view.width = width;
+  view.height = height;
+  return view;
+}
+
+// Metal Y-up clip space, uv (0,0) at the top-left of the source -- the same
+// full-target quad the reference raster oracle uses, so the two backends
+// receive identical vertices.
+std::vector<vg::metal::RasterVertex> metal_fullscreen_quad() {
+  const vg::metal::RasterVertex top_left{-1.0f, 1.0f, 0.0f, 0.0f};
+  const vg::metal::RasterVertex top_right{1.0f, 1.0f, 1.0f, 0.0f};
+  const vg::metal::RasterVertex bottom_left{-1.0f, -1.0f, 0.0f, 1.0f};
+  const vg::metal::RasterVertex bottom_right{1.0f, -1.0f, 1.0f, 1.0f};
+  return {top_left, top_right, bottom_left, top_right, bottom_right, bottom_left};
+}
+
+// E008: Texture2DArray + mip, sampled through metal::SampleCoord, compared
+// against reference::sample_facet. A second call against the same FacetRef
+// must report facet_cache_hit. Out-of-range slice/lod is a rejection, not a
+// clamp. The three Phase C capability bits this adapter now advertises are
+// asserted here so a device that dropped one cannot hide behind a green sample.
+bool run_sample_facet(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "sample-facet: no Metal device available on this host\n";
+    return false;
+  }
+  const auto& caps = metal_device->capabilities();
+  if (!caps.supports(vg::hal::Capability::Raster) ||
+      !caps.supports(vg::hal::Capability::RepresentationTransform) ||
+      !caps.supports(vg::hal::Capability::CheckedFacetGeneration)) {
+    std::cerr << "sample-facet: device must advertise Raster, RepresentationTransform and "
+                 "CheckedFacetGeneration\n";
+    return false;
+  }
+
+  vg::core::CanonicalView view;
+  view.format = vg::core::PixelFormat::RGBA8Unorm;
+  view.dimension = vg::core::ViewDimension::Texture2DArray;
+  view.width = 2;
+  view.height = 2;
+  view.array_layers = 2;
+  view.mip_levels = 2;
+  std::string view_error;
+  if (!view.valid(&view_error)) {
+    std::cerr << "sample-facet: CanonicalView rejected: " << view_error << "\n";
+    return false;
+  }
+
+  vg::core::Arena arena;
+  auto& allocation = arena.allocate(view.byte_size());
+  view.allocation = allocation.id;
+  view.allocation_generation = allocation.generation;
+  // Distinct solid colour per (layer, level), packed through the view's own
+  // linear layout so Metal's upload and the CPU oracle read the same bytes.
+  const std::array<std::array<uint8_t, 4>, 4> colours = {{
+      {255, 0, 0, 255},
+      {0, 255, 0, 255},
+      {0, 0, 255, 255},
+      {255, 255, 255, 255},
+  }};
+  fill_subresource(allocation, view, 0, 0, colours[0]);
+  fill_subresource(allocation, view, 0, 1, colours[1]);
+  fill_subresource(allocation, view, 1, 0, colours[2]);
+  fill_subresource(allocation, view, 1, 1, colours[3]);
+
+  vg::core::FacetPool pool;
+  vg::core::FacetRef sample_ref;
+  std::string error;
+  if (!pool.acquire(arena, view, vg::core::FacetKind::Sample, &sample_ref, &error)) {
+    std::cerr << "sample-facet: acquire failed: " << error << "\n";
+    return false;
+  }
+
+  const std::vector<vg::metal::SampleCoord> coords = {
+      {0.5f, 0.5f, 0.0f, 0},
+      {0.5f, 0.5f, 1.0f, 0},
+      {0.5f, 0.5f, 0.0f, 1},
+      {0.5f, 0.5f, 1.0f, 1},
+  };
+  vg::metal::SampleFacetResult result;
+  if (!metal_device->run_sample_facet(arena, pool, sample_ref, vg::core::FilterMode::Nearest,
+                                      vg::core::WrapMode::Clamp, coords,
+                                      vg::core::ValidationProfile::FastNative, &result, &error)) {
+    std::cerr << "sample-facet: Metal sample failed: " << error << "\n";
+    return false;
+  }
+  auto oracle = vg::reference::sample_facet(arena, pool, sample_ref, vg::core::FilterMode::Nearest,
+                                            vg::core::WrapMode::Clamp, to_reference_coords(coords));
+  if (!oracle.ok) {
+    std::cerr << "sample-facet: reference oracle failed: " << oracle.message << "\n";
+    return false;
+  }
+  if (result.sampled_rgba.size() != oracle.sampled_rgba.size()) {
+    std::cerr << "sample-facet: sampled_rgba size mismatch\n";
+    return false;
+  }
+  for (size_t i = 0; i < coords.size(); ++i) {
+    if (!channels_close(result.sampled_rgba[i], oracle.sampled_rgba[i], kNearestTol, "sample-facet",
+                        "coord sample"))
+      return false;
+  }
+  // lod 0 vs lod 1, and slice 0 vs slice 1, must actually select different
+  // subresources -- a level-0-only or slice-0-only path would pass the oracle
+  // comparison if both sides made the same mistake.
+  const auto same_colour = [](const std::array<float, 4>& a, const std::array<float, 4>& b) {
+    for (int c = 0; c < 4; ++c)
+      if (std::fabs(a[c] - b[c]) > kNearestTol) return false;
+    return true;
+  };
+  if (same_colour(result.sampled_rgba[0], result.sampled_rgba[1])) {
+    std::cerr << "sample-facet: lod 0 and lod 1 produced the same colour\n";
+    return false;
+  }
+  if (same_colour(result.sampled_rgba[0], result.sampled_rgba[2])) {
+    std::cerr << "sample-facet: slice 0 and slice 1 produced the same colour\n";
+    return false;
+  }
+
+  vg::metal::SampleFacetResult second;
+  if (!metal_device->run_sample_facet(arena, pool, sample_ref, vg::core::FilterMode::Nearest,
+                                      vg::core::WrapMode::Clamp, coords,
+                                      vg::core::ValidationProfile::FastNative, &second, &error)) {
+    std::cerr << "sample-facet: second sample failed: " << error << "\n";
+    return false;
+  }
+  if (!second.facet_cache_hit) {
+    std::cerr << "sample-facet: expected facet_cache_hit on second use\n";
+    return false;
+  }
+
+  vg::metal::SampleFacetResult unused;
+  const std::vector<vg::metal::SampleCoord> bad_slice{{0.5f, 0.5f, 0.0f, 2}};
+  if (metal_device->run_sample_facet(arena, pool, sample_ref, vg::core::FilterMode::Nearest,
+                                     vg::core::WrapMode::Clamp, bad_slice,
+                                     vg::core::ValidationProfile::FastNative, &unused, &error)) {
+    std::cerr << "sample-facet: out-of-range slice must be rejected\n";
+    return false;
+  }
+  const std::vector<vg::metal::SampleCoord> bad_lod{{0.5f, 0.5f, 2.0f, 0}};
+  if (metal_device->run_sample_facet(arena, pool, sample_ref, vg::core::FilterMode::Nearest,
+                                     vg::core::WrapMode::Clamp, bad_lod,
+                                     vg::core::ValidationProfile::FastNative, &unused, &error)) {
+    std::cerr << "sample-facet: out-of-range lod must be rejected\n";
+    return false;
+  }
+
+  std::cout << "sample-facet: ok\n";
+  return true;
+}
+
+// 06 §6.4: live SampleFacet + CheckedNative writes no poison; a retired or
+// forged generation is rejected in-shader (call succeeds, violations>0,
+// channels == kFacetGenerationPoisonValue). FastNative still fails that token
+// host-side. After Arena::transform the old FacetRef is EpochStale, which the
+// generation table cannot encode, so CheckedNative is refused host-side.
+bool run_checked_facet_generation(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "checked-facet-generation: no Metal device available on this host\n";
+    return false;
+  }
+
+  constexpr uint32_t kW = 2;
+  constexpr uint32_t kH = 2;
+  vg::core::Arena arena;
+  auto& allocation = arena.allocate(kW * kH * 4);
+  allocation.bytes = {
+      255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+  };
+  const vg::core::CanonicalView view = make_rgba8_view(allocation, kW, kH);
+
+  vg::core::FacetPool pool;
+  vg::core::FacetRef live_ref;
+  std::string error;
+  if (!pool.acquire(arena, view, vg::core::FacetKind::Sample, &live_ref, &error)) {
+    std::cerr << "checked-facet-generation: acquire failed: " << error << "\n";
+    return false;
+  }
+
+  const std::vector<vg::metal::SampleCoord> coords{{0.25f, 0.25f, 0.0f, 0}};
+  vg::metal::SampleFacetResult live;
+  if (!metal_device->run_sample_facet(arena, pool, live_ref, vg::core::FilterMode::Nearest,
+                                      vg::core::WrapMode::Clamp, coords,
+                                      vg::core::ValidationProfile::CheckedNative, &live, &error)) {
+    std::cerr << "checked-facet-generation: live CheckedNative sample failed: " << error << "\n";
+    return false;
+  }
+  if (!live.checked_profile || live.generation_violations != 0) {
+    std::cerr << "checked-facet-generation: live token must run checked with zero violations\n";
+    return false;
+  }
+
+  const vg::core::FacetRef retired_ref = live_ref;
+  if (!pool.retire(retired_ref, &error)) {
+    std::cerr << "checked-facet-generation: retire failed: " << error << "\n";
+    return false;
+  }
+  vg::metal::SampleFacetResult retired;
+  if (!metal_device->run_sample_facet(arena, pool, retired_ref, vg::core::FilterMode::Nearest,
+                                      vg::core::WrapMode::Clamp, coords,
+                                      vg::core::ValidationProfile::CheckedNative, &retired, &error)) {
+    std::cerr << "checked-facet-generation: retired CheckedNative must succeed (shader poison): "
+              << error << "\n";
+    return false;
+  }
+  if (!retired.checked_profile || retired.generation_violations == 0) {
+    std::cerr << "checked-facet-generation: retired token must report generation_violations>0\n";
+    return false;
+  }
+  for (int c = 0; c < 4; ++c) {
+    if (retired.sampled_rgba[0][c] != vg::compiler::kFacetGenerationPoisonValue) {
+      std::cerr << "checked-facet-generation: retired channel " << c
+                << " is not kFacetGenerationPoisonValue\n";
+      return false;
+    }
+  }
+
+  vg::core::FacetRef forged = retired_ref;
+  forged.generation = retired_ref.generation + 99;
+  vg::metal::SampleFacetResult forged_result;
+  if (!metal_device->run_sample_facet(arena, pool, forged, vg::core::FilterMode::Nearest,
+                                      vg::core::WrapMode::Clamp, coords,
+                                      vg::core::ValidationProfile::CheckedNative, &forged_result,
+                                      &error)) {
+    std::cerr << "checked-facet-generation: forged CheckedNative must succeed (shader poison): "
+              << error << "\n";
+    return false;
+  }
+  if (!forged_result.checked_profile || forged_result.generation_violations == 0) {
+    std::cerr << "checked-facet-generation: forged token must report generation_violations>0\n";
+    return false;
+  }
+  for (int c = 0; c < 4; ++c) {
+    if (forged_result.sampled_rgba[0][c] != vg::compiler::kFacetGenerationPoisonValue) {
+      std::cerr << "checked-facet-generation: forged channel " << c
+                << " is not kFacetGenerationPoisonValue\n";
+      return false;
+    }
+  }
+
+  vg::metal::SampleFacetResult fast_dead;
+  if (metal_device->run_sample_facet(arena, pool, retired_ref, vg::core::FilterMode::Nearest,
+                                     vg::core::WrapMode::Clamp, coords,
+                                     vg::core::ValidationProfile::FastNative, &fast_dead, &error)) {
+    std::cerr << "checked-facet-generation: FastNative must refuse a dead token host-side\n";
+    return false;
+  }
+
+  vg::core::FacetRef epoch_ref;
+  if (!pool.acquire(arena, view, vg::core::FacetKind::Sample, &epoch_ref, &error)) {
+    std::cerr << "checked-facet-generation: re-acquire failed: " << error << "\n";
+    return false;
+  }
+  uint32_t new_epoch = 0;
+  if (!arena.transform(allocation.id, allocation.generation, &new_epoch, &error)) {
+    std::cerr << "checked-facet-generation: Arena::transform failed: " << error << "\n";
+    return false;
+  }
+  vg::core::FacetStatus status = vg::core::FacetStatus::Ok;
+  if (pool.lookup(arena, epoch_ref, &status) != nullptr || status != vg::core::FacetStatus::EpochStale) {
+    std::cerr << "checked-facet-generation: old FacetRef must be EpochStale after Arena::transform\n";
+    return false;
+  }
+  vg::metal::SampleFacetResult stale;
+  if (metal_device->run_sample_facet(arena, pool, epoch_ref, vg::core::FilterMode::Nearest,
+                                     vg::core::WrapMode::Clamp, coords,
+                                     vg::core::ValidationProfile::CheckedNative, &stale, &error)) {
+    std::cerr << "checked-facet-generation: CheckedNative must refuse EpochStale host-side "
+                 "(generation table cannot encode epoch staleness)\n";
+    return false;
+  }
+
+  std::cout << "checked-facet-generation: ok\n";
+  return true;
+}
+
+// Source Sample + target Attachment, full-screen quad, Metal Y-up. Interior
+// pixels are compared against reference::raster_triangles at the E008 nearest
+// tolerance (edge pixels are where Metal's per-pixel shade and the oracle's
+// per-sample shade are allowed to disagree). Wrong kind, a vertex count that
+// is not a multiple of 3, and sample_count>1 without MultisampleResolve fail.
+bool run_basic_raster(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "basic-raster: no Metal device available on this host\n";
+    return false;
+  }
+
+  constexpr uint32_t kExtent = 4;
+  constexpr uint32_t kBytes = kExtent * kExtent * 4;
+  vg::core::Arena arena;
+  auto& source_alloc = arena.allocate(kBytes);
+  auto& target_alloc = arena.allocate(kBytes);
+  for (uint32_t y = 0; y < kExtent; ++y) {
+    for (uint32_t x = 0; x < kExtent; ++x) {
+      const uint64_t texel = (static_cast<uint64_t>(y) * kExtent + x) * 4;
+      source_alloc.bytes[texel + 0] = static_cast<uint8_t>(10 + 40 * x);
+      source_alloc.bytes[texel + 1] = static_cast<uint8_t>(20 + 40 * y);
+      source_alloc.bytes[texel + 2] = static_cast<uint8_t>(30 + 8 * x + 16 * y);
+      source_alloc.bytes[texel + 3] = 255;
+    }
+  }
+
+  const vg::core::CanonicalView source_view = make_rgba8_view(source_alloc, kExtent, kExtent);
+  const vg::core::CanonicalView target_view = make_rgba8_view(target_alloc, kExtent, kExtent);
+
+  vg::core::FacetPool pool;
+  vg::core::FacetRef source_ref;
+  vg::core::FacetRef target_ref;
+  std::string error;
+  if (!pool.acquire(arena, source_view, vg::core::FacetKind::Sample, &source_ref, &error) ||
+      !pool.acquire(arena, target_view, vg::core::FacetKind::Attachment, &target_ref, &error)) {
+    std::cerr << "basic-raster: acquire failed: " << error << "\n";
+    return false;
+  }
+
+  vg::metal::RasterDesc desc;
+  desc.filter = vg::core::FilterMode::Nearest;
+  desc.wrap = vg::core::WrapMode::Clamp;
+  desc.attachment.load = vg::metal::AttachmentLoadAction::Clear;
+  desc.attachment.store = vg::metal::AttachmentStoreAction::Store;
+  desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
+  desc.attachment.sample_count = 1;
+
+  const auto quad = metal_fullscreen_quad();
+  vg::metal::RasterResult metal_result;
+  if (!metal_device->run_raster_triangles(arena, pool, source_ref, target_ref, desc, quad,
+                                          &metal_result, &error)) {
+    std::cerr << "basic-raster: Metal raster failed: " << error << "\n";
+    return false;
+  }
+  auto oracle = vg::reference::raster_triangles(arena, pool, source_ref, target_ref,
+                                                to_reference_desc(desc), to_reference_vertices(quad));
+  if (!oracle.ok) {
+    std::cerr << "basic-raster: reference oracle failed: " << oracle.message << "\n";
+    return false;
+  }
+  if (metal_result.resolved_rgba.size() != oracle.resolved_rgba.size() ||
+      metal_result.width != kExtent || metal_result.height != kExtent) {
+    std::cerr << "basic-raster: resolved image size mismatch\n";
+    return false;
+  }
+  for (uint32_t y = 1; y + 1 < kExtent; ++y) {
+    for (uint32_t x = 1; x + 1 < kExtent; ++x) {
+      const size_t index = static_cast<size_t>(y) * kExtent + x;
+      if (!channels_close(metal_result.resolved_rgba[index], oracle.resolved_rgba[index], kNearestTol,
+                          "basic-raster", "interior pixel"))
+        return false;
+    }
+  }
+
+  vg::core::FacetRef wrong_source;
+  vg::core::FacetRef wrong_target;
+  if (!pool.acquire(arena, source_view, vg::core::FacetKind::Attachment, &wrong_source, &error) ||
+      !pool.acquire(arena, target_view, vg::core::FacetKind::Sample, &wrong_target, &error)) {
+    std::cerr << "basic-raster: wrong-kind acquire failed: " << error << "\n";
+    return false;
+  }
+  vg::metal::RasterResult unused;
+  if (metal_device->run_raster_triangles(arena, pool, wrong_source, target_ref, desc, quad, &unused,
+                                         &error)) {
+    std::cerr << "basic-raster: Attachment source must be rejected\n";
+    return false;
+  }
+  if (metal_device->run_raster_triangles(arena, pool, source_ref, wrong_target, desc, quad, &unused,
+                                         &error)) {
+    std::cerr << "basic-raster: Sample target must be rejected\n";
+    return false;
+  }
+
+  const std::vector<vg::metal::RasterVertex> dangling{quad[0], quad[1], quad[2], quad[3]};
+  if (metal_device->run_raster_triangles(arena, pool, source_ref, target_ref, desc, dangling, &unused,
+                                         &error)) {
+    std::cerr << "basic-raster: vertex count not a multiple of 3 must be rejected\n";
+    return false;
+  }
+
+  vg::metal::RasterDesc msaa = desc;
+  msaa.attachment.sample_count = 4;
+  msaa.attachment.store = vg::metal::AttachmentStoreAction::Store;
+  if (metal_device->run_raster_triangles(arena, pool, source_ref, target_ref, msaa, quad, &unused,
+                                         &error)) {
+    std::cerr << "basic-raster: sample_count>1 without MultisampleResolve must be rejected\n";
+    return false;
+  }
+  msaa.attachment.store = vg::metal::AttachmentStoreAction::MultisampleResolve;
+  vg::metal::RasterResult resolved;
+  if (!metal_device->run_raster_triangles(arena, pool, source_ref, target_ref, msaa, quad, &resolved,
+                                          &error)) {
+    std::cerr << "basic-raster: sample_count=4 with MultisampleResolve failed: " << error << "\n";
+    return false;
+  }
+  if (resolved.sample_count != 4) {
+    std::cerr << "basic-raster: resolve must report sample_count 4\n";
+    return false;
+  }
+
+  std::cout << "basic-raster: ok\n";
+  return true;
+}
+
+// E013: run_pipeline_classification. After the sha256 key fix the expected
+// arithmetic is classified=6 (2 compute checked on/off + 4 raster
+// format×sample) and naive=24. Assert those exact counts when they match;
+// otherwise keep the invariants (classified < naive, hits>0, misses>0,
+// unsupported_rejected) and print the observed counts rather than inventing
+// a match.
+bool run_pipeline_classification(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "pipeline-classification: no Metal device available on this host\n";
+    return false;
+  }
+
+  vg::metal::PipelineClassificationRun result;
+  std::string error;
+  if (!metal_device->run_pipeline_classification(&result, &error)) {
+    std::cerr << "pipeline-classification: run failed: " << error << "\n";
+    return false;
+  }
+  if (result.classified_pipeline_count >= result.naive_pipeline_count) {
+    std::cerr << "pipeline-classification: classified_pipeline_count must be < naive_pipeline_count "
+                 "(classified="
+              << result.classified_pipeline_count << " naive=" << result.naive_pipeline_count << ")\n";
+    return false;
+  }
+  if (result.cache_hits == 0 || result.cache_misses == 0) {
+    std::cerr << "pipeline-classification: expected both cache hits and misses (hits="
+              << result.cache_hits << " misses=" << result.cache_misses << ")\n";
+    return false;
+  }
+  if (!result.unsupported_rejected) {
+    std::cerr << "pipeline-classification: UnsupportedNeedsConversion must be rejected\n";
+    return false;
+  }
+  if (result.classified_pipeline_count == 6 && result.naive_pipeline_count == 24) {
+    std::cout << "pipeline-classification: ok (classified=6 naive=24 hits=" << result.cache_hits
+              << " misses=" << result.cache_misses << ")\n";
+    return true;
+  }
+  std::cout << "pipeline-classification: ok (classified=" << result.classified_pipeline_count
+            << " naive=" << result.naive_pipeline_count << " hits=" << result.cache_hits
+            << " misses=" << result.cache_misses
+            << "; expected 6/24 after sha256 key fix, asserting invariants only)\n";
+  return true;
+}
+
+// Builds a load-only module against `allocation` at a caller-chosen
+// representation_epoch. Stage 5 runs before the interpreter and bumps the
+// transformed allocation's epoch, so a module that still names the
+// pre-transform epoch faults STALE_OR_BOUNDS. The consume-input cases below
+// load a *separate* probe allocation that Stage 5 does not touch, so the
+// module stays valid after the bump (and after ConsumeInput clears the
+// image's host bytes).
+vg::ir::Module make_epoch_probe_module(const vg::core::Allocation& allocation, uint32_t epoch) {
+  vg::ir::Module module;
+  module.version = 1;
+  module.root_schema = "vg.test/v1";
+  vg::ir::Instruction load;
+  load.op = "load";
+  load.allocation = allocation.id;
+  load.generation = allocation.generation;
+  load.representation_epoch = epoch;
+  load.offset = 0;
+  load.size = 4;
+  module.instructions.push_back(load);
+  module.declared_effects.push_back({allocation.id, 0, 4, vg::ir::Access::Read, epoch});
+  return module;
+}
+
+bool compile_and_submit_representation(vg::metal::DeviceHal& metal_device, vg::core::Arena& arena,
+                                       const vg::ir::Module& module,
+                                       const vg::hal::RepresentationRequest& request,
+                                       vg::hal::Submission* submission, std::string* error) {
+  vg::hal::ExecutionPlan plan;
+  plan.capabilities = metal_device.capabilities();
+  plan.module = module;
+  plan.published = true;
+  plan.representation_requests.push_back(request);
+  vg::hal::CompiledPlan compiled;
+  if (!metal_device.compile(plan, &compiled, error)) return false;
+  return metal_device.submit(compiled, arena, submission, error);
+}
+
+// E005 via compile()/submit() Stage 5 only. Standalone
+// run_representation_transform never consumes (06 §11). multi-version keeps
+// the old backing (released_backing_bytes==0); ConsumeInput with a complete
+// proof releases it (allocation stays Active, generation unchanged, the new
+// facet still samples). An incomplete proof is rejected by
+// ExecutionPlan::validate, not inferred by the adapter.
+bool run_consume_input(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "consume-input: no Metal device available on this host\n";
+    return false;
+  }
+
+  auto prepare_image = [](vg::core::Arena& arena, vg::core::CanonicalView* view) -> vg::core::Allocation& {
+    constexpr uint32_t kW = 2;
+    constexpr uint32_t kH = 2;
+    auto& allocation = arena.allocate(kW * kH * 4);
+    allocation.bytes = {
+        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+    };
+    *view = make_rgba8_view(allocation, kW, kH);
+    return allocation;
+  };
+
+  const std::vector<std::array<float, 2>> uvs = {{0.25f, 0.25f}};
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    prepare_image(arena, &view);
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = false;
+
+    vg::hal::Submission submission;
+    std::string error;
+    if (!compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error)) {
+      std::cerr << "consume-input: multi-version compile/submit failed: " << error << "\n";
+      return false;
+    }
+    if (!submission.result.ok) {
+      std::cerr << "consume-input: multi-version execution reported failure: "
+                << submission.result.message << "\n";
+      return false;
+    }
+    if (!submission.representation_epoch.sealed() || submission.representation_facets.size() != 1) {
+      std::cerr << "consume-input: multi-version must seal one RepresentationEpoch facet\n";
+      return false;
+    }
+    if (submission.old_backing_bytes == 0 || submission.released_backing_bytes != 0) {
+      std::cerr << "consume-input: multi-version must keep old backing (old="
+                << submission.old_backing_bytes << " released=" << submission.released_backing_bytes
+                << ")\n";
+      return false;
+    }
+    std::cout << "consume-input: multi-version ok (old=" << submission.old_backing_bytes
+              << " new=" << submission.new_backing_bytes << " released=0)\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const uint64_t image_id = image.id;
+    const uint32_t generation_before = image.generation;
+    auto expected = vg::reference::sample_facet(arena, view, vg::core::FilterMode::Nearest,
+                                                vg::core::WrapMode::Clamp, uvs);
+    if (!expected.ok) {
+      std::cerr << "consume-input: pre-submit oracle failed: " << expected.message << "\n";
+      return false;
+    }
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+
+    vg::hal::Submission submission;
+    std::string error;
+    if (!compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error)) {
+      std::cerr << "consume-input: ConsumeInput compile/submit failed: " << error << "\n";
+      return false;
+    }
+    if (!submission.result.ok) {
+      std::cerr << "consume-input: ConsumeInput execution reported failure: "
+                << submission.result.message << "\n";
+      return false;
+    }
+    if (submission.released_backing_bytes == 0 || submission.consumed_allocation_count != 1) {
+      std::cerr << "consume-input: ConsumeInput must release the superseded backing (released="
+                << submission.released_backing_bytes
+                << " consumed_allocation_count=" << submission.consumed_allocation_count << ")\n";
+      return false;
+    }
+    if (submission.released_backing_bytes != submission.old_backing_bytes) {
+      std::cerr << "consume-input: released_backing_bytes (" << submission.released_backing_bytes
+                << ") must equal old_backing_bytes (" << submission.old_backing_bytes << ")\n";
+      return false;
+    }
+    const auto* after = arena.lookup(image_id, generation_before);
+    if (after == nullptr || after->state != vg::core::ObjectState::Active ||
+        after->generation != generation_before) {
+      std::cerr << "consume-input: allocation must stay Active at the same generation\n";
+      return false;
+    }
+    if (submission.representation_facets.size() != 1) {
+      std::cerr << "consume-input: ConsumeInput must publish exactly one live facet\n";
+      return false;
+    }
+    vg::metal::SampleFacetResult sampled;
+    if (!metal_device->run_sample_facet(arena, metal_device->facet_pool(),
+                                        submission.representation_facets[0],
+                                        vg::core::FilterMode::Nearest, vg::core::WrapMode::Clamp, uvs,
+                                        &sampled, &error)) {
+      std::cerr << "consume-input: new facet must still sample after ConsumeInput: " << error << "\n";
+      return false;
+    }
+    if (!channels_close(sampled.sampled_rgba[0], expected.sampled_rgba[0], kNearestTol, "consume-input",
+                        "post-consume sample"))
+      return false;
+    bool released_device_linear = false;
+    for (const auto& event : submission.report.events) {
+      if (event.operation == "consume_input_backing_release" && event.bytes != 0) released_device_linear = true;
+    }
+    if (!released_device_linear) {
+      std::cerr << "consume-input: ConsumeInput must destroy the superseded linear device buffer, "
+                   "not only the host bytes\n";
+      return false;
+    }
+    std::cout << "consume-input: ConsumeInput ok (old=" << submission.old_backing_bytes
+              << " new=" << submission.new_backing_bytes
+              << " released=" << submission.released_backing_bytes << ")\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    prepare_image(arena, &view);
+    auto& probe = arena.allocate(64);
+    vg::hal::ExecutionPlan plan;
+    plan.capabilities = metal_device->capabilities();
+    plan.module = make_epoch_probe_module(probe, probe.representation_epoch);
+    plan.published = true;
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    plan.representation_requests.push_back(request);
+    std::string validate_error;
+    if (plan.validate(&validate_error)) {
+      std::cerr << "consume-input: incomplete proof unexpectedly validated\n";
+      return false;
+    }
+    std::cout << "consume-input: incomplete proof rejected by plan.validate\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    vg::hal::ExecutionPlan plan;
+    plan.capabilities = metal_device->capabilities();
+    plan.module = make_epoch_probe_module(image, image.representation_epoch);
+    plan.published = true;
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    plan.representation_requests.push_back(request);
+    vg::hal::CompiledPlan compiled;
+    std::string compile_error;
+    if (metal_device->compile(plan, &compiled, &compile_error)) {
+      std::cerr << "consume-input: ConsumeInput of an allocation the module also loads must fail compile\n";
+      return false;
+    }
+    if (compile_error.find("whose linear representation this plan's compute module also reads or writes") ==
+        std::string::npos) {
+      std::cerr << "consume-input: same-allocation ConsumeInput was refused for the wrong reason: "
+                << compile_error << "\n";
+      return false;
+    }
+    std::cout << "consume-input: same-allocation ConsumeInput rejected at compile\n";
+  }
+
+  // Catalog fault-injection (09 E005): transform 前/中/后 fault;
+  // capture replay request; 外部引用存在. These run the real rejection
+  // paths and print what the program actually does -- they do not invent a
+  // second Arena fault injector (existing IR poison stays scoped to
+  // compile()/submit() instruction execution).
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const auto original = image.bytes;
+    const uint32_t generation = image.generation;
+    const uint32_t epoch_before = image.representation_epoch;
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    if (!arena.acquire(image.id, generation)) {
+      std::cerr << "consume-input: fault-before acquire failed\n";
+      return false;
+    }
+    vg::hal::Submission submission;
+    std::string error;
+    if (compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error)) {
+      std::cerr << "consume-input: fault-before must refuse while the allocation is in flight\n";
+      return false;
+    }
+    if (error.find("representation epoch is referenced in flight") == std::string::npos) {
+      std::cerr << "consume-input: fault-before refused for the wrong reason: " << error << "\n";
+      return false;
+    }
+    if (image.bytes != original || image.generation != generation ||
+        image.representation_epoch != epoch_before ||
+        image.state != vg::core::ObjectState::Active) {
+      std::cerr << "consume-input: fault-before must leave the old representation untouched\n";
+      return false;
+    }
+    if (!arena.release(image.id, generation)) {
+      std::cerr << "consume-input: fault-before release failed\n";
+      return false;
+    }
+    std::cout << "consume-input: fault-before refused (in-flight), old backing kept ("
+              << image.bytes.size() << " bytes, epoch=" << image.representation_epoch << ")\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const auto original = image.bytes;
+    const uint32_t generation = image.generation;
+    const uint32_t epoch_before = image.representation_epoch;
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    vg::core::FacetPool pool;
+    vg::hal::Submission submission;
+    std::string error;
+    if (vg::hal::run_representation_stage(
+            {request}, arena, pool,
+            [](const vg::hal::RepresentationRequest&, vg::core::FacetRef,
+               vg::hal::RepresentationTransformCost*, std::string* physical_error) {
+              if (physical_error) *physical_error = "injected physical transform fault";
+              return false;
+            },
+            &submission, &error)) {
+      std::cerr << "consume-input: fault-during must fail the physical step\n";
+      return false;
+    }
+    if (error.find("injected physical transform fault") == std::string::npos) {
+      std::cerr << "consume-input: fault-during refused for the wrong reason: " << error << "\n";
+      return false;
+    }
+    // 02 §9: a fault is not transactional rollback. transform() already
+    // published the new epoch before the physical step ran; consume must
+    // not have happened, and the superseded host bytes must still be here.
+    if (submission.consumed_allocation_count != 0 || submission.released_backing_bytes != 0) {
+      std::cerr << "consume-input: fault-during must not consume (consumed="
+                << submission.consumed_allocation_count
+                << " released=" << submission.released_backing_bytes << ")\n";
+      return false;
+    }
+    if (image.bytes != original || image.generation != generation ||
+        image.state != vg::core::ObjectState::Active) {
+      std::cerr << "consume-input: fault-during must keep the old host backing\n";
+      return false;
+    }
+    if (image.representation_epoch != epoch_before + 1) {
+      std::cerr << "consume-input: fault-during rolled back the published epoch (got "
+                << image.representation_epoch << ")\n";
+      return false;
+    }
+    if (arena.lookup(image.id, generation, epoch_before) != nullptr ||
+        arena.lookup(image.id, generation, image.representation_epoch) == nullptr) {
+      std::cerr << "consume-input: fault-during must leave the new epoch visible and the old one stale\n";
+      return false;
+    }
+    std::cout << "consume-input: fault-during kept old backing (" << image.bytes.size()
+              << " bytes), epoch advanced " << epoch_before << "->" << image.representation_epoch
+              << ", consume did not run\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const uint32_t generation = image.generation;
+    const uint32_t epoch_before = image.representation_epoch;
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    vg::hal::Submission submission;
+    std::string error;
+    if (!compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error) ||
+        !submission.result.ok || submission.released_backing_bytes == 0) {
+      std::cerr << "consume-input: fault-after setup ConsumeInput failed: " << error << "\n";
+      return false;
+    }
+    const auto stale_module = make_epoch_probe_module(image, epoch_before);
+    const auto stale = vg::reference::execute(stale_module, arena);
+    if (stale.ok || stale.outputs_valid || stale.poison == vg::core::PoisonState::Valid ||
+        stale.fault.code != "STALE_OR_BOUNDS") {
+      std::cerr << "consume-input: fault-after old-epoch load must be STALE_OR_BOUNDS (ok="
+                << stale.ok << " code=" << stale.fault.code << ")\n";
+      return false;
+    }
+    if (!image.bytes.empty() || image.generation != generation ||
+        image.state != vg::core::ObjectState::Active) {
+      std::cerr << "consume-input: fault-after must not roll consume back\n";
+      return false;
+    }
+    std::cout << "consume-input: fault-after old-epoch load " << stale.fault.code
+              << ", consume not rolled back (released=" << submission.released_backing_bytes << ")\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const auto original = image.bytes;
+    const uint32_t epoch_before = image.representation_epoch;
+    const auto image_module = make_epoch_probe_module(image, epoch_before);
+    const auto pre = vg::capture::make_capture(image_module, arena);
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    vg::hal::Submission submission;
+    std::string error;
+    if (!compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error) ||
+        !submission.result.ok) {
+      std::cerr << "consume-input: capture-replay setup ConsumeInput failed: " << error << "\n";
+      return false;
+    }
+    vg::capture::ReplayResult pre_replay;
+    if (!vg::capture::replay(pre, &pre_replay, &error) || !pre_replay.execution.ok) {
+      std::cerr << "consume-input: pre-consume capture must still replay: " << error << " "
+                << pre_replay.execution.message << "\n";
+      return false;
+    }
+    const auto post = vg::capture::make_capture(image_module, arena);
+    if (post.allocations.size() != 2) {
+      std::cerr << "consume-input: post-consume capture allocation count=" << post.allocations.size()
+                << "\n";
+      return false;
+    }
+    uint64_t post_image_bytes = 0;
+    for (const auto& snapshot : post.allocations) {
+      if (snapshot.id == image.id) post_image_bytes = snapshot.bytes.size();
+    }
+    vg::capture::ReplayResult post_replay;
+    if (vg::capture::replay(post, &post_replay, &error)) {
+      std::cerr << "consume-input: post-consume capture must not be importable after bytes were released\n";
+      return false;
+    }
+    if (error.find("cannot restore a consumed representation") == std::string::npos) {
+      std::cerr << "consume-input: post-consume replay was refused for the wrong reason: " << error << "\n";
+      return false;
+    }
+    std::cout << "consume-input: capture-replay pre-package ok, post-package lost " << original.size()
+              << " linear bytes (snapshot now " << post_image_bytes << "), " << error << "\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    prepare_image(arena, &view);
+    vg::hal::ExecutionPlan plan;
+    plan.capabilities = metal_device->capabilities();
+    auto& probe = arena.allocate(64);
+    plan.module = make_epoch_probe_module(probe, probe.representation_epoch);
+    plan.published = true;
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    request.consume_proof.no_external_references = false;
+    plan.representation_requests.push_back(request);
+    std::string validate_error;
+    if (plan.validate(&validate_error)) {
+      std::cerr << "consume-input: external-ref proof unexpectedly validated\n";
+      return false;
+    }
+    if (validate_error.find("an external reference to the old representation still exists") ==
+        std::string::npos) {
+      std::cerr << "consume-input: external-ref proof was refused for the wrong reason: "
+                << validate_error << "\n";
+      return false;
+    }
+    std::cout << "consume-input: external-ref proof rejected by plan.validate\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    vg::core::FacetRef live{};
+    std::string error;
+    if (!metal_device->facet_pool().acquire(arena, view, vg::core::FacetKind::Sample, &live, &error)) {
+      std::cerr << "consume-input: live-facet acquire failed: " << error << "\n";
+      return false;
+    }
+    if (!metal_device->facet_pool().begin_gpu_use(arena, live, &error)) {
+      std::cerr << "consume-input: live-facet begin_gpu_use failed: " << error << "\n";
+      return false;
+    }
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    vg::hal::Submission submission;
+    if (compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error)) {
+      std::cerr << "consume-input: live-facet ConsumeInput must be refused while the token is held\n";
+      return false;
+    }
+    if (error.find("a facet token still names the old representation") == std::string::npos) {
+      std::cerr << "consume-input: live-facet was refused for the wrong reason: " << error << "\n";
+      return false;
+    }
+    vg::core::FacetStatus status = vg::core::FacetStatus::Ok;
+    if (metal_device->facet_pool().lookup(arena, live, &status) == nullptr) {
+      std::cerr << "consume-input: live-facet token must still resolve after a refused consume (status="
+                << vg::core::to_string(status) << ")\n";
+      return false;
+    }
+    if (image.bytes.size() != 16) {
+      std::cerr << "consume-input: live-facet refuse must keep the old backing\n";
+      return false;
+    }
+    if (!metal_device->facet_pool().end_gpu_use(live, &error)) {
+      std::cerr << "consume-input: live-facet end_gpu_use failed: " << error << "\n";
+      return false;
+    }
+    std::cout << "consume-input: external live-facet token still live, ConsumeInput refused\n";
+  }
+
+  std::cout << "consume-input: ok\n";
+  return true;
+}
+
+// E016: four catalog variants over standalone transforms (unbounded growth,
+// backpressure reject, ConsumeInput watermark, drop/quality skip). Assert
+// unbounded peak at 8 transforms exceeds the ConsumeInput peak, and that
+// backpressure triggers at least once. fif==1 accepts 0 transforms because
+// the allocation's initial representation already saturates the budget.
+bool run_representation_churn(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "representation-churn: no Metal device available on this host\n";
+    return false;
+  }
+
+  constexpr uint32_t kW = 2;
+  constexpr uint32_t kH = 2;
+  constexpr uint32_t kAttempts = 8;
+  const auto seed = [](vg::core::Arena& arena, vg::core::CanonicalView* view,
+                       std::vector<uint8_t>* bytes) -> vg::core::Allocation& {
+    auto& allocation = arena.allocate(kW * kH * 4);
+    allocation.bytes = {
+        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+    };
+    *view = make_rgba8_view(allocation, kW, kH);
+    if (bytes != nullptr) *bytes = allocation.bytes;
+    return allocation;
+  };
+
+  uint64_t unbounded_peak = 0;
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& allocation = seed(arena, &view, nullptr);
+    arena.set_max_in_flight_representations(0);
+    vg::core::FacetPool pool;
+    uint64_t accumulated_new = 0;
+    uint32_t last_live = allocation.live_representations;
+    for (uint32_t i = 0; i < kAttempts; ++i) {
+      vg::metal::RepresentationTransformResult result;
+      std::string error;
+      if (!metal_device->run_representation_transform(arena, pool, view, vg::core::FacetKind::Sample,
+                                                      &result, &error)) {
+        std::cerr << "representation-churn: unbounded transform " << i << " failed: " << error << "\n";
+        return false;
+      }
+      accumulated_new += result.new_backing_bytes;
+      const uint64_t current = result.old_backing_bytes + accumulated_new;
+      if (current > unbounded_peak) unbounded_peak = current;
+      last_live = allocation.live_representations;
+    }
+    if (last_live <= 1) {
+      std::cerr << "representation-churn: unbounded live_representations did not grow\n";
+      return false;
+    }
+    std::cout << "representation-churn: unbounded ok (live=" << last_live
+              << " peak=" << unbounded_peak << ")\n";
+  }
+
+  bool backpressure_triggered = false;
+  const uint32_t fif_values[] = {1, 2, 4, 8};
+  for (uint32_t fif : fif_values) {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    seed(arena, &view, nullptr);
+    arena.set_max_in_flight_representations(fif);
+    vg::core::FacetPool pool;
+    uint32_t accepted = 0;
+    for (uint32_t i = 0; i < kAttempts; ++i) {
+      vg::metal::RepresentationTransformResult result;
+      std::string error;
+      if (metal_device->run_representation_transform(arena, pool, view, vg::core::FacetKind::Sample,
+                                                     &result, &error)) {
+        ++accepted;
+        continue;
+      }
+      if (error.find("in-flight representation budget exceeded") == std::string::npos) {
+        std::cerr << "representation-churn: backpressure fif=" << fif
+                  << " refused without the budget error: " << error << "\n";
+        return false;
+      }
+      backpressure_triggered = true;
+    }
+    if (fif == 1 && accepted != 0) {
+      std::cerr << "representation-churn: fif=1 must accept 0 transforms, accepted " << accepted
+                << "\n";
+      return false;
+    }
+    std::cout << "representation-churn: backpressure fif=" << fif << " accepted " << accepted
+              << " / " << kAttempts << "\n";
+  }
+  if (!backpressure_triggered) {
+    std::cerr << "representation-churn: backpressure never triggered\n";
+    return false;
+  }
+
+  uint64_t consume_peak = 0;
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    std::vector<uint8_t> original;
+    auto& allocation = seed(arena, &view, &original);
+    arena.set_max_in_flight_representations(0);
+    vg::core::FacetPool pool;
+    const auto proof = complete_consume_proof();
+    for (uint32_t i = 0; i < kAttempts; ++i) {
+      vg::metal::RepresentationTransformResult result;
+      std::string error;
+      if (!metal_device->run_representation_transform(arena, pool, view, vg::core::FacetKind::Sample,
+                                                      &result, &error)) {
+        std::cerr << "representation-churn: ConsumeInput transform " << i << " failed: " << error
+                  << "\n";
+        return false;
+      }
+      const uint64_t current = result.old_backing_bytes + result.new_backing_bytes;
+      if (current > consume_peak) consume_peak = current;
+      uint64_t released = 0;
+      if (!arena.consume_representation(allocation.id, allocation.generation, result.new_epoch, proof,
+                                        &released, &error)) {
+        std::cerr << "representation-churn: consume_representation " << i << " failed: " << error
+                  << "\n";
+        return false;
+      }
+      // Host consume cannot see this adapter's Shared blit source. Drop it
+      // now, before the next frame restores host bytes, so the device
+      // watermark matches what consume_representation already handed back.
+      metal_device->reclaim_released_backing(arena);
+      if (allocation.live_representations > 2) {
+        std::cerr << "representation-churn: ConsumeInput live_representations="
+                  << allocation.live_representations << " escaped the transform window\n";
+        return false;
+      }
+      // Restore host bytes so the next standalone blit still has a linear
+      // source -- consume_representation releases the superseded backing, which
+      // is the point of the watermark, but the next frame still has to upload.
+      allocation.bytes = original;
+    }
+    std::cout << "representation-churn: ConsumeInput ok (peak=" << consume_peak << ")\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    seed(arena, &view, nullptr);
+    arena.set_max_in_flight_representations(2);
+    vg::core::FacetPool pool;
+    uint32_t skipped = 0;
+    for (uint32_t frame = 0; frame < kAttempts; ++frame) {
+      vg::metal::RepresentationTransformResult result;
+      std::string error;
+      if (metal_device->run_representation_transform(arena, pool, view, vg::core::FacetKind::Sample,
+                                                     &result, &error))
+        continue;
+      // drop/quality: skip the frame. Application policy, not a core API --
+      // we do not release_representation to make room, and we do not retry.
+      ++skipped;
+    }
+    if (skipped == 0) {
+      std::cerr << "representation-churn: drop/quality never skipped a frame\n";
+      return false;
+    }
+    std::cout << "representation-churn: drop/quality skipped " << skipped << " frames\n";
+  }
+
+  if (unbounded_peak <= consume_peak) {
+    std::cerr << "representation-churn: unbounded peak at fif=8 (" << unbounded_peak
+              << ") must exceed ConsumeInput peak (" << consume_peak << ")\n";
+    return false;
+  }
+
+  std::cout << "representation-churn: ok\n";
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc != 3) {
     std::cerr << "usage: vg_metal_task_timeline_test "
                  "<task-tier0|timeline|access-certificate|tier1-indirect|cull-compact|effect-dag|pointer-graph|"
-                 "indexed-binding|representation-layer> "
+                 "indexed-binding|representation-layer|sample-facet|checked-facet-generation|basic-raster|"
+                 "pipeline-classification|consume-input|representation-churn> "
                  "<repo_root>\n";
     return 2;
   }
@@ -1303,6 +2517,18 @@ int main(int argc, char** argv) {
     ok = run_indexed_binding(root);
   } else if (mode == "representation-layer") {
     ok = run_representation_layer(root);
+  } else if (mode == "sample-facet") {
+    ok = run_sample_facet(root);
+  } else if (mode == "checked-facet-generation") {
+    ok = run_checked_facet_generation(root);
+  } else if (mode == "basic-raster") {
+    ok = run_basic_raster(root);
+  } else if (mode == "pipeline-classification") {
+    ok = run_pipeline_classification(root);
+  } else if (mode == "consume-input") {
+    ok = run_consume_input(root);
+  } else if (mode == "representation-churn") {
+    ok = run_representation_churn(root);
   } else {
     std::cerr << "unknown mode: " << mode << "\n";
     return 2;

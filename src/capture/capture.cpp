@@ -101,6 +101,16 @@ bool deserialize(const std::string& text, ir::Module* module, std::string* error
 bool replay(const Capture& capture, ReplayResult* result, std::string* error) {
   try {
     if (result == nullptr) throw std::runtime_error("replay output is required"); core::Arena arena;
+    // ConsumeInput releases linear bytes but leaves Allocation::size. A
+    // snapshot of that state is not a restoreable representation (02 §4.2 /
+    // 09 E005: the lost replay must be named, not reported as a generic
+    // import failure).
+    for (const auto& snapshot : capture.allocations) {
+      if (snapshot.state == core::ObjectState::Active && snapshot.size > 0 && snapshot.bytes.empty()) {
+        if (error) *error = "cannot restore a consumed representation";
+        return false;
+      }
+    }
     for (const auto& snapshot : capture.allocations) { if (!arena.import_allocation(snapshot.id, snapshot.generation, snapshot.size, snapshot.representation_epoch, snapshot.state, snapshot.bytes, error)) return false; result->relocation[snapshot.id] = snapshot.id; }
     if (!capture.graph_references.empty()) {
       core::GraphEpochBuilder graph_builder(&arena, capture.graph_epoch == 0 ? 1 : capture.graph_epoch);
