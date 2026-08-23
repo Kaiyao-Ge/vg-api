@@ -310,4 +310,10 @@ if(BUILD_TESTING)
   foreach(VG_PHASE_D_FRAGMENT IN LISTS VG_PHASE_D_CMAKE)
     include(${VG_PHASE_D_FRAGMENT})
   endforeach()
+
+  # Phase E slices land in cmake/phase-e-e*.cmake (TASK-E1 / E4 / E6).
+  file(GLOB VG_PHASE_E_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/phase-e-e*.cmake")
+  foreach(VG_PHASE_E_FRAGMENT IN LISTS VG_PHASE_E_CMAKE)
+    include(${VG_PHASE_E_FRAGMENT})
+  endforeach()
 endif()

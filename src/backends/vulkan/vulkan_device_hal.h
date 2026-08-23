@@ -488,7 +488,8 @@ class DeviceHal final : public vg::hal::DeviceHal {
   // (no reachable hardware, ADR-024). The analogue of Metal's default
   // bucket compute + per-Node indirect is a GPU histogram / prefix-sum
   // over authorized node classes followed by one vkCmdDispatchIndirect
-  // per class. VK_EXT_device_generated_commands (DGC) is the optional
+  // per class. Metal now prefers a GPU-encoded ICB for the same select.
+  // VK_EXT_device_generated_commands (DGC) is the optional
   // capability upgrade matching Metal ICB -- not required, and never the
   // floor. Host-read-counts-then-vkCmdDispatch is Serialized/HostAssisted,
   // never DevicePass. Tier3 (GPU invents a Node / grows the envelope)

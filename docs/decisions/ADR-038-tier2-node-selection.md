@@ -101,15 +101,21 @@ win.
 - ctest `unit.tier2-oracle` and `vertical-slice.metal.tier2-nodes`
 - Vulkan compile-review comments in `vulkan_device_hal.{h,cpp}`
 
-This host's recorded path is **bucket, not ICB**.
+This host's recorded path was **bucket, not ICB** when this ADR landed.
+
+## Revisit (2026-08-23)
+
+GPU-encoded ICB select is now the preferred Metal path: one compute
+command per published task, a distinct `supportIndirectCommandBuffers`
+PSO per authorized class, `inheritPipelineState=NO`, reset + optional
+optimize + `executeCommandsInBuffer`. The host does not read a histogram
+before execute. That path reports `DevicePass`. Allocate/encode/execute
+failure still uses the bucket path and stays `EmulatedDevicePass`. A
+single-PSO ICB wrapper, or host-filling slots from a read-back count,
+must not be labeled `DevicePass`. Vulkan DGC remains compile-review-only.
 
 ## Revisit trigger
 
-Revisit if a later milestone implements a real ICB (or Vulkan DGC)
-multi-pipeline select that the GPU itself picks among. At that point the
-successful ICB path may report `DevicePass`, the bucket path stays
-`EmulatedDevicePass`, and this ADR's "ICB unused" evidence sentence
-should be superseded rather than rewritten into a success it did not
-earn. Revisit if M-series ICB command types are shown to be insufficient
-even as an upgrade -- that would confirm, not retract, the bucket
-default.
+Revisit if Vulkan DGC becomes executable, or if M-series ICB encode+execute
+is shown unavailable on a target that still allocates an ICB -- that
+keeps the bucket fallback, it does not retract a successful ICB run.

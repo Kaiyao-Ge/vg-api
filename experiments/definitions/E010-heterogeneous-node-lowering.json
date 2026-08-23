@@ -4,7 +4,7 @@
   "name": "heterogeneous-node-lowering",
   "workload": "two_authorized_node_classes_uniform_and_skewed_select",
   "backends": ["cpu-reference", "metal"],
-  "variants": ["cpu-oracle-host-walk", "gpu-bucket-per-node-indirect"],
+  "variants": ["cpu-oracle-host-walk", "gpu-icb-multi-pso-select", "gpu-bucket-per-node-indirect"],
   "metrics": [
     "selected_node_class_multiset",
     "bucket_count",
@@ -15,7 +15,7 @@
   ],
   "protocol": {
     "deterministic": false,
-    "note": "GPU bucket assignment uses atomic_fetch_add, so per-bucket slot order is thread-arrival order. Selected node classes are compared against reference::select_tier2_nodes as a sorted multiset, never by GPU slot position. Default Metal path is bucket compute + per-Node dispatchThreadgroupsWithIndirectBuffer; the host does not read bucket counts before those indirect dispatches. ICB is an optional capability upgrade and is not used. A post-wait readback (last_selected_node_classes) is verification only."
+    "note": "Preferred Metal path: GPU encodes one ConcurrentDispatch ICB command per published task, binds a distinct ICB-capable compute PSO per authorized node class, then executeCommandsInBuffer. The host does not read class counts before execute. Selected node classes are compared against reference::select_tier2_nodes as a sorted multiset. Bucket + per-class dispatchThreadgroupsWithIndirectBuffer remains the fallback if ICB allocate/encode/execute is unavailable, and must stay EmulatedDevicePass. A post-wait readback (last_selected_node_classes) is verification only."
   },
   "correctness": {
     "oracle": "reference::select_tier2_nodes",
@@ -28,8 +28,9 @@
     "no_cpu_read_counts_then_reencode_marked_device_pass",
     "tier3_remains_unsupported"
   ],
-  "phase_d_classification": "EmulatedDevicePass",
+  "phase_d_classification": "DevicePass",
+  "phase_d_fallback_classification": "EmulatedDevicePass",
   "break_even_curve": "unmeasured",
-  "judgement": "Metal selects among two pre-authorized Node classes with a GPU bucket kernel plus one indirect dispatch per class. The selected-class multiset matches the CPU oracle on uniform (4+4) and skewed (7+1) 8-task graphs. An unauthorized class is refused. The report carries bucket/command counts and is classified EmulatedDevicePass -- not DevicePass -- because no native ICB select ran. The reference backend host-walks the same graph and reports Serialized. Tier3 (GPU invents a Node / grows the envelope) is not implemented and stays Unsupported. No hitch or cost curve is claimed; D7 records break-even as unmeasured.",
+  "judgement": "Metal prefers a GPU-encoded ICB: one compute command per task, a distinct ICB-capable PSO per authorized class, executeCommandsInBuffer, classified DevicePass. Uniform (4+4) and skewed (7+1) selected-class multisets must match the CPU oracle. An unauthorized class is refused. ICB allocate/encode/execute failure falls back to bucket + per-class indirect and stays EmulatedDevicePass -- that fallback is not relabeled DevicePass. The reference backend host-walks the same graph and reports Serialized. Tier3 stays Unsupported. No hitch or cost curve is claimed.",
   "vulkan_status": "compile-review-only (ADR-024/038/041); comments in vulkan_device_hal.{h,cpp} document DGC-or-bucket as the analogue and are not wired to request_tier2_select"
 }

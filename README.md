@@ -14,9 +14,16 @@ harnesses for the VG project.
 | Phase | Scope |
 | --- | --- |
 | **Phase 0** | C11 ABI skeleton, CPU/reference enumeration, optional Metal and Linux/Vulkan capability probes, reproducible evidence bundles |
-| **Phase A** | Portable semantic core, canonical IR/schema generation, CPU reference execution, task/effect/timeline validation, capture/reference replay, machine-readable gate runner (E001/E003/E006/E015/E018) |
+| **Phase A** | Portable semantic core; gate `reference-complete` (E001/E003/E006/E015/E018) |
+| **Phase B** | Compute adapters; gate closed per ADR-024 (Metal+reference; Vulkan compile-review-only) |
+| **Phase C** | Representation / raster; **not-closed** (layer1 complete; E005/E008/E016 implemented, peak bytes unmeasured) |
+| **Phase D** | Dynamic graph / residency research; recorded per ADR-041 (not product-closed) |
+| **Phase E** | Research Alpha; recorded per ADR-042 (aggregation + external reproduction, not a product close) |
 
 On Apple Silicon, GPU evidence is **`MetalAdapter`** or **`SemanticReference`** evidence — not evidence of a native VG driver or hardware contract.
+
+External reproduction: [docs/reports/external-repro-runbook.md](docs/reports/external-repro-runbook.md).
+Eighteen-experiment table: [docs/reports/phase-e-gate.md](docs/reports/phase-e-gate.md).
 
 ## Requirements
 
@@ -41,6 +48,8 @@ cmake --build --preset dev-metal
 ctest --preset dev-metal
 python3 tools/vg-exp/vg_exp.py probe --build-dir build/dev-metal
 python3 tools/vg-exp/vg_exp.py phase-a --build-dir build/dev-reference
+python3 tools/vg-exp/vg_exp.py phase-e --build-dir build/dev-metal
+python3 tools/vg-exp/vg_exp.py benchmark --build-dir build/dev-metal
 
 # Schema / link checks
 cmake --preset docs

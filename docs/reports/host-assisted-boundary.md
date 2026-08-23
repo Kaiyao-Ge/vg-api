@@ -10,7 +10,7 @@ Vulkan 五行都是 compile-review-only（ADR-024），不进入本清单的执�
 | 问题 | 本机答案 | 分类 | 证据 |
 |---|---|---|---|
 | 发现是否必须回主机？ | 必须。`discover_reachable` 在主机读 12 字节 `PointerRef`，可达集回到主机后再提交。没有 GPU discovery kernel，也没有同提交 compact。 | `HostAssisted`，不是 `DevicePass` | E004 重访；ADR-036 |
-| 多节点是否必须分桶？ | 必须用「bucket compute + 每类一条 indirect」，才能在现有 API 上选 ≥2 个预授权 Node。本机没有跑过 ICB 多管线 select。 | Metal：`EmulatedDevicePass`；reference：`Serialized` | E010；ADR-038 |
+| 多节点是否必须分桶？ | 不再必须。Metal 优先走 GPU 编码 ICB（每条 Task 一条计算命令、每类一条预授权 PSO）。分桶 + 每类一条间接 dispatch 只在 ICB 分配/编码/执行失败时回退。 | Metal ICB：`DevicePass`；回退：`EmulatedDevicePass`；reference：`Serialized` | E010；ADR-038 revisit |
 | 续跑是否必须第二次提交？ | 必须。portable 机制是 overflow buffer + 下一提交。没有 DelegatedEnvelope，也不许静默加大 `envelope_task_quota`。 | `HostAssisted` | E017；ADR-039 |
 | 工作集是否只有 proxy？ | 是。`requested` / `committed` / `proxy` 都来自 `allocation->size`，原因写明 proxy。本机没有可当真理的 OS 驻留计数器。Metal sparse = `Unsupported`。 | 预算检查是硬拒绝；数字是 proxy | E011；ADR-037 |
 | 抓包跨后端是否只是语义对照？ | 是。同环境回放只在 cpu-reference。Metal↔Vulkan 只对照稳定 ID / IR hash / epoch / fault taxonomy，不声称两边都执行过。 | 跨后端：语义对照，不是 dual execution | E014；ADR-040 |

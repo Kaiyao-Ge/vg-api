@@ -12,7 +12,7 @@
 现有 Metal / reference 适配器能诚实做到的上限：
 
 - 发现是主机走图 + 回主机（`HostAssisted`）。
-- 多 Node 选择是 bucket + per-Node indirect（`EmulatedDevicePass`），不是原生 ICB/DGC select。
+- 多 Node 选择：Metal 优先 GPU 编码 ICB（`DevicePass`）；ICB 失败才回退 bucket + per-Node indirect（`EmulatedDevicePass`）。Vulkan DGC 仍未执行。
 - 信封溢出靠第二次 submit，令牌记在设备对象上的主机表。
 - 工作集数字是 allocation 大小的 proxy；sparse 为 `Unsupported`。
 - 跨后端抓包是语义对照。
@@ -35,12 +35,13 @@
 
 ### 2.2 原生多管线 select（对应 E010）
 
-现有断点：bucket kernel + 每类一条 `dispatchThreadgroupsWithIndirectBuffer:`。
-本机 ICB 只 probe 过能否分配，没有编码过一次多管线 select。
+现有断点（Metal 适配器侧）：GPU 编码 ICB 已是优先路径——同一 command buffer
+里 reset → GPU encode → optimize → `executeCommandsInBuffer`，按 `node_index`
+选预授权 PSO，host 不读回计数。未授权 Node 由 encode kernel 置位后拒绝。
+Vulkan DGC 仍是 compile-review-only。Tier3（GPU 发明 Node、涨信封）仍拒绝。
 
-要问的合同：ICB / Vulkan DGC / 等价物能否在 **同一 command buffer** 里，
-按 GPU 写下的 Node 类选择预授权管线，且 host 在 dispatch 前不读回计数？
-未授权 Node 谁拒绝？Tier3（GPU 发明 Node、涨信封）仍应默认拒绝。
+还要问的合同：DGC 能否在可执行 Vulkan 上做同一件事；ICB 命令类型是否覆盖
+后续需要的 draw / blit；失败回退不得被标成 `DevicePass`。
 
 读回计数再 host 重编码，只能标 `Serialized` / `HostAssisted`。
 
@@ -90,6 +91,6 @@ fault 对照。
 出现下列之一再写 v2，而不是现在开写驱动：
 
 - 可执行的 Vulkan 真机，或 discrete-GPU Metal 上出现与 proxy 不同的驻留计数；
-- 一次真实的 ICB / DGC 多管线 select（可标 `DevicePass`）；
+- 一次可执行的 Vulkan DGC 多管线 select（可标 `DevicePass`）；Metal ICB GPU-encode 已落地，不单独构成 v2；
 - 一份不经 host 读回、仍能盖住见证的设备侧发现集；
 - 预授权信封在硬件上可观察，而不是第二次 submit。
