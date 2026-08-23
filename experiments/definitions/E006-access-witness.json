@@ -1,0 +1,13 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E006",
+  "name": "access-witness-diagnostics",
+  "workload": "reference-ir-access-fixtures",
+  "backends": ["cpu-reference"],
+  "variants": ["valid", "certificate-miss", "stale-generation", "out-of-bounds", "epoch-mismatch"],
+  "metrics": ["fault_code", "witness_entries", "missing_effects", "outputs_valid"],
+  "protocol": {"deterministic": true, "full_instrumentation": true},
+  "correctness": {"oracle": "structured-reference-diagnostics", "tolerance": "exact"},
+  "requirements": ["certificate", "witness", "fault_record"],
+  "judgement": "every invalid fixture is diagnosed with an allocation/range/instruction witness"
+}

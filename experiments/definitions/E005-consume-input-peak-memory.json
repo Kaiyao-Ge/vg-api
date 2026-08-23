@@ -1,0 +1,24 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E005",
+  "name": "consume-input-peak-memory",
+  "workload": "linear_to_sample_optimal_representation_transform",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["multi-version-baseline", "consume-input"],
+  "metrics": ["peak_bytes", "steady_bytes", "old_backing_bytes", "new_backing_bytes", "temporary_bytes", "completion_delay_ns"],
+  "protocol": {
+    "deterministic": true,
+    "note": "Both variants perform the identical real transform (a linear RGBA8Unorm buffer allocation transformed into a real MTLTexture SampleFacet via TASK-C2's ensure_texture, then Arena::transform() to advance representation_epoch). multi-version-baseline mirrors the traditional explicit-fence-and-manual-reuse scheme: it deliberately never calls Arena::consume(), so the old linear backing stays resident alongside the new texture indefinitely. consume-input additionally calls Arena::consume() once the new representation is live, honoring ConsumeInput's real contract (Arena::consume requires an epoch-matched lookup and in_flight==0, then retires the allocation) -- the old backing's host bytes are then actually freed (not merely reported as freed), and completion_delay_ns measures the real host wall-clock time from the epoch bump to that retirement completing."
+  },
+  "correctness": {
+    "oracle": "arithmetic: peak_bytes == old_backing_bytes + new_backing_bytes for both variants (same workload, so this must match exactly); steady_bytes == peak_bytes for multi-version-baseline (nothing retired); steady_bytes == new_backing_bytes for consume-input (old backing actually retired)",
+    "tolerance": "exact (integer byte counts, no floating-point involved)"
+  },
+  "requirements": ["consume_requires_in_flight_zero_and_epoch_match", "old_backing_bytes_actually_freed_not_just_reported"],
+  "fault_injection": {
+    "status": "Deferred",
+    "reason": "The catalog names 'fault before/during/after transform; capture replay request; external reference exists' as required fault-injection variants. This codebase's existing fault/poison mechanism (core::PoisonState/FaultRecord/ExecutionResult, ADR-005/ADR-009) is scoped to ir::Module instruction execution (instruction_index, ir::Effect, task_index) inside compile()/submit() -- run_consume_input performs no IR module execution at all (it is a standalone Arena+Metal-texture operation, the same standalone shape as run_cull_compact/run_sample_facet). Reusing that mechanism here is not possible without inventing a new, unrelated fault-injection concept for Arena-level transform/consume calls specifically. Rather than fabricate fault-injection results to fill this metric, this milestone reports it honestly as Deferred; a future milestone that needs it would need to design that mechanism for real, scoped to Arena::transform/consume, not adapt the IR-execution fault path."
+  },
+  "judgement": "consume-input demonstrates a real, measured steady-state memory reduction relative to the multi-version-baseline for an identical linear-to-sample-optimal transform (verified on real Apple Silicon hardware: peak 32 bytes, baseline steady 32 bytes, consume-input steady 16 bytes -- a 50% reduction for this fixture's 2x2 RGBA8Unorm workload). Per the catalog's judgement rule ('ConsumeInput is enabled only when the proof succeeds; the reduced watermark and lost replay/rollback capability must be explicitly quantified'): the watermark reduction is the steady_bytes delta above; what is explicitly given up is that consume-input's old linear backing is unrecoverable after Arena::consume() retires it (its bytes are cleared, its allocation id can never satisfy a future epoch-matched lookup at the old generation) -- there is no replay/rollback to the pre-transform representation once ConsumeInput has run, whereas multi-version-baseline retains the old backing precisely so such a rollback stays possible. Fault-injection coverage is explicitly Deferred (see fault_injection above), not silently omitted.",
+  "vulkan_status": "compile-review-only (ADR-024/030); no Vulkan-side ConsumeInput wiring was attempted in this milestone (no Vulkan hardware reachable on this host, and this milestone's transform target -- SampleFacet -- is itself compile-review-only on Vulkan per E008)"
+}

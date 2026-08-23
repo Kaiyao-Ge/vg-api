@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vg.run/v1",
+  "type": "object",
+  "required": ["schema", "run_id", "files"],
+  "properties": {
+    "schema": {"const": "vg.run/v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "files": {"type": "object"}
+  }
+}

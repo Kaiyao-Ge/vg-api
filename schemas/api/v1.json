@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vg.api/v1",
+  "type": "object",
+  "required": ["schema", "api_version"],
+  "properties": {
+    "schema": {"const": "vg.api/v1"},
+    "api_version": {"const": "1.0"}
+  }
+}

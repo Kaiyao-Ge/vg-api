@@ -1,0 +1,23 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E002",
+  "name": "typed-pointer-graph",
+  "workload": "load_ref_load_via_store_via_cachedobject_lowering",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["single-hop-store-via"],
+  "metrics": [
+    "compute_package_classification",
+    "binding_count"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "note": "One load_ref over a 16-byte allocation (never read on the GPU in this lowering) plus one store_via targeting a separate 4-byte allocation via ref_operand, covered by a single declared_pointer_edges entry. load_via/store_via's target is statically resolved host-side in ir::verify() before compile() runs, so compile() reports the compute_package event CachedObject rather than Direct (ADR-028)."
+  },
+  "correctness": {
+    "oracle": "reference::execute (dynamic dangling-ref check: loaded PointerRef must match the dereferencing instruction's own {allocation, generation}) plus compute_package.cpp's store_word_pattern byte-broadcast",
+    "tolerance": "exact (report classification is an exact enum match; store_via's written bytes must exactly equal the byte-broadcast pattern of the stored value)"
+  },
+  "requirements": ["cached_object_lowering_only", "no_dynamic_device_pointer_dereference", "single_hop_pointer_edge_only"],
+  "judgement": "compiler::build_pointer_graph_compute_package (ADR-028) gives E002 a real Metal + reference result under a CachedObject lowering: load_ref is elided from the generated kernel entirely (its value is never read on the GPU in this lowering, only by the reference executor's dynamic dangling-ref check), and load_via/store_via targets are bound by static binding(N) index -- their identity is already resolved host-side via ir::Module::declared_pointer_edges, checked in ir::verify() before compile() ever runs, so no dynamic GPU-side pointer chase is needed. This is a deliberate divergence from the original plan's Vulkan framing (a real BDA-based device-pointer dereference) applied identically on both backends: building a host-side allocation-id -> device-address table would be disproportionate infrastructure for targets that are already statically known. Metal wiring required fixing two self-detected latent bugs before they could ship: Impl::ensure_pipeline's hardcoded kernel function name (would have failed pipeline creation for every pointer-graph module) and submit()'s ir::Access classification ternary defaulting load_ref/load_via/store_via to Publish (would have silently mis-tagged every pointer-graph instruction's trace/witness entry). Both fixed and verified via vertical-slice.metal.pointer-graph on real Apple Silicon hardware.",
+  "vulkan_status": "compile-review-only (ADR-024); vulkan_device_hal.cpp still calls build_linear_compute_package unconditionally and would reject a pointer-graph module exactly as Metal would have pre-B15 -- a documentation-only comment block above DeviceHal::compile maps the same CachedObject-only design (not the plan's originally-envisioned real BDA pointer-chase) onto this backend's existing buffer_reference push-constant convention, with zero functional change (ADR-028)"
+}

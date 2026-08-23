@@ -1,0 +1,29 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E009",
+  "name": "gpu-generated-same-node-work",
+  "workload": "task_ring_tier1_indirect_dispatch_and_instance_cull_compact",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["cpu-cull-oracle", "gpu-cull-compact", "vg-task-tier1-indirect"],
+  "metrics": [
+    "cpu_encode_ns",
+    "cpu_submit_ns",
+    "encoder_count",
+    "command_buffer_count",
+    "queue_wait_count",
+    "task_dispatch_dims_bytes",
+    "visible_count",
+    "hidden_host_round_trip"
+  ],
+  "protocol": {
+    "deterministic": false,
+    "note": "gpu-cull-compact's atomic-append output slot order reflects GPU thread arrival order, not instance index order -- it is compared against cpu-cull-oracle as a sorted multiset of ids, never by position. vg-task-tier1-indirect's dispatch dims (TaskRecord.x/y/z) are GPU-authored from the Tier0 publication buffer and blitted straight into the indirect-args buffer within one command buffer; last_tier1_indirect_dims() is a debug/test-only readback used purely to verify the blit copied the right bytes, not a host round trip the dispatch itself depends on."
+  },
+  "correctness": {
+    "oracle": "reference::cull_compact / reference::execute_task_graph",
+    "tolerance": "exact (as sorted multiset for gpu-cull-compact; byte-exact, in dispatch order, for vg-task-tier1-indirect dims)"
+  },
+  "requirements": ["graph_epoch_consistency", "no_hidden_host_round_trip", "idempotent_instruction_set_only"],
+  "judgement": "VG Task Tier1 dispatches each published task's real x/y/z dims without any host read of those dims before the indirect dispatch runs (ADR-026); the LoweringReport carries a tier1_indirect_dispatch event with real CPU encode/submit timing (TASK-B12), and has_hidden_host_wait() reports no hidden host wait was introduced by this path. GPU cull/compact demonstrates GPU-authored, atomically-claimed stream compaction whose id set matches the CPU oracle exactly once compared as a set. Scope boundary (explicit, not a gap): this milestone validates the Tier1 and cull/compact mechanisms and their correctness on real Apple Silicon hardware; it does not run the catalog's full four-variant comparative CPU-frame-time benchmark (cpu-cull+commands vs. gpu-cull+readback+CPU vs. gpu-cull+indirect vs. VG Tier1 at million-instance scale) -- that would require a separate perf-harness milestone, not a correctness vertical slice. Tier1's re-dispatch is only exercised against an idempotent (load/store-only) probe module; combining it with atomic_add is out of scope for this milestone (ADR-026 Revisit trigger).",
+  "vulkan_status": "compile-review-only (ADR-024); Tier1 reuses the already-implemented dispatch_task_ring_and_tier1 (ADR-022); cull_compact_vulkan_source() exists as a GLSL analogue but is deliberately not wired into vulkan_device_hal.cpp in this milestone"
+}

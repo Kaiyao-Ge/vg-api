@@ -1,0 +1,33 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E016",
+  "name": "representation-epoch-churn",
+  "workload": "frames_in_flight_1_to_8_representation_transform_churn",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["multi-version-unbounded", "backpressure", "consume-input"],
+  "metrics": [
+    "epoch_count",
+    "peak_bytes",
+    "steady_bytes",
+    "producer_stall_ns",
+    "latency_ns",
+    "throughput_transforms_per_s",
+    "transforms_rejected",
+    "backpressure_triggered"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "note": "For each frames_in_flight in 1..8, run_representation_churn executes the same linear RGBA8Unorm allocation through 8 transform attempts under three policies. multi-version-unbounded leaves Arena::max_in_flight_representations at 0 (unbounded) and retains every newly created MTLTexture in a host-side version ring, so peak_bytes grows with accepted transforms. backpressure installs Arena::set_max_in_flight_representations(frames_in_flight); when transform() returns false with 'in-flight representation budget exceeded', the reject is counted, the oldest ring entry is released via Arena::release_representation (producer stall), and the transform is retried -- except at frames_in_flight==1 where the sole initial representation already saturates the budget and every attempt is a pure reject with no release possible. consume-input keeps the allocation Active but releases older representations after each transform so the ring stays near the transform window (live_representations <= 2)."
+  },
+  "correctness": {
+    "oracle": "arithmetic: MultiVersionUnbounded peak at fif=8 exceeds ConsumeInput peak at fif=8; Backpressure peak <= frames_in_flight * version_bytes + linear_bytes; Backpressure triggers at least once across the fif sweep; fif=1 Backpressure accepts 0 transforms",
+    "tolerance": "exact (integer byte counts and reject counters)"
+  },
+  "requirements": [
+    "unbounded_version_creation_forbidden_under_backpressure",
+    "predictable_reject_rather_than_thrashing",
+    "consume_input_keeps_peak_near_transform_window"
+  ],
+  "judgement": "Backpressure policy is formed as an Arena-level max_in_flight_representations budget that makes transform() return false with an explicit error once live_representations would exceed the budget (catalog: 'unbounded version creation forbidden'; 'predictable failure rather than system thrashing'). Measured on real Apple Silicon: MultiVersionUnbounded peak at fif=8 exceeds the ConsumeInput peak; Backpressure keeps peak within the budgeted ring and actually reports transforms_rejected/backpressure_triggered rather than silently growing. drop/quality policy (catalog variant) is out of scope for this milestone -- it is an application-level choice once backpressure has refused a transform, not a core/Arena mechanism.",
+  "vulkan_status": "compile-review-only (ADR-024/030); no Vulkan-side RepresentationEpoch churn wiring was attempted (no Vulkan hardware reachable on this host)"
+}

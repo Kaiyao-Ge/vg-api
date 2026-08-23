@@ -1,0 +1,73 @@
+{
+  "schema": "vg.phase-b-gate/v1",
+  "status": "gate-closed-per-adr-024",
+  "scope": "ComputeAdapter",
+  "mechanism_evidence": {
+    "reference": "task_graph + timeline consumption real, byte-exact oracle (ADR-019)",
+    "metal": "Tier0 + timeline hardware-verified, dev-metal preset, ctest 20/20 passed (2026-08-21)",
+    "vulkan": "Tier0 + Tier1 + timeline compile-review-only, no Linux/NVIDIA execution evidence"
+  },
+  "experiments": {
+    "E002": "passed",
+    "E004": "passed",
+    "E007": "passed",
+    "E009": "passed",
+    "E012": "passed"
+  },
+  "experiment_evidence": {
+    "E002": {
+      "adr": "ADR-028",
+      "task": "TASK-B15",
+      "ctests": ["vertical-slice.metal.pointer-graph", "compiler.compute-package-golden"],
+      "definition": "experiments/definitions/E002-typed-pointer-graph.json",
+      "backends": "metal (real hardware, CachedObject lowering) + reference (byte-exact oracle); vulkan compile-review-only"
+    },
+    "E004": {
+      "adr": "ADR-025",
+      "task": "TASK-B11",
+      "ctests": ["vertical-slice.metal.access-certificate"],
+      "definition": "experiments/definitions/E004-access-certificate.json",
+      "backends": "metal (real hardware, CertifiedPinned/Universe Direct + DiscoverThenLease HostAssisted) + reference (all Direct); SoftwarePaged/FaultManaged honestly Unsupported on both; vulkan compile-review-only"
+    },
+    "E007": {
+      "adr": "ADR-029",
+      "task": "TASK-B16",
+      "ctests": ["vertical-slice.metal.indexed-binding"],
+      "definition": "experiments/definitions/E007-root-pointer-vs-bindless.json",
+      "backends": "metal (real hardware, genuine Direct table-dereference lowering, gpu_addresses capability confirmed present) + reference (zero code changes needed); vulkan compile-review-only, real descriptor indexing explicitly deferred"
+    },
+    "E009": {
+      "adr": "ADR-026",
+      "task": "TASK-B13",
+      "ctests": ["vertical-slice.metal.tier1-indirect", "vertical-slice.metal.cull-compact"],
+      "definition": "experiments/definitions/E009-gpu-generated-same-node-work.json",
+      "backends": "metal (real hardware, indirect dispatch + atomic-counter stream compaction) + reference; vulkan compile-review-only, reusing ADR-022's existing dispatch_task_ring_and_tier1"
+    },
+    "E012": {
+      "adr": "ADR-027",
+      "task": "TASK-B14",
+      "ctests": ["vertical-slice.metal.effect-dag"],
+      "definition": "experiments/definitions/E012-effect-dag-sync-quality.json",
+      "backends": "metal (real hardware, 3 of 4 graph shapes: linear chain, independent branches via multi-encoder hazard tracking, fork-join via MTLFence) + reference; cross-queue/representation-transition/external-present shapes honestly Unsupported/Deferred; vulkan compile-review-only"
+    }
+  },
+  "runner": {
+    "tool": "tools/vg-exp/vg_exp.py phase-b",
+    "ctest": "tooling.phase-b-runner",
+    "note": "Parses the five experiments' ctest results into a single vg.summary/v1 run; Vulkan is recorded as a fixed compile-review-only sample per experiment, never executed, never reported as passed."
+  },
+  "gap_pattern_historical": "Before TASK-B10-B17 (see ADR-023/TASK-B9), all five gate experiments had zero implementation of their required core capability. Every gap identified there has a corresponding real implementation and ADR listed above.",
+  "unsupported_or_deferred": [
+    "E004 SoftwarePaged/FaultManaged: honestly Unsupported on metal and reference (ADR-025) -- pre-authorized by the backend design docs, not a gap",
+    "E009 GPU-side hardware timestamps: out of scope, CPU-side timing only (ADR-026)",
+    "E012 cross-queue / representation-transition / external-present graph shapes: honestly Unsupported/Deferred (ADR-027), 1 of 4 shapes",
+    "E002 multi-hop pointer chains: single-hop only verified end-to-end (ADR-028)",
+    "E007 real Vulkan descriptor indexing (VK_EXT_descriptor_indexing/nonuniformEXT) as the bindless comparison baseline: explicitly out of scope, the largest single deferral in the whole plan (ADR-029)"
+  ],
+  "gate_closure_criterion": {
+    "adr": "ADR-024",
+    "summary": "Metal+reference real hardware results + Vulkan compile-review-only evidence, an explicit documented deviation from the roadmap's literal both-backend-results text, due to permanent Vulkan hardware unavailability on this development machine.",
+    "status": "satisfied -- all five experiments (E002/E004/E007/E009/E012) have real, hardware-verified Metal+reference results plus documented Vulkan compile-review-only mappings, per ADR-025 through ADR-029",
+    "milestones_complete": "TASK-B10 through TASK-B17"
+  }
+}

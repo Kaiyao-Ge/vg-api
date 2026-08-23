@@ -1,0 +1,9 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "P000",
+  "name": "phase0-platform-probe",
+  "workload": "platform-probe",
+  "backends": ["cpu-reference", "metal", "vulkan"],
+  "metrics": ["adapter_count"],
+  "correctness": {"oracle": "runtime-enumeration", "tolerance": "exact"}
+}

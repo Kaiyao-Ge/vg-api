@@ -1,0 +1,31 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E013",
+  "name": "pipeline-classification",
+  "workload": "compute_pipeline_stateblock_classification_vs_naive_permutation",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["naive-full-permutation", "vg-stateblock-classification"],
+  "metrics": [
+    "naive_pipeline_count",
+    "classified_pipeline_count",
+    "naive_compile_ns",
+    "classified_compile_ns",
+    "cache_hits",
+    "cache_misses"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "note": "run_pipeline_classification compiles a tiny Metal compute kernel specialized by a function-constant PipelineKeyState axis across a 2x2x2 matrix (PipelineKeyState x MetalDynamicState x ShaderVisibleData). naive-full-permutation creates one MTLComputePipelineState per triple (8 PSOs). vg-stateblock-classification keys the cache only on PipelineKeyState (2 PSOs), treating MetalDynamicState and ShaderVisibleData as encode-time bindings that must hit the cached PSO (6 cache hits, 2 misses). UnsupportedNeedsConversion blocks are rejected rather than silently folded into a key. Scope is compute-only: no render PSO exists in this codebase yet (ADR-030/034)."
+  },
+  "correctness": {
+    "oracle": "arithmetic: naive_pipeline_count == 8; classified_pipeline_count == 2; cache_misses == 2; cache_hits == 6; classified_pipeline_count < naive_pipeline_count",
+    "tolerance": "exact (integer pipeline/cache counters)"
+  },
+  "requirements": [
+    "shader_data_and_dynamic_state_do_not_enter_pipeline_key",
+    "unsupported_state_reported_not_silently_keyed",
+    "classified_pipeline_count_strictly_below_naive"
+  ],
+  "judgement": "StateBlock classification on the existing compute-pipeline creation path reduces the test-matrix PSO count from 8 (naive full permutation) to 2 (PipelineKeyState only), with dynamic/shader-visible axes hitting the classified cache. Per ADR-030 this experiment is a roadmap work item and is implemented, but it is NOT a hard gate for Phase C closure (the catalog Representation gate row lists only E005/E008/E016). Scope boundary (explicit): compute PSO only -- AttachmentFacet/raster PSO classification is out of scope because no render command encoder exists yet.",
+  "vulkan_status": "compile-review-only (ADR-024/030); no Vulkan pipeline-classification wiring was attempted (no Vulkan hardware reachable on this host)"
+}

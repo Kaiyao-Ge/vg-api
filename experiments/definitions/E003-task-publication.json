@@ -1,0 +1,13 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E003",
+  "name": "task-publication-memory-model",
+  "workload": "publication_ring",
+  "backends": ["cpu-reference"],
+  "variants": ["release-acquire", "ring-overflow", "quota-overflow"],
+  "metrics": ["published_tasks", "overflow_errors", "torn_records"],
+  "protocol": {"deterministic": true, "ring_capacity": 4, "payload_sizes": [0, 4, 64]},
+  "correctness": {"oracle": "publication-state-machine", "tolerance": "exact"},
+  "requirements": ["release", "acquire", "immutable_task"],
+  "judgement": "published records are complete and overflow is explicit"
+}

@@ -1,0 +1,67 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "CMAKE_EXPORT_COMPILE_COMMANDS": "ON", "BUILD_TESTING": "ON" }
+    },
+    {
+      "name": "dev-reference",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "VG_ENABLE_SANITIZERS": "ON" }
+    },
+    {
+      "name": "dev-metal",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "VG_ENABLE_SANITIZERS": "ON", "VG_ENABLE_METAL": "ON" }
+    },
+    {
+      "name": "perf-metal",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "VG_ENABLE_METAL": "ON" }
+    },
+    {
+      "name": "dev-vulkan",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "VG_ENABLE_SANITIZERS": "ON", "VG_ENABLE_VULKAN": "ON" }
+    },
+    {
+      "name": "perf-vulkan",
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "VG_ENABLE_VULKAN": "ON" }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "VG_ENABLE_SANITIZERS": "ON" }
+    },
+    {
+      "name": "docs",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev-reference", "configurePreset": "dev-reference" },
+    { "name": "dev-metal", "configurePreset": "dev-metal" },
+    { "name": "perf-metal", "configurePreset": "perf-metal" },
+    { "name": "dev-vulkan", "configurePreset": "dev-vulkan" },
+    { "name": "perf-vulkan", "configurePreset": "perf-vulkan" },
+    { "name": "fuzz", "configurePreset": "fuzz" },
+    { "name": "docs", "configurePreset": "docs" }
+  ],
+  "testPresets": [
+    { "name": "dev-reference", "configurePreset": "dev-reference", "output": { "outputOnFailure": true } },
+    { "name": "dev-metal", "configurePreset": "dev-metal", "output": { "outputOnFailure": true } },
+    { "name": "dev-vulkan", "configurePreset": "dev-vulkan", "output": { "outputOnFailure": true } },
+    { "name": "docs", "configurePreset": "docs", "output": { "outputOnFailure": true } }
+  ]
+}

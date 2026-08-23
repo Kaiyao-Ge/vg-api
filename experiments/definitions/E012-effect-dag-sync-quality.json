@@ -1,0 +1,27 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E012",
+  "name": "effect-dag-sync-quality",
+  "workload": "general_effect_dag_shape_driven_encoder_fence_lowering",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["independent-branches", "linear-chain", "fork-join", "unsupported-shape"],
+  "metrics": [
+    "encoder_count",
+    "barrier_count",
+    "command_buffer_count",
+    "queue_wait_count",
+    "cpu_encode_ns",
+    "cpu_submit_ns"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "note": "All 4 sub-cases run through a single MTLCommandBuffer per submit() call. fork-join's 4 passes all write the same allocation with mutually-conflicting effects and zero explicit dependencies -- EffectGraphBuilder::seal()'s automatic conflict detection produces the full C(4,2)=6-edge transitive closure, which is the only construction classify_effect_graph_shape recognizes as ForkJoin at node_count==4 (see ADR-027). The written allocation's final bytes are asserted against the deterministic topological order's last writer, which only holds if the per-node MTLFence scheme actually serializes the 4 encoders rather than racing."
+  },
+  "correctness": {
+    "oracle": "core::classify_effect_graph_shape + core::effect_graph_deterministic_order",
+    "tolerance": "exact (encoder_count/barrier_count are exact integers; final buffer bytes are byte-exact against the deterministic-order last writer)"
+  },
+  "requirements": ["effect_graph_shape_classification_only", "no_cross_queue", "no_representation_transition", "no_external_present"],
+  "judgement": "Metal's dispatch_effect_dag lowers exactly 3 of the 4 EffectGraphShape values to real, hardware-verified encoder/fence strategies (ADR-027, finalizing the backend-specific barrier merging and queue/encoder lowering ADR-008 deferred to Phase B): IndependentBranches (one encoder per pass, no fences, relying on the shape's own zero-conflict precondition), LinearChain (a single encoder, sequential in-encoder ordering), and ForkJoin (one encoder per pass, a fully general per-node MTLFence scheme keyed off actual graph.edges() predecessors -- not a source/join role split, since empirical construction showed the classifier's own edge-count invariant forces at least one direct middle-to-middle edge once node_count>3). The 4th bucket (Unsupported) is a first-class, honestly-reported outcome: a diamond construction with both explicit dependencies and overlapping conflicting effects between adjacent nodes produces duplicate Explicit+InferredConflict edges that inflate structural_edges past what the classifier recognizes, and compile() reports this honestly via an effect_dag_lowering report event classified LoweringClass::Unsupported rather than guessing a fence placement. Scope boundary (explicit, not a gap): cross-queue (a second MTLCommandQueue), representation-transition, and external-present shaped graphs are not among the 3 recognized shapes and are not attempted -- they fall into the same honest Unsupported bucket. Combining effect_dag_passes with task_graph in the same submission is out of scope for this milestone (ADR-027), mirroring ADR-026's identical Tier1/atomic_add scope boundary.",
+  "vulkan_status": "compile-review-only (ADR-024); vulkan_device_hal.cpp does not act on effect_dag_passes at all -- a documentation-only comment block above DeviceHal::compile maps the same 3 in-scope shapes onto vkCmdPipelineBarrier2/multiple vkCmdDispatch calls, with zero functional change to actual Vulkan behavior (ADR-027)"
+}

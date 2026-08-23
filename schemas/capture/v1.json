@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vg.capture/v1",
+  "type": "object",
+  "required": ["schema", "schema_version", "ir_hash", "allocations", "tasks"],
+  "properties": {
+    "schema": {"const": "vg.capture/v1"},
+    "schema_version": {"type": "integer"},
+    "ir_hash": {"type": "string"},
+    "allocations": {"type": "array"},
+    "tasks": {"type": "array"}
+  }
+}

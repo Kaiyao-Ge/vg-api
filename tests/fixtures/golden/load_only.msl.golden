@@ -1,0 +1,7 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void vg_linear_compute(device uint* allocation_0 [[buffer(0)]], uint3 gid [[thread_position_in_grid]]) {
+  if (any(gid != uint3(0))) return;
+  volatile uint value_0 = allocation_0[0];
+}

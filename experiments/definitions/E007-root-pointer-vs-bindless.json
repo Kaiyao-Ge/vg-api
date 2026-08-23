@@ -1,0 +1,23 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E007",
+  "name": "root-pointer-vs-bindless",
+  "workload": "indexed_compute_binding_table_vs_linear_per_allocation_binding",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["two-allocation-indexed-table"],
+  "metrics": [
+    "compute_package_classification",
+    "binding_count"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "note": "One load over a 4-byte allocation and one store to a separate 4-byte allocation, compiled through build_indexed_compute_package instead of build_linear_compute_package (ExecutionPlan::request_indexed_binding). Both distinct allocations collapse into one argument-buffer-style table binding (table_binding=0, stride=sizeof(uint64_t), count=2), dereferenced by the GPU through a real MTLBuffer.gpuAddress per-entry, in contrast to build_linear_compute_package's two separate buffer(N) slots for the identical IR (ADR-029)."
+  },
+  "correctness": {
+    "oracle": "reference::execute (build_linear_compute_package's ordinary load/store semantics -- the reference backend needs no indexed-specific code path, see ADR-029) plus compute_package.cpp's store_word_pattern byte-broadcast",
+    "tolerance": "exact (report classification is an exact enum match; bytes must equal exactly 1; store's written bytes must exactly equal the byte-broadcast pattern of the stored value)"
+  },
+  "requirements": ["real_device_pointer_table_required", "gpu_addresses_capability_required", "load_store_only_no_atomic_add_no_pointer_graph_opcodes"],
+  "judgement": "compiler::build_indexed_compute_package (ADR-029) gives E007 a real Metal + reference result under a genuine Direct lowering -- the opposite classification choice from ADR-028's E002 CachedObject lowering, because this experiment specifically measures the cost of a table the GPU actually dereferences at runtime, not a host-resolved binding. The compiled report's compute_package event reports bytes=1 (one table binding) in direct contrast to the linear path's N separate buffer(N) slots for the same two-allocation IR -- exactly the N-vs-1 binding-count signal this experiment is named for. Getting a real result required bypassing a known-stale CapabilitySnapshot::gpu_addresses bit (hardcoded false, never wired to a real check, discovered in a prior milestone and left unfixed) with a narrowly-scoped Impl::probe_gpu_addresses() runtime check instead -- this machine's Metal device was confirmed via vertical-slice.metal.indexed-binding to genuinely support MTLBuffer.gpuAddress, so the test exercises the real dispatch path, not the honest-Unsupported-skip fallback. The residency cost (every referenced allocation still requires a useResource: call even though only the table occupies a binding slot) is reported honestly in ADR-029's prose rather than folded into the bytes metric, keeping the binding-count contrast legible. Reference backend required zero code changes: it never reads request_indexed_binding or branches on indexed_compute_package at all, since build_indexed_compute_package's IR contract is a strict subset of what the ordinary linear path already executes correctly.",
+  "vulkan_status": "compile-review-only (ADR-024); vulkan_device_hal.cpp still calls build_linear_compute_package unconditionally and never branches on request_indexed_binding -- a documentation-only comment block above DeviceHal::compile maps the hypothetical VgIndexedPushConstants table array (reusing E002/ADR-028's VgAllocationRef buffer_reference convention) onto this backend, with zero functional change. Real descriptor indexing (VK_EXT_descriptor_indexing/nonuniformEXT) as the traditional bindless comparison baseline is explicitly out of scope -- this backend has no descriptor-set/pool infrastructure at all, and building that subsystem for a compile-review-only requirement would be disproportionate; this is the largest single scope deferral in the whole Phase B gate plan (ADR-029)."
+}

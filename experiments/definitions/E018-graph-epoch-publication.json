@@ -1,0 +1,13 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E018",
+  "name": "graph-modification-and-epoch-publication",
+  "workload": "graph_epoch_builder",
+  "backends": ["cpu-reference"],
+  "variants": ["new-epoch", "deduplicated-reference", "stale-reference"],
+  "metrics": ["topology_epoch", "graph_reference_count", "stale_rejections"],
+  "protocol": {"deterministic": true, "publication": "immutable-seal"},
+  "correctness": {"oracle": "graph-epoch-reference-model", "tolerance": "exact"},
+  "requirements": ["graph_epoch", "immutable_publication"],
+  "judgement": "new topology publishes without mutating an already sealed graph epoch"
+}

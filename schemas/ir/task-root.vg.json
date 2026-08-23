@@ -1,0 +1,35 @@
+{
+  "schema": "vg.schema/v1",
+  "name": "TaskRoot",
+  "version": 1,
+  "types": {
+    "NodeRef": {
+      "kind": "struct",
+      "fields": [
+        {"name": "index", "type": "u32"},
+        {"name": "generation", "type": "u32"}
+      ]
+    },
+    "ExecutionShape": {
+      "kind": "struct",
+      "fields": [
+        {"name": "x", "type": "u32"},
+        {"name": "y", "type": "u32"},
+        {"name": "z", "type": "u32"},
+        {"name": "flags", "type": "u32"}
+      ]
+    },
+    "TaskRecord": {
+      "kind": "struct",
+      "fields": [
+        {"name": "node", "type": "NodeRef"},
+        {"name": "root", "type": "u64"},
+        {"name": "shape", "type": "ExecutionShape"},
+        {"name": "contract_index", "type": "u32"},
+        {"name": "payload_size", "type": "u32"},
+        {"name": "payload_or_offset", "type": "u64"}
+      ]
+    }
+  },
+  "root": "TaskRecord"
+}

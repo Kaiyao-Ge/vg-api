@@ -1,0 +1,20 @@
+#version 450
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_atomic_int64 : require
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer VgAllocationRef {
+  uint words[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer VgAllocationRef64 {
+  uint64_t words64[];
+};
+
+layout(push_constant) uniform VgPushConstants {
+  VgAllocationRef allocations[1];
+} vg_pc;
+
+void main() {
+  if (gl_GlobalInvocationID != uvec3(0)) return;
+  atomicAdd(VgAllocationRef64(uint64_t(vg_pc.allocations[0])).words64[0], uint64_t(3UL));
+}

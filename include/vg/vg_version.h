@@ -1,0 +1,7 @@
+#ifndef VG_VG_VERSION_H_
+#define VG_VG_VERSION_H_
+
+#define VG_API_VERSION_1_0 0x00010000u
+#define VG_HEADER_VERSION_1_0 VG_API_VERSION_1_0
+
+#endif

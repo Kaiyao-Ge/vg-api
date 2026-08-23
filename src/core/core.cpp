@@ -1,0 +1,799 @@
+#include "core/core.h"
+
+#include <algorithm>
+#include <chrono>
+#include <functional>
+
+namespace vg::core {
+
+bool GraphEpoch::contains(PointerRef reference) const {
+  return std::any_of(references_.begin(), references_.end(), [&](PointerRef candidate) {
+    return candidate.allocation == reference.allocation && candidate.generation == reference.generation;
+  });
+}
+
+bool GraphEpochBuilder::add_reference(PointerRef reference, std::string* error) {
+  if (sealed_) { if (error) *error = "graph epoch is sealed"; return false; }
+  if (reference.generation == 0) { if (error) *error = "graph reference generation must be non-zero"; return false; }
+  if (std::any_of(references_.begin(), references_.end(), [&](PointerRef candidate) {
+        return candidate.allocation == reference.allocation && candidate.generation == reference.generation;
+      })) return true;
+  references_.push_back(reference);
+  return true;
+}
+
+bool GraphEpochBuilder::add_reference(const Arena& arena, PointerRef reference, std::string* error) {
+  if (arena.lookup(reference.allocation, reference.generation) == nullptr) {
+    if (error) *error = "graph reference is not active in arena";
+    return false;
+  }
+  if (arena_ == nullptr) arena_ = &arena;
+  return add_reference(reference, error);
+}
+
+bool GraphEpochBuilder::seal(GraphEpoch* out, std::string* error) {
+  if (out == nullptr) { if (error) *error = "graph epoch output is required"; return false; }
+  if (sealed_) { if (error) *error = "graph epoch builder is already sealed"; return false; }
+  out->value_ = arena_ != nullptr ? arena_->topology_epoch() : next_epoch_;
+  out->references_ = references_;
+  out->sealed_ = true;
+  sealed_ = true;
+  return true;
+}
+
+namespace {
+bool pointer_ref_equal(PointerRef a, PointerRef b) { return a.allocation == b.allocation && a.generation == b.generation; }
+}
+
+bool PointerGraph::reachable(PointerRef from, uint64_t field_offset, PointerRef to) const {
+  return std::any_of(edges_.begin(), edges_.end(), [&](const Edge& edge) {
+    return pointer_ref_equal(edge.from, from) && edge.field_offset == field_offset && pointer_ref_equal(edge.to, to);
+  });
+}
+
+bool PointerGraph::reachable(PointerRef from, PointerRef to) const {
+  std::vector<PointerRef> worklist{from};
+  std::vector<PointerRef> seen{from};
+  while (!worklist.empty()) {
+    PointerRef current = worklist.back();
+    worklist.pop_back();
+    for (const auto& edge : edges_) {
+      if (!pointer_ref_equal(edge.from, current)) continue;
+      if (pointer_ref_equal(edge.to, to)) return true;
+      if (std::any_of(seen.begin(), seen.end(), [&](PointerRef candidate) { return pointer_ref_equal(candidate, edge.to); })) continue;
+      seen.push_back(edge.to);
+      worklist.push_back(edge.to);
+    }
+  }
+  return false;
+}
+
+bool PointerGraphBuilder::add_edge(PointerRef from, uint64_t field_offset, PointerRef to, std::string* error) {
+  if (built_) { if (error) *error = "pointer graph builder is already built"; return false; }
+  if (from.generation == 0 || to.generation == 0) { if (error) *error = "pointer edge generation must be non-zero"; return false; }
+  edges_.push_back({from, field_offset, to});
+  return true;
+}
+
+bool PointerGraphBuilder::build(PointerGraph* out, std::string* error) {
+  if (out == nullptr) { if (error) *error = "pointer graph output is required"; return false; }
+  if (built_) { if (error) *error = "pointer graph builder is already built"; return false; }
+  out->edges_ = edges_;
+  built_ = true;
+  return true;
+}
+
+PublicationRing::PublicationRing(uint32_t capacity) : slots_(capacity) {}
+
+int32_t PublicationRing::reserve() {
+  if (slots_.empty()) return -1;
+  const uint32_t start = next_slot_.fetch_add(1, std::memory_order_relaxed);
+  for (uint32_t i = 0; i < slots_.size(); ++i) {
+    const uint32_t index = (start + i) % static_cast<uint32_t>(slots_.size());
+    auto expected = PublicationState::Empty;
+    if (slots_[index].state.compare_exchange_strong(expected, PublicationState::Writing,
+                                                     std::memory_order_acquire,
+                                                     std::memory_order_relaxed)) return static_cast<int32_t>(index);
+  }
+  return -1;
+}
+
+bool PublicationRing::write(uint32_t slot, const TaskRecord& task, std::string* error) {
+  if (slot >= slots_.size()) { if (error) *error = "publication slot is out of range"; return false; }
+  if (slots_[slot].state.load(std::memory_order_relaxed) != PublicationState::Writing) { if (error) *error = "publication slot is not writable"; return false; }
+  if (task.node_generation == 0 || task.root_generation == 0) { if (error) *error = "task generation must be non-zero"; return false; }
+  slots_[slot].task = task;
+  return true;
+}
+
+bool PublicationRing::publish(uint32_t slot, std::string* error) {
+  if (slot >= slots_.size()) { if (error) *error = "publication slot is out of range"; return false; }
+  auto expected = PublicationState::Writing;
+  if (!slots_[slot].state.compare_exchange_strong(expected, PublicationState::Published,
+                                                   std::memory_order_release,
+                                                   std::memory_order_relaxed)) { if (error) *error = "publication slot is not in writing state"; return false; }
+  return true;
+}
+
+bool PublicationRing::acquire(uint32_t slot, TaskRecord* out, std::string* error) const {
+  if (slot >= slots_.size() || out == nullptr) { if (error) *error = "publication acquire arguments are invalid"; return false; }
+  if (slots_[slot].state.load(std::memory_order_acquire) != PublicationState::Published) { if (error) *error = "publication slot is not published"; return false; }
+  *out = slots_[slot].task;
+  return true;
+}
+
+bool PublicationRing::consume(uint32_t slot, std::string* error) {
+  if (slot >= slots_.size()) { if (error) *error = "publication slot is out of range"; return false; }
+  auto expected = PublicationState::Published;
+  if (!slots_[slot].state.compare_exchange_strong(expected, PublicationState::Consumed,
+                                                   std::memory_order_acquire,
+                                                   std::memory_order_relaxed)) { if (error) *error = "publication slot is not consumable"; return false; }
+  return true;
+}
+
+bool PublicationRing::abort(uint32_t slot, std::string* error) {
+  if (slot >= slots_.size()) { if (error) *error = "publication slot is out of range"; return false; }
+  auto expected = PublicationState::Writing;
+  if (!slots_[slot].state.compare_exchange_strong(expected, PublicationState::Empty,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_relaxed)) {
+    if (error) *error = "publication slot is not abortable";
+    return false;
+  }
+  return true;
+}
+
+bool PublicationRing::publish_task(const TaskRecord& task, uint32_t* slot, std::string* error) {
+  const int32_t reserved = reserve();
+  if (reserved < 0) { if (error) *error = "publication ring quota overflow"; return false; }
+  const uint32_t index = static_cast<uint32_t>(reserved);
+  if (!write(index, task, error)) { abort(index); return false; }
+  if (!publish(index, error)) { abort(index); return false; }
+  if (slot != nullptr) *slot = index;
+  return true;
+}
+
+Allocation& Arena::allocate(uint64_t size) {
+  Allocation allocation;
+  allocation.id = next_id_++;
+  allocation.size = size;
+  allocation.bytes.resize(static_cast<size_t>(size));
+  ++topology_epoch_;
+  auto [it, inserted] = allocations_.emplace(allocation.id, std::move(allocation));
+  (void)inserted;
+  return it->second;
+}
+
+bool Arena::import_allocation(uint64_t id, uint32_t generation, uint64_t size,
+                              uint32_t representation_epoch, ObjectState state,
+                              const std::vector<uint8_t>& bytes, std::string* error) {
+  if (id == 0 || generation == 0 || size == 0 || bytes.size() != size || allocations_.count(id) != 0) {
+    if (error) *error = "invalid or duplicate capture allocation";
+    return false;
+  }
+  Allocation allocation;
+  allocation.id = id;
+  allocation.generation = generation;
+  allocation.size = size;
+  allocation.representation_epoch = representation_epoch;
+  allocation.state = state;
+  allocation.bytes = bytes;
+  allocations_.emplace(id, std::move(allocation));
+  next_id_ = std::max(next_id_, id + 1);
+  ++topology_epoch_;
+  return true;
+}
+
+bool Arena::retire(uint64_t id, uint32_t generation) {
+  auto it = allocations_.find(id);
+  if (it == allocations_.end() || it->second.generation != generation || it->second.state != ObjectState::Active || it->second.in_flight != 0) return false;
+  it->second.state = ObjectState::Retired;
+  ++it->second.generation;
+  ++topology_epoch_;
+  return true;
+}
+
+Allocation* Arena::lookup(uint64_t id, uint32_t generation) {
+  auto it = allocations_.find(id);
+  if (it == allocations_.end() || it->second.state != ObjectState::Active || it->second.generation != generation) return nullptr;
+  return &it->second;
+}
+
+const Allocation* Arena::lookup(uint64_t id, uint32_t generation) const {
+  auto it = allocations_.find(id);
+  if (it == allocations_.end() || it->second.state != ObjectState::Active || it->second.generation != generation) return nullptr;
+  return &it->second;
+}
+
+Allocation* Arena::lookup(uint64_t id, uint32_t generation, uint32_t representation_epoch) {
+  auto* allocation = lookup(id, generation);
+  return allocation != nullptr && allocation->representation_epoch == representation_epoch ? allocation : nullptr;
+}
+
+const Allocation* Arena::lookup(uint64_t id, uint32_t generation, uint32_t representation_epoch) const {
+  const auto* allocation = lookup(id, generation);
+  return allocation != nullptr && allocation->representation_epoch == representation_epoch ? allocation : nullptr;
+}
+
+bool Arena::acquire(uint64_t id, uint32_t generation) {
+  auto* allocation = lookup(id, generation);
+  if (allocation == nullptr) return false;
+  ++allocation->in_flight;
+  return true;
+}
+
+bool Arena::release(uint64_t id, uint32_t generation) {
+  auto* allocation = lookup(id, generation);
+  if (allocation == nullptr || allocation->in_flight == 0) return false;
+  --allocation->in_flight;
+  return true;
+}
+
+bool Arena::transform(uint64_t id, uint32_t generation, uint32_t* new_epoch, std::string* error) {
+  auto* allocation = lookup(id, generation);
+  if (allocation == nullptr) { if (error) *error = "stale allocation for representation transform"; return false; }
+  if (allocation->in_flight != 0) { if (error) *error = "representation epoch is referenced in flight"; return false; }
+  ++allocation->representation_epoch;
+  if (new_epoch != nullptr) *new_epoch = allocation->representation_epoch;
+  return true;
+}
+
+bool Arena::transform(uint64_t id, uint32_t generation, uint32_t expected_epoch, uint32_t* new_epoch, std::string* error) {
+  if (lookup(id, generation, expected_epoch) == nullptr) { if (error) *error = "representation epoch is stale"; return false; }
+  return transform(id, generation, new_epoch, error);
+}
+
+bool Arena::consume(uint64_t id, uint32_t generation, uint32_t expected_epoch, std::string* error) {
+  auto* allocation = lookup(id, generation, expected_epoch);
+  if (allocation == nullptr) { if (error) *error = "stale allocation or representation epoch for consume"; return false; }
+  if (allocation->in_flight != 0) { if (error) *error = "consume requires exclusive ownership"; return false; }
+  allocation->state = ObjectState::Retired;
+  ++allocation->generation;
+  ++topology_epoch_;
+  return true;
+}
+
+const char* to_string(FacetStatus status) {
+  switch (status) {
+    case FacetStatus::Ok: return "ok";
+    case FacetStatus::UnknownIndex: return "facet index out of range";
+    case FacetStatus::Retired: return "facet slot retired";
+    case FacetStatus::GenerationMismatch: return "facet generation mismatch";
+    case FacetStatus::EpochStale: return "facet representation epoch stale";
+    case FacetStatus::AllocationLost: return "facet backing allocation is no longer active";
+  }
+  return "unknown facet status";
+}
+
+bool FacetPool::acquire(const Arena& arena, const CanonicalView& view, FacetKind kind, FacetRef* out,
+                        std::string* error) {
+  if (out == nullptr) { if (error) *error = "facet ref output is required"; return false; }
+  const auto* allocation = arena.lookup(view.allocation, view.allocation_generation);
+  if (allocation == nullptr) { if (error) *error = "canonical view allocation is not active in arena"; return false; }
+  FacetSlot slot;
+  slot.active = true;
+  slot.kind = kind;
+  slot.view = view;
+  slot.representation_epoch = allocation->representation_epoch;
+  if (!free_list_.empty()) {
+    const uint32_t index = free_list_.back();
+    free_list_.pop_back();
+    slot.generation = slots_[index].generation;
+    slots_[index] = slot;
+    *out = {index, slot.generation};
+    return true;
+  }
+  slots_.push_back(slot);
+  *out = {static_cast<uint32_t>(slots_.size() - 1), slot.generation};
+  return true;
+}
+
+const FacetSlot* FacetPool::lookup(const Arena& arena, FacetRef ref, FacetStatus* status) const {
+  const auto fail = [status](FacetStatus reason) -> const FacetSlot* {
+    if (status) *status = reason;
+    return nullptr;
+  };
+  if (ref.index >= slots_.size()) return fail(FacetStatus::UnknownIndex);
+  const FacetSlot& slot = slots_[ref.index];
+  if (!slot.active) return fail(FacetStatus::Retired);
+  if (slot.generation != ref.generation) return fail(FacetStatus::GenerationMismatch);
+  const auto* allocation = arena.lookup(slot.view.allocation, slot.view.allocation_generation);
+  if (allocation == nullptr) return fail(FacetStatus::AllocationLost);
+  if (allocation->representation_epoch != slot.representation_epoch) return fail(FacetStatus::EpochStale);
+  if (status) *status = FacetStatus::Ok;
+  return &slot;
+}
+
+bool FacetPool::retire(FacetRef ref, std::string* error) {
+  if (ref.index >= slots_.size() || !slots_[ref.index].active || slots_[ref.index].generation != ref.generation) {
+    if (error) *error = "stale or already-retired facet ref";
+    return false;
+  }
+  retire_slot(ref.index);
+  return true;
+}
+
+size_t FacetPool::retire_stale(const Arena& arena) {
+  size_t retired = 0;
+  for (uint32_t index = 0; index < slots_.size(); ++index) {
+    FacetSlot& slot = slots_[index];
+    if (!slot.active) continue;
+    const auto* allocation = arena.lookup(slot.view.allocation, slot.view.allocation_generation);
+    if (allocation != nullptr && allocation->representation_epoch == slot.representation_epoch) continue;
+    retire_slot(index);
+    ++retired;
+  }
+  return retired;
+}
+
+bool FacetPool::begin_gpu_use(const Arena& arena, FacetRef ref, std::string* error) {
+  FacetStatus status = FacetStatus::Ok;
+  if (lookup(arena, ref, &status) == nullptr) {
+    if (error) *error = to_string(status);
+    return false;
+  }
+  FacetSlot& slot = slots_[ref.index];
+  slot.in_flight_generation = ref.generation;
+  ++slot.in_flight;
+  return true;
+}
+
+bool FacetPool::end_gpu_use(FacetRef ref, std::string* error) {
+  if (ref.index >= slots_.size()) {
+    if (error) *error = to_string(FacetStatus::UnknownIndex);
+    return false;
+  }
+  FacetSlot& slot = slots_[ref.index];
+  // Deliberately matched against in_flight_generation, not `generation`: the
+  // slot may already have been retired while this use was outstanding, and
+  // that use still has to be released.
+  if (slot.in_flight == 0 || slot.in_flight_generation != ref.generation) {
+    if (error) *error = "facet ref has no outstanding GPU use";
+    return false;
+  }
+  if (--slot.in_flight == 0 && !slot.active) free_list_.push_back(ref.index);
+  return true;
+}
+
+uint32_t FacetPool::in_flight(FacetRef ref) const {
+  if (ref.index >= slots_.size()) return 0;
+  const FacetSlot& slot = slots_[ref.index];
+  return slot.in_flight_generation == ref.generation ? slot.in_flight : 0;
+}
+
+void FacetPool::retire_slot(uint32_t index) {
+  FacetSlot& slot = slots_[index];
+  slot.active = false;
+  ++slot.generation;
+  // An in-flight slot's index is withheld until end_gpu_use() drops the last
+  // use; the token is already dead, but the backend resource behind it is not
+  // reassignable yet.
+  if (slot.in_flight == 0) free_list_.push_back(index);
+}
+
+bool TaskGraphBuilder::append(const TaskRecord& task, std::string* error) {
+  if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
+  if (task.node_generation == 0 || task.root_generation == 0) { if (error) *error = "task generation must be non-zero"; return false; }
+  if (tasks_.size() >= max_tasks_) { if (error) *error = "task graph quota overflow"; return false; }
+  if (task.payload_size > max_payload_bytes_ - payload_bytes_) { if (error) *error = "task payload quota overflow"; return false; }
+  tasks_.push_back(task);
+  effects_.emplace_back();
+  payload_bytes_ += task.payload_size;
+  return true;
+}
+
+bool TaskGraphBuilder::add_dependency(uint32_t before, uint32_t after, std::string* error) {
+  if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
+  if (before >= tasks_.size() || after >= tasks_.size() || before == after) { if (error) *error = "invalid task dependency"; return false; }
+  dependencies_.push_back({before, after});
+  return true;
+}
+
+bool TaskGraphBuilder::add_effect(uint32_t task, const ir::Effect& effect, std::string* error) {
+  if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
+  if (task >= effects_.size()) { if (error) *error = "effect task index is out of range"; return false; }
+  if (effect.allocation == 0 || effect.size == 0) {
+    if (error) *error = "task effect identity and size must be non-zero";
+    return false;
+  }
+  if (effect.offset > UINT64_MAX - effect.size) { if (error) *error = "task effect range overflows"; return false; }
+  effects_[task].push_back(effect);
+  return true;
+}
+
+bool TaskGraphBuilder::set_effects(uint32_t task, std::vector<ir::Effect> effects, std::string* error) {
+  if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
+  if (task >= effects_.size()) { if (error) *error = "effect task index is out of range"; return false; }
+  effects_[task].clear();
+  for (const auto& effect : effects) if (!add_effect(task, effect, error)) return false;
+  return true;
+}
+
+bool TaskGraphBuilder::set_quota(uint32_t max_tasks, uint64_t max_payload_bytes, std::string* error) {
+  if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
+  if (max_tasks < tasks_.size() || max_payload_bytes < payload_bytes_) {
+    if (error) *error = "task graph quota is below current usage";
+    return false;
+  }
+  max_tasks_ = max_tasks;
+  max_payload_bytes_ = max_payload_bytes;
+  return true;
+}
+
+bool TaskGraphBuilder::append_published(PublicationRing& ring, uint32_t slot, std::string* error) {
+  TaskRecord task;
+  if (!ring.acquire(slot, &task, error)) return false;
+  if (!append(task, error)) return false;
+  return ring.consume(slot, error);
+}
+
+bool TaskGraphBuilder::seal(TaskGraph* out, std::string* error) {
+  if (out == nullptr) { if (error) *error = "sealed graph output is required"; return false; }
+  if (sealed_) { if (error) *error = "task graph builder is already sealed"; return false; }
+  EffectGraph graph;
+  for (const auto& edge : dependencies_) if (!graph.add_edge(edge.first, edge.second, EffectEdgeKind::Explicit, 0, error)) return false;
+  for (uint32_t before = 0; before < effects_.size(); ++before) {
+    for (uint32_t after = before + 1; after < effects_.size(); ++after) {
+      bool hazard = false;
+      for (const auto& lhs : effects_[before]) for (const auto& rhs : effects_[after])
+        hazard = hazard || EffectGraph::conflicts(lhs, rhs);
+      if (hazard && !graph.add_edge(before, after, EffectEdgeKind::InferredConflict, 0, error)) return false;
+    }
+  }
+  if (!graph.valid()) { if (error) *error = "task graph dependency cycle"; return false; }
+  if (!graph.validate_happens_before(effects_, error)) return false;
+  out->tasks_ = tasks_;
+  out->dependencies_.clear();
+  for (const auto& edge : graph.edges()) out->dependencies_.push_back({edge.before, edge.after});
+  out->effect_graph_ = std::move(graph);
+  out->published_ = false;
+  sealed_ = true;
+  return true;
+}
+
+bool TaskGraph::publish(std::string* error) {
+  if (!sealed_) { if (error) *error = "task graph must be sealed before publication"; return false; }
+  if (published_) { if (error) *error = "task graph is already published"; return false; }
+  published_ = true;
+  return true;
+}
+
+bool TaskGraph::validate_execution(std::string* error) const {
+  if (!sealed_) { if (error) *error = "task graph must be sealed before execution"; return false; }
+  if (!published_) { if (error) *error = "task graph must be published before execution"; return false; }
+  for (const auto& task : tasks_) {
+    if (task.node_generation == 0 || task.root_generation == 0) {
+      if (error) *error = "task generation is stale";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TaskGraph::deterministic_order(std::vector<uint32_t>* out, std::string* error) const {
+  if (out == nullptr) { if (error) *error = "deterministic order output is required"; return false; }
+  const uint32_t count = static_cast<uint32_t>(tasks_.size());
+  std::vector<std::vector<uint32_t>> adjacency(count);
+  std::vector<uint32_t> in_degree(count, 0);
+  for (const auto& dependency : dependencies_) {
+    adjacency[dependency.first].push_back(dependency.second);
+    ++in_degree[dependency.second];
+  }
+  std::vector<uint32_t> ready;
+  for (uint32_t i = 0; i < count; ++i) if (in_degree[i] == 0) ready.push_back(i);
+  out->clear();
+  out->reserve(count);
+  while (!ready.empty()) {
+    std::sort(ready.begin(), ready.end());
+    const uint32_t node = ready.front();
+    ready.erase(ready.begin());
+    out->push_back(node);
+    for (uint32_t next : adjacency[node]) if (--in_degree[next] == 0) ready.push_back(next);
+  }
+  if (out->size() != count) {
+    if (error) *error = "task graph dependency cycle detected during execution ordering";
+    return false;
+  }
+  return true;
+}
+
+bool EffectGraph::add_edge(uint32_t before, uint32_t after, std::string* error) {
+  return add_edge(before, after, EffectEdgeKind::Explicit, 0, error);
+}
+
+bool EffectGraph::add_edge(uint32_t before, uint32_t after, EffectEdgeKind kind,
+                           uint64_t timeline_value, std::string* error) {
+  if (before == after) { if (error) *error = "effect graph self-cycle"; return false; }
+  edges_.push_back({before, after, kind, timeline_value});
+  return true;
+}
+
+bool EffectGraph::add_timeline_edge(uint32_t before, uint32_t after, uint64_t required_value,
+                                    uint64_t signaled_value, std::string* error) {
+  if (required_value == 0) { if (error) *error = "timeline dependency value must be non-zero"; return false; }
+  if (signaled_value < required_value) { if (error) *error = "timeline wait point is unsatisfied"; return false; }
+  return add_edge(before, after, EffectEdgeKind::Timeline, required_value, error);
+}
+
+bool EffectGraph::conflicts(const ir::Effect& before, const ir::Effect& after) {
+  if (before.allocation != after.allocation || before.representation_epoch != after.representation_epoch) return false;
+  if (before.size == 0 || after.size == 0 || before.offset > UINT64_MAX - before.size || after.offset > UINT64_MAX - after.size) return false;
+  const bool overlap = before.offset < after.offset + after.size && after.offset < before.offset + before.size;
+  if (!overlap) return false;
+  return !(before.access == ir::Access::Read && after.access == ir::Access::Read);
+}
+
+bool EffectGraph::validate_happens_before(const std::vector<std::vector<ir::Effect>>& effects,
+                                          std::string* error) const {
+  const uint32_t count = static_cast<uint32_t>(effects.size());
+  std::vector<std::vector<uint32_t>> adjacency(count);
+  for (const auto& edge : edges_) {
+    if (edge.before >= count || edge.after >= count) {
+      if (error) *error = "effect edge references an unknown task";
+      return false;
+    }
+    adjacency[edge.before].push_back(edge.after);
+  }
+  for (uint32_t before = 0; before < count; ++before) {
+    for (uint32_t after = before + 1; after < count; ++after) {
+      bool conflict = false;
+      for (const auto& lhs : effects[before]) for (const auto& rhs : effects[after])
+        conflict = conflict || conflicts(lhs, rhs);
+      if (!conflict) continue;
+      std::vector<uint8_t> seen(count);
+      std::vector<uint32_t> work{before};
+      seen[before] = 1;
+      for (size_t i = 0; i < work.size(); ++i) for (uint32_t next : adjacency[work[i]])
+        if (!seen[next]) { seen[next] = 1; work.push_back(next); }
+      if (!seen[after]) {
+        if (error) *error = "conflicting task effects have no happens-before edge";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool EffectGraph::valid() const {
+  std::unordered_map<uint32_t, std::vector<uint32_t>> adjacency;
+  for (const auto& edge : edges_) adjacency[edge.before].push_back(edge.after);
+  std::unordered_map<uint32_t, uint8_t> mark;
+  std::function<bool(uint32_t)> visit = [&](uint32_t node) {
+    if (mark[node] == 1) return false;
+    if (mark[node] == 2) return true;
+    mark[node] = 1;
+    for (uint32_t next : adjacency[node]) if (!visit(next)) return false;
+    mark[node] = 2;
+    return true;
+  };
+  for (const auto& [node, _] : adjacency) if (!visit(node)) return false;
+  return true;
+}
+
+uint32_t EffectGraphBuilder::add_node(std::vector<ir::Effect> effects, std::string* error) {
+  if (sealed_) { if (error) *error = "effect graph builder is sealed"; return UINT32_MAX; }
+  effects_.push_back(std::move(effects));
+  return static_cast<uint32_t>(effects_.size() - 1);
+}
+
+bool EffectGraphBuilder::add_dependency(uint32_t before, uint32_t after, std::string* error) {
+  if (sealed_) { if (error) *error = "effect graph builder is sealed"; return false; }
+  if (before >= effects_.size() || after >= effects_.size() || before == after) {
+    if (error) *error = "invalid effect graph dependency";
+    return false;
+  }
+  dependencies_.push_back({before, after});
+  return true;
+}
+
+bool EffectGraphBuilder::seal(EffectGraph* out, uint32_t* node_count, std::string* error) {
+  if (out == nullptr) { if (error) *error = "sealed effect graph output is required"; return false; }
+  if (sealed_) { if (error) *error = "effect graph builder is already sealed"; return false; }
+  EffectGraph graph;
+  for (const auto& edge : dependencies_) if (!graph.add_edge(edge.first, edge.second, EffectEdgeKind::Explicit, 0, error)) return false;
+  for (uint32_t before = 0; before < effects_.size(); ++before) {
+    for (uint32_t after = before + 1; after < effects_.size(); ++after) {
+      bool hazard = false;
+      for (const auto& lhs : effects_[before]) for (const auto& rhs : effects_[after])
+        hazard = hazard || EffectGraph::conflicts(lhs, rhs);
+      if (hazard && !graph.add_edge(before, after, EffectEdgeKind::InferredConflict, 0, error)) return false;
+    }
+  }
+  if (!graph.valid()) { if (error) *error = "effect graph dependency cycle"; return false; }
+  if (!graph.validate_happens_before(effects_, error)) return false;
+  if (node_count != nullptr) *node_count = static_cast<uint32_t>(effects_.size());
+  *out = std::move(graph);
+  sealed_ = true;
+  return true;
+}
+
+EffectGraphShape classify_effect_graph_shape(const EffectGraph& graph, uint32_t node_count) {
+  if (node_count <= 1) return EffectGraphShape::LinearChain;
+  // Timeline/Publication edges are cross-cutting metadata, not structural
+  // ordering the shape classifier reasons about -- only Explicit and
+  // InferredConflict edges shape encoder/fence lowering (ADR-027).
+  std::vector<uint32_t> out_degree(node_count, 0), in_degree(node_count, 0);
+  uint32_t structural_edges = 0;
+  for (const auto& edge : graph.edges()) {
+    if (edge.kind != EffectEdgeKind::Explicit && edge.kind != EffectEdgeKind::InferredConflict) continue;
+    if (edge.before >= node_count || edge.after >= node_count) return EffectGraphShape::Unsupported;
+    ++out_degree[edge.before];
+    ++in_degree[edge.after];
+    ++structural_edges;
+  }
+
+  if (structural_edges == 0) return EffectGraphShape::IndependentBranches;
+
+  // Linear chain: exactly node_count - 1 edges, every node has in/out
+  // degree <= 1, forming a single path (checked by walking from the sole
+  // in-degree-0 node and requiring every step to have exactly one option).
+  if (structural_edges == node_count - 1) {
+    bool is_chain = true;
+    uint32_t sources = 0, start = 0;
+    for (uint32_t i = 0; i < node_count; ++i) {
+      if (in_degree[i] > 1 || out_degree[i] > 1) { is_chain = false; break; }
+      if (in_degree[i] == 0) { ++sources; start = i; }
+    }
+    if (is_chain && sources == 1) {
+      std::vector<std::vector<uint32_t>> adjacency(node_count);
+      for (const auto& edge : graph.edges())
+        if (edge.kind == EffectEdgeKind::Explicit || edge.kind == EffectEdgeKind::InferredConflict)
+          adjacency[edge.before].push_back(edge.after);
+      uint32_t node = start;
+      uint32_t visited = 1;
+      while (!adjacency[node].empty()) { node = adjacency[node].front(); ++visited; }
+      if (visited == node_count) return EffectGraphShape::LinearChain;
+    }
+  }
+
+  // Fork-join: exactly one source node fanning out to every other node
+  // except a single join node, and exactly one join node fanning in from
+  // every other node except the source, with no edges among the "middle"
+  // nodes themselves.
+  uint32_t source = UINT32_MAX, join = UINT32_MAX;
+  for (uint32_t i = 0; i < node_count; ++i) {
+    if (out_degree[i] == node_count - 1 && in_degree[i] == 0) source = i;
+    if (in_degree[i] == node_count - 1 && out_degree[i] == 0) join = i;
+  }
+  if (source != UINT32_MAX && join != UINT32_MAX && source != join &&
+      structural_edges == 2 * (node_count - 1)) {
+    return EffectGraphShape::ForkJoin;
+  }
+
+  return EffectGraphShape::Unsupported;
+}
+
+bool effect_graph_deterministic_order(const EffectGraph& graph, uint32_t node_count,
+                                      std::vector<uint32_t>* out, std::string* error) {
+  if (out == nullptr) { if (error) *error = "effect graph deterministic order output is required"; return false; }
+  std::vector<std::vector<uint32_t>> adjacency(node_count);
+  std::vector<uint32_t> in_degree(node_count, 0);
+  for (const auto& edge : graph.edges()) {
+    if (edge.kind != EffectEdgeKind::Explicit && edge.kind != EffectEdgeKind::InferredConflict) continue;
+    if (edge.before >= node_count || edge.after >= node_count) {
+      if (error) *error = "effect graph edge references an unknown node";
+      return false;
+    }
+    adjacency[edge.before].push_back(edge.after);
+    ++in_degree[edge.after];
+  }
+  std::vector<uint32_t> ready;
+  for (uint32_t i = 0; i < node_count; ++i) if (in_degree[i] == 0) ready.push_back(i);
+  out->clear();
+  out->reserve(node_count);
+  while (!ready.empty()) {
+    std::sort(ready.begin(), ready.end());
+    const uint32_t node = ready.front();
+    ready.erase(ready.begin());
+    out->push_back(node);
+    for (uint32_t next : adjacency[node]) if (--in_degree[next] == 0) ready.push_back(next);
+  }
+  if (out->size() != node_count) {
+    if (error) *error = "effect graph dependency cycle detected during execution ordering";
+    return false;
+  }
+  return true;
+}
+
+EffectGraphForkJoin describe_fork_join(const EffectGraph& graph, uint32_t node_count) {
+  EffectGraphForkJoin result;
+  std::vector<uint32_t> out_degree(node_count, 0), in_degree(node_count, 0);
+  for (const auto& edge : graph.edges()) {
+    if (edge.kind != EffectEdgeKind::Explicit && edge.kind != EffectEdgeKind::InferredConflict) continue;
+    if (edge.before >= node_count || edge.after >= node_count) continue;
+    ++out_degree[edge.before];
+    ++in_degree[edge.after];
+  }
+  for (uint32_t i = 0; i < node_count; ++i) {
+    if (out_degree[i] == node_count - 1 && in_degree[i] == 0) result.source = i;
+    if (in_degree[i] == node_count - 1 && out_degree[i] == 0) result.join = i;
+  }
+  for (uint32_t i = 0; i < node_count; ++i) if (i != result.source && i != result.join) result.middle.push_back(i);
+  return result;
+}
+
+bool Timeline::signal(uint64_t value, std::string* error) {
+  if (value <= value_) { if (error) *error = "timeline signal must be strictly monotonic"; return false; }
+  value_ = value;
+  return true;
+}
+
+bool Timeline::validate_wait(uint64_t value, std::string* error) const {
+  if (value == 0) { if (error) *error = "timeline wait point must be non-zero"; return false; }
+  if (value > value_) { if (error) *error = "timeline wait point is unsatisfied"; return false; }
+  return true;
+}
+
+bool Certificate::covers(const ir::Effect& effect) const {
+  return std::any_of(ranges.begin(), ranges.end(), [&](const ir::Effect& range) { return ir::effect_covers(range, effect); });
+}
+
+void AccessWitness::record(ir::Effect effect, uint32_t instruction_index) {
+  entries_.push_back({effect, instruction_index});
+}
+
+WitnessDiff AccessWitness::diff(const Certificate& certificate) const {
+  WitnessDiff result;
+  for (const auto& entry : entries_) if (!certificate.covers(entry.effect)) result.missing.push_back(entry.effect);
+  for (const auto& range : certificate.ranges) {
+    const bool observed = std::any_of(entries_.begin(), entries_.end(), [&](const WitnessEntry& entry) {
+      return ir::effect_covers(range, entry.effect);
+    });
+    if (!observed) result.unused.push_back(range);
+  }
+  return result;
+}
+
+bool validate_certificate(const Certificate& certificate, const std::vector<ir::Effect>& effects, std::string* error) {
+  for (const auto& effect : effects) {
+    if (!certificate.covers(effect)) { if (error) *error = "certificate does not cover inferred effect"; return false; }
+  }
+  return true;
+}
+
+bool build_access_certificate(const Arena& arena, AccessCertificateMode mode,
+                              const std::vector<PointerRef>& touched,
+                              AccessCertificate* out, std::string* error) {
+  if (out == nullptr) { if (error) *error = "access certificate output is required"; return false; }
+  if (mode == AccessCertificateMode::SoftwarePaged || mode == AccessCertificateMode::FaultManaged) {
+    if (error) *error = "this access certificate mode has no implementation; callers must classify it Unsupported";
+    return false;
+  }
+  out->mode = mode;
+  const auto started = std::chrono::steady_clock::now();
+  GraphEpochBuilder builder(&arena);
+  uint64_t scanned_bytes = 0;
+  if (mode == AccessCertificateMode::CertifiedPinned) {
+    for (const auto& reference : touched) {
+      const Allocation* allocation = arena.lookup(reference.allocation, reference.generation);
+      if (allocation == nullptr) { if (error) *error = "touched allocation is not active in arena"; return false; }
+      if (!builder.add_reference(reference, error)) return false;
+      scanned_bytes += allocation->size;
+    }
+  } else {
+    // Universe and DiscoverThenLease both scan every live allocation in the
+    // arena; under this project's unified-memory Metal/reference model there
+    // is no GPU-resident subset distinct from the arena itself, so
+    // DiscoverThenLease's "discovery" is a real, honestly-timed host rescan
+    // that happens to find the same set Universe would — an accurate result,
+    // not a gap.
+    for (const auto& [id, allocation] : arena.allocations()) {
+      if (allocation.state != ObjectState::Active) continue;
+      if (!builder.add_reference(PointerRef{allocation.id, allocation.generation}, error)) return false;
+      scanned_bytes += allocation.size;
+    }
+  }
+  GraphEpoch epoch;
+  if (!builder.seal(&epoch, error)) return false;
+  out->epoch = epoch;
+  out->scanned_bytes = scanned_bytes;
+  out->result_bytes = scanned_bytes;
+  out->working_set_bytes = scanned_bytes;
+  if (mode == AccessCertificateMode::DiscoverThenLease) {
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    out->discovery_host_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+  }
+  return true;
+}
+
+}  // namespace vg::core

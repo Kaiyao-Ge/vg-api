@@ -1,0 +1,15 @@
+{
+  "schema": "vg.ir/v1",
+  "version": 1,
+  "root_schema": "vg.fixture/mixed",
+  "instructions": [
+    {"op": "store", "allocation": 1, "offset": 0, "size": 4, "value": 9, "generation": 1, "representation_epoch": 0, "source": "mixed:store"},
+    {"op": "load", "allocation": 1, "offset": 0, "size": 4, "generation": 1, "representation_epoch": 0, "source": "mixed:load"},
+    {"op": "atomic_add", "allocation": 2, "offset": 0, "size": 8, "value": 5, "generation": 1, "representation_epoch": 0, "source": "mixed:atomic_add"}
+  ],
+  "effects": [
+    {"allocation": 1, "offset": 0, "size": 4, "access": "write", "representation_epoch": 0},
+    {"allocation": 1, "offset": 0, "size": 4, "access": "read", "representation_epoch": 0},
+    {"allocation": 2, "offset": 0, "size": 8, "access": "atomic", "representation_epoch": 0}
+  ]
+}

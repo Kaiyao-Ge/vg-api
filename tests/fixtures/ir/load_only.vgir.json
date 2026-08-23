@@ -1,0 +1,11 @@
+{
+  "schema": "vg.ir/v1",
+  "version": 1,
+  "root_schema": "vg.fixture/load-only",
+  "instructions": [
+    {"op": "load", "allocation": 1, "offset": 0, "size": 4, "generation": 1, "representation_epoch": 0, "source": "load_only:0"}
+  ],
+  "effects": [
+    {"allocation": 1, "offset": 0, "size": 4, "access": "read", "representation_epoch": 0}
+  ]
+}

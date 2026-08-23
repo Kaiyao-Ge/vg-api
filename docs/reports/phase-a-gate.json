@@ -1,0 +1,25 @@
+{
+  "schema": "vg.phase-a-gate/v1",
+  "status": "reference-complete",
+  "scope": "PortableCore",
+  "experiments": {
+    "E001": "passed",
+    "E003": "passed",
+    "E006": "passed",
+    "E015": "passed",
+    "E018": "passed"
+  },
+  "conformance": {
+    "ctest": "13/13 passed",
+    "asan_ubsan": "13/13 passed",
+    "capture_reference_replay": "passed",
+    "schema_layout_golden": "passed"
+  },
+  "native_adapter": "deferred-to-phase-b",
+  "unsupported_or_deferred": [
+    "Metal/Vulkan lowering and adapter conformance",
+    "dynamic discovery and Universe break-even",
+    "cross-device capture resource import",
+    "GPU-generated delegated continuation"
+  ]
+}

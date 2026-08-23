@@ -1,0 +1,11 @@
+{
+  "schema": "vg.ir/v1",
+  "version": 1,
+  "root_schema": "vg.fixture/atomic-add-only",
+  "instructions": [
+    {"op": "atomic_add", "allocation": 1, "offset": 0, "size": 8, "value": 3, "generation": 1, "representation_epoch": 0, "source": "atomic_add_only:0"}
+  ],
+  "effects": [
+    {"allocation": 1, "offset": 0, "size": 8, "access": "atomic", "representation_epoch": 0}
+  ]
+}

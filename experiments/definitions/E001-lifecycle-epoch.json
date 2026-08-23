@@ -1,0 +1,13 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E001",
+  "name": "lifecycle-and-epoch-conformance",
+  "workload": "arena_graph_epoch",
+  "backends": ["cpu-reference"],
+  "variants": ["active", "retire", "representation-transform", "consume-input"],
+  "metrics": ["fault_code", "generation_valid", "epoch_valid"],
+  "protocol": {"deterministic": true, "random_sequences": 1000},
+  "correctness": {"oracle": "reference-lifecycle-model", "tolerance": "exact"},
+  "requirements": ["generation", "representation_epoch", "graph_epoch"],
+  "judgement": "all stale references are rejected without accessing a reused allocation"
+}

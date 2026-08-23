@@ -1,0 +1,9 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void vg_linear_compute(device uint* allocation_0 [[buffer(0)]], device uint* allocation_1 [[buffer(1)]], uint3 gid [[thread_position_in_grid]]) {
+  if (any(gid != uint3(0))) return;
+  allocation_0[0] = 151587081u;
+  volatile uint value_1 = allocation_0[0];
+  atomic_fetch_add_explicit((device atomic<ulong>*)((device uchar*)allocation_1 + 0), (ulong)5UL, memory_order_relaxed);
+}

@@ -1,0 +1,13 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E015",
+  "name": "fault-and-poison",
+  "workload": "reference-fault-fixtures",
+  "backends": ["cpu-reference"],
+  "variants": ["certificate-fault", "atomic-width-fault", "stale-reference"],
+  "metrics": ["poison_state", "outputs_valid", "fault_code", "partial_output_bytes"],
+  "protocol": {"deterministic": true, "capture_fault_case": true},
+  "correctness": {"oracle": "nontransactional-reference-fault", "tolerance": "exact"},
+  "requirements": ["poison", "fault_record", "capture_replay"],
+  "judgement": "faults never report partial output as valid and never imply rollback"
+}

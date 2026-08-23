@@ -1,0 +1,62 @@
+# Build outputs
+/build/
+/out/
+/dist/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake / Ninja
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+.ninja_deps
+.ninja_log
+CTestTestfile.cmake
+Testing/
+
+# Generated sources (produced by vg-schema during configure/build)
+/generated/
+
+# Experiment and probe run artifacts (reproducible locally; not versioned)
+/artifacts/runs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local agent / tooling caches
+.codebase-memory/
+.claude/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp

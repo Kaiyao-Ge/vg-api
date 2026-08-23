@@ -1,0 +1,29 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E004",
+  "name": "access-certificate-modes",
+  "workload": "arena_certification_scan",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["certified-pinned", "universe", "discover-then-lease", "software-paged", "fault-managed"],
+  "metrics": [
+    "discovery_host_ns",
+    "discovery_gpu_ns",
+    "scanned_bytes",
+    "result_bytes",
+    "working_set_bytes",
+    "certificate_reference_count"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "arena_allocations": 2,
+    "touched_allocations": 1,
+    "note": "arena holds one allocation the compiled module statically touches and one it does not, so CertifiedPinned's certified set (1 reference) is distinguishable from Universe/DiscoverThenLease's full-arena set (2 references)"
+  },
+  "correctness": {
+    "oracle": "core::build_access_certificate",
+    "tolerance": "exact"
+  },
+  "requirements": ["graph_epoch_consistency", "honest_unsupported_reporting"],
+  "judgement": "CertifiedPinned/Universe/DiscoverThenLease each produce a real, epoch-stamped AccessCertificate on both backends (ADR-025); SoftwarePaged/FaultManaged are honestly reported LoweringClass::Unsupported on both backends rather than approximated -- under this project's unified-memory Metal/reference model there is no GPU-resident subset distinct from the arena itself, so DiscoverThenLease's discovery break-even is degenerate (it certifies the same set as Universe, at additional measured host-rescan cost) rather than a smaller leased subset; this is an accurate adapter result, not a gap. Vulkan is compile-review-only per ADR-024 and is not a backend for this experiment's actual results.",
+  "vulkan_status": "compile-review-only (ADR-024); vulkan_device_hal.cpp does not implement requested_certificate_mode in this milestone"
+}
