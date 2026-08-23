@@ -1,0 +1,56 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E014",
+  "name": "capture-replay",
+  "workload": "canonical-capture-same-environment-replay",
+  "backends": ["cpu-reference"],
+  "variants": [
+    "same-device-compute-exact",
+    "fault-capture",
+    "consume-after-refuse",
+    "incompatible-capability-refuse",
+    "metal-vulkan-semantic-correspondence",
+    "driver-update",
+    "dynamic-graph"
+  ],
+  "metrics": [
+    "capture_hash",
+    "ir_hash",
+    "replay_ok",
+    "poison_state",
+    "fault_code",
+    "stable_id_quality",
+    "unsupported_reason"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "note": "Same-environment replay is cpu-reference serialize → deserialize → replay. capture_hash and ir_hash must be identical across two serializations of the same package. Fault captures replay with the recorded poison (PartiallyProduced / Poisoned) and fault taxonomy. A post-consume snapshot (Active, size>0, empty bytes) is refused with the exact string 'cannot restore a consumed representation'. vg-capture-view writes a markdown/json report of allocation id, generation, representation_epoch, size, and fault code/message; it must not emit GPU pointers or 0x device addresses. required_capabilities that the ReplayEnvironment does not have fail closed ('incompatible capabilities refused'). Metal↔Vulkan is semantic correspondence only (stable IDs, IR hash, epoch, fault taxonomy) and never claims both executed. Schema remains vg.capture/v1 with schema_version 2; view metadata is optional (ADR-040)."
+  },
+  "correctness": {
+    "oracle": "reference-capture-replay plus write_view stable-id report",
+    "tolerance": "exact (hash equality, poison/fault taxonomy, refuse strings). Raster image compare is out of this row; use existing raster oracles if a raster capture is later attached."
+  },
+  "requirements": [
+    "portable_capture_does_not_depend_on_backend_addresses",
+    "same_environment_deterministic_hash_match",
+    "incompatible_capabilities_refused",
+    "consumed_representation_refuse_exact_string",
+    "metal_vulkan_semantic_mapping_only"
+  ],
+  "skipped_variants": [
+    {
+      "id": "driver-update",
+      "status": "skipped",
+      "reason": "No second driver or OS upgrade laboratory is available on this host; the catalog marks the variant conditional."
+    },
+    {
+      "id": "dynamic-graph",
+      "status": "blocked",
+      "reason": "D2 later landed discovery_seeds / run_discovery_stage, but E014 still has no capture of a discovered reachable subset. graph_references remain sealed GraphEpoch pointers, not invented discovery data."
+    }
+  ],
+  "phase_d_classification": "same-environment-reference; cross-backend-semantic-only",
+  "break_even_curve": "unmeasured",
+  "judgement": "A compute-exact capture round-trips on cpu-reference with stable capture_hash and ir_hash; fault poison is preserved; a consumed package is refused with the Phase C wording; incompatible capabilities are refused by name; vg-capture-view lists stable IDs without GPU addresses. Metal↔Vulkan is recorded as semantic correspondence, not dual execution. Dynamic-graph and driver-update rows are blocked/skipped rather than fabricated. No performance curve is claimed.",
+  "vulkan_status": "compile-review-only (ADR-024/035/040/041); Metal↔Vulkan is semantic mapping of stable IDs / IR hash / epoch / fault taxonomy and is never reported as both backends having executed"
+}

@@ -1,8 +1,10 @@
 #include "backends/reference/reference_device_hal.h"
 
 #include "backends/reference/reference_executor.h"
+#include "backends/reference/tier2_oracle.h"
 
 #include <chrono>
+#include <vector>
 
 namespace vg::reference {
 namespace {
@@ -108,6 +110,13 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     if (!compiled.plan.graph_epoch_matches(arena, error)) return false;
     submission->abi_version = hal::kDeviceHalAbiVersion;
     submission->report = compiled.report;
+    // TASK-D2 / ADR-036: DiscoverThenLease walk when seeds are set (02 §7.2).
+    // Empty seeds leave the B-era full-arena scan below unchanged.
+    if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
+    // TASK-D3 / ADR-037: this-submit residency is not the address graph.
+    // A set working_set_budget that the requested bytes exceed is a hard
+    // refuse -- never a silent clamp, and never "unified memory is infinite".
+    if (!hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
     // Stage 5 precedes Stage 6/7 (03 §7), and runs outside the cpu_submit_ns
     // window below so that counter keeps meaning exactly the interpreter's own
     // wall clock. The physical step reports what this backend can actually
@@ -144,19 +153,70 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       return true;
     }
     if (!compiled.plan.task_graph.tasks().empty()) {
-      auto task_result = execute_task_graph(compiled.plan.task_graph);
-      if (!task_result.ok) {
-        submission->result.ok = false;
-        submission->result.message = task_result.message;
+      // TASK-D5 / ADR-039: host-split on deterministic_order. Unset quota
+      // keeps the pre-D5 full publish. A set cap publishes a prefix and
+      // parks leftover under a device token; the next submit must present
+      // that record as pending_overflow.
+      std::vector<uint32_t> publish_order;
+      if (!hal::apply_envelope_continuation(compiled.plan, &envelope_continuations_, submission,
+                                            &publish_order, error)) {
         submission->cpu_submit_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submit_start).count();
-        return true;
+        return false;
       }
-      submission->published_tasks = std::move(task_result.published_tasks);
+      if (!publish_order.empty()) {
+        std::string task_error;
+        core::PublicationRing ring(static_cast<uint32_t>(publish_order.size()));
+        const auto& tasks = compiled.plan.task_graph.tasks();
+        submission->published_tasks.clear();
+        submission->published_tasks.reserve(publish_order.size());
+        for (uint32_t index : publish_order) {
+          uint32_t slot = 0;
+          if (index >= tasks.size() || !ring.publish_task(tasks[index], &slot, &task_error) ||
+              !ring.consume(slot, &task_error)) {
+            submission->result.ok = false;
+            submission->result.message = task_error.empty() ? "envelope task index is out of range"
+                                                            : task_error;
+            submission->cpu_submit_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                    submit_start)
+                    .count();
+            return true;
+          }
+          submission->published_tasks.push_back(tasks[index]);
+        }
+      }
+      if (compiled.plan.request_tier2_select) {
+        // Host-walk of the sealed graph: Serialized, never DevicePass.
+        // The Metal path is the emulated device pass; this backend is the
+        // byte-level judge that path must match as a multiset.
+        const auto selected =
+            select_tier2_nodes(compiled.plan.task_graph, compiled.plan.authorized_node_classes);
+        if (!selected.ok) {
+          submission->result.ok = false;
+          submission->result.message = selected.message;
+          submission->report.add("tier2_node_select",
+                                 selected.unauthorized ? hal::LoweringClass::Unsupported
+                                                       : hal::LoweringClass::Serialized,
+                                 1, 0, selected.message);
+          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - submit_start)
+                                          .count();
+          return true;
+        }
+        submission->report.add("tier2_node_select", hal::LoweringClass::Serialized, selected.command_count,
+                               0, "CPU oracle host-walk of authorized node classes; not a device pass");
+        submission->report.add("tier2_bucket_count", hal::LoweringClass::Serialized, selected.bucket_count, 0,
+                               "one host bucket per authorized node class");
+      }
     }
     submission->cpu_submit_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submit_start).count();
-    if (compiled.plan.requested_certificate_mode.has_value()) {
+    // B-era certificate path. A non-empty discovery_seeds list already
+    // attached the discovered (strict subset) certificate above; running
+    // build_access_certificate here would overwrite it with the historical
+    // full-arena DiscoverThenLease scan (ADR-025 / ADR-035).
+    if (compiled.plan.requested_certificate_mode.has_value() && compiled.plan.discovery_seeds.empty()) {
       std::vector<core::PointerRef> touched;
       for (const auto& instruction : compiled.plan.module.instructions) {
         touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});

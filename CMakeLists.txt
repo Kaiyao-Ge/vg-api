@@ -303,4 +303,11 @@ if(BUILD_TESTING)
 
   add_test(NAME schema.generate COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_schema_generator.py ${CMAKE_CURRENT_SOURCE_DIR} ${VG_GENERATED_DIR})
   add_test(NAME tooling.phase-a-runner COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_phase_a_runner.py ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+
+  # Phase D slices land in cmake/phase-d-d*.cmake so D2–D6 can land in
+  # parallel without editing this file. Missing fragments are skipped.
+  file(GLOB VG_PHASE_D_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/phase-d-d*.cmake")
+  foreach(VG_PHASE_D_FRAGMENT IN LISTS VG_PHASE_D_CMAKE)
+    include(${VG_PHASE_D_FRAGMENT})
+  endforeach()
 endif()

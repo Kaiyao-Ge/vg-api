@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <atomic>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -647,6 +648,117 @@ struct AccessCertificate {
 bool build_access_certificate(const Arena& arena, AccessCertificateMode mode,
                               const std::vector<PointerRef>& touched,
                               AccessCertificate* out, std::string* error = nullptr);
+
+// TASK-D2 / ADR-036: seed-topology discovery (02 §7.2). Distinct from
+// build_access_certificate's B-era DiscoverThenLease, which still scans
+// every Active allocation. This walk reads 12-byte PointerRef slots
+// packed the same way load_ref does ({u64 allocation, u32 generation},
+// not sizeof(PointerRef) which may pad) and follows only refs that are
+// well-formed and resolve to Active allocations. Result = seeds +
+// reachable, which can be strictly smaller than Universe on the same
+// Arena. This is a semantic reachable set / proxy, not an OS page
+// migration (06 §10).
+//
+// topology_epoch is frozen at the start of the walk; a change mid-walk
+// refuses rather than certifying a mixed-epoch set.
+struct DiscoveryResult {
+  std::vector<PointerRef> reachable;
+  uint64_t frozen_topology_epoch{};
+  uint64_t scanned_bytes{};
+  uint64_t result_bytes{};
+  uint64_t discovery_host_ns{};
+};
+
+// `after_visit` is invoked after each newly reached allocation is
+// recorded and before the next hop. Production callers leave it empty.
+// Tests use it to bump topology_epoch mid-walk so the freeze check in
+// 02 §7.2 is observable.
+bool discover_reachable(const Arena& arena, const std::vector<PointerRef>& seeds,
+                        DiscoveryResult* out, std::string* error = nullptr,
+                        const std::function<void()>& after_visit = {});
+
+// Seals a DiscoverThenLease AccessCertificate over `discovery.reachable`
+// only -- not the B-era full-arena scan. Callers that still want that
+// scan must keep using build_access_certificate.
+bool build_discovered_certificate(const Arena& arena, const DiscoveryResult& discovery,
+                                  AccessCertificate* out, std::string* error = nullptr);
+
+// 02 §10: certificate (proof) covers witness (observation). An extra
+// forged allocation in `witness` is a refuse, not a silent enlarge.
+bool certificate_covers_discovery_witness(const AccessCertificate& certificate,
+                                          const std::vector<PointerRef>& witness,
+                                          std::string* error = nullptr);
+
+// Phase D shared contracts (ADR-035). Independent of AccessCertificate
+// (sound over-approximation) and of Allocation eviction: this is the
+// residency hold and overflow bookkeeping D2/D3/D5 fill in. Default
+// construction is "not applied" so existing callers stay unchanged.
+
+// Unset (has_limit == false) is distinct from a set limit of 0. A set
+// limit that requested bytes exceed is a predictable refusal, not a clamp.
+struct WorkingSetBudget {
+  bool has_limit{};
+  uint64_t byte_limit{};
+
+  static WorkingSetBudget unlimited() { return {}; }
+  static WorkingSetBudget limited(uint64_t bytes) {
+    WorkingSetBudget budget;
+    budget.has_limit = true;
+    budget.byte_limit = bytes;
+    return budget;
+  }
+  bool allows(uint64_t bytes, std::string* error = nullptr) const;
+};
+
+// This submission's residency hold. A lease cannot name an allocation
+// absent from the caller-supplied proven set (certificate or discovery
+// witness). `complete` is the caller's claim that the named set is the
+// whole hold -- it is not inferred from Arena state.
+struct WorkingSetLease {
+  std::vector<PointerRef> allocations;
+  uint64_t byte_limit{};
+  bool complete{};
+
+  bool covers(PointerRef ref) const;
+  bool add(PointerRef ref, const std::vector<PointerRef>& proven, std::string* error = nullptr);
+  bool valid(const std::vector<PointerRef>& proven, std::string* error = nullptr) const;
+};
+
+// Work this submit could not fit. Rejected cannot be reported as
+// continued. Deferred leftover requires a non-zero continuation token
+// for the next submit -- not a silent quota increase (ADR-010's
+// set_quota is build-time only).
+enum class EnvelopeOverflowDisposition { None, Rejected, Deferred };
+
+struct EnvelopeOverflow {
+  uint32_t overflow_task_count{};
+  EnvelopeOverflowDisposition disposition{EnvelopeOverflowDisposition::None};
+  uint64_t continuation_token{};
+
+  bool valid(std::string* error = nullptr) const;
+  // True only for a valid Deferred leftover. A Rejected record never
+  // answers true, even if a caller stuffed a token in.
+  bool continued() const;
+};
+
+// Per-device leftover buffer for E017 / ADR-039. Tokens are minted here
+// so a second submit can present ExecutionPlan::pending_overflow without
+// turning leftover into an implicit global queue. Token 0 is never issued.
+class EnvelopeContinuationTable {
+ public:
+  // Stores leftover deterministic-order indices and returns a non-zero
+  // token. Empty leftover is not a Deferred record -- mint returns 0 and
+  // stores nothing.
+  uint64_t mint(std::vector<uint32_t> leftover_order);
+  bool contains(uint64_t token) const;
+  bool lookup(uint64_t token, std::vector<uint32_t>* leftover, std::string* error = nullptr) const;
+  // Removes the leftover so a later submit cannot drain it twice.
+  bool take(uint64_t token, std::vector<uint32_t>* leftover, std::string* error = nullptr);
+
+ private:
+  uint64_t next_token_{1};
+  std::unordered_map<uint64_t, std::vector<uint32_t>> leftover_;
+};
 
 struct FaultRecord {
   uint32_t instruction_index{};

@@ -57,6 +57,17 @@
 
 **退出**：E004/E010/E011/E014/E017；break-even curves；HostAssisted 边界清单；NativeContractResearch v1。
 
+**Correction (2026-08-23，见 [ADR-035](../decisions/ADR-035-phase-d-evidence-policy-and-shared-contracts.md)）：**
+证据形状沿用 ADR-024：Metal+reference 真跑，Vulkan 为 compile-review-only，
+不冒充执行证据。`HostAssisted`/`Unsupported` 是合法结论。B 阶段 E004
+（DiscoverThenLease 退化成 Universe 全扫描）保留为历史结果，不是 D 的发现关门。
+租约、预算、信封溢出是独立 core 类型，不是证书字段。原文退出句不改写。
+
+**Correction (2026-08-23，见 [ADR-041](../decisions/ADR-041-phase-d-hostassisted-boundary-and-native-contract-v1.md)）：**
+D7 已写出 HostAssisted 边界清单与 NativeContractResearch v1。五门实验有诚实
+分类；盈亏曲线样本不足，标未测。这是研究记录，不是产品关门，也不自动开始
+Phase E。原文退出句仍不改写。
+
 ## 6. Phase E：Research Alpha
 
 **目标**：外部研究者可复现、评价和扩展。

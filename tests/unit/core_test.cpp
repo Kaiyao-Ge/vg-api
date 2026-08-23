@@ -1173,5 +1173,101 @@ int main() {
     assert(stale_arena.lookup(stale_backing.id, stale_backing.generation)->representation_epoch == 1);
   }
 
+  // --- TASK-D1 / ADR-035: lease, budget, overflow are independent types.
+  // Budget 0 ≠ unset. A lease cannot cover an unproven allocation.
+  // Rejected overflow cannot answer continued(). ---
+  {
+    const auto unlimited = vg::core::WorkingSetBudget::unlimited();
+    assert(!unlimited.has_limit);
+    assert(unlimited.allows(0));
+    assert(unlimited.allows(1ull << 40));
+
+    const auto zero = vg::core::WorkingSetBudget::limited(0);
+    assert(zero.has_limit);
+    assert(zero.byte_limit == 0);
+    assert(zero.allows(0));
+    std::string budget_error;
+    assert(!zero.allows(1, &budget_error));
+    assert(budget_error == "working-set budget exceeded");
+    assert(zero.has_limit != unlimited.has_limit);
+
+    const vg::core::PointerRef proven_a{1, 1};
+    const vg::core::PointerRef proven_b{2, 1};
+    const vg::core::PointerRef stranger{3, 1};
+    const std::vector<vg::core::PointerRef> proven{proven_a, proven_b};
+
+    vg::core::WorkingSetLease lease;
+    std::string lease_error;
+    assert(lease.add(proven_a, proven, &lease_error));
+    assert(lease.covers(proven_a));
+    assert(!lease.covers(stranger));
+    assert(!lease.add(stranger, proven, &lease_error));
+    assert(lease_error == "lease cannot cover an unproven allocation");
+    assert(!lease.covers(stranger));
+    lease.allocations.push_back(stranger);
+    assert(!lease.valid(proven, &lease_error));
+    assert(lease_error == "lease cannot cover an unproven allocation");
+    lease.allocations.pop_back();
+    assert(lease.valid(proven, &lease_error));
+
+    vg::core::EnvelopeOverflow unused;
+    assert(unused.valid());
+    assert(!unused.continued());
+    unused.overflow_task_count = 3;
+    assert(!unused.valid(&lease_error));
+    assert(lease_error == "an unused overflow record cannot carry leftover work or a continuation token");
+
+    vg::core::EnvelopeOverflow rejected;
+    rejected.disposition = vg::core::EnvelopeOverflowDisposition::Rejected;
+    rejected.overflow_task_count = 4;
+    assert(rejected.valid());
+    assert(!rejected.continued());
+    rejected.continuation_token = 9;
+    assert(!rejected.valid(&lease_error));
+    assert(lease_error == "a rejected overflow cannot be marked continued");
+    assert(!rejected.continued());
+
+    vg::core::EnvelopeOverflow deferred;
+    deferred.disposition = vg::core::EnvelopeOverflowDisposition::Deferred;
+    assert(!deferred.valid(&lease_error));
+    assert(lease_error == "a deferred overflow requires leftover work and a continuation token");
+    deferred.overflow_task_count = 2;
+    deferred.continuation_token = 11;
+    assert(deferred.valid());
+    assert(deferred.continued());
+
+    vg::hal::ExecutionPlan plan;
+    assert(!plan.working_set_budget.has_value());
+    assert(!plan.working_set_lease.has_value());
+    assert(!plan.pending_overflow.has_value());
+    vg::hal::Submission submission;
+    assert(!submission.envelope_overflow.has_value());
+
+    auto ref_device = vg::reference::make_device_hal();
+    assert(ref_device != nullptr);
+    auto compiled = vg::compiler::compile_c_like("@node @effects store(1,0,4,7)");
+    assert(compiled.ok);
+    plan.capabilities = ref_device->capabilities();
+    plan.module = compiled.module;
+    plan.published = true;
+    assert(plan.validate());
+
+    plan.working_set_budget = vg::core::WorkingSetBudget::limited(16);
+    plan.working_set_lease = vg::core::WorkingSetLease{};
+    plan.working_set_lease->byte_limit = 32;
+    std::string plan_error;
+    assert(!plan.validate(&plan_error));
+    assert(plan_error == "working-set lease exceeds the plan's working-set budget");
+    plan.working_set_lease->byte_limit = 16;
+    assert(plan.validate());
+
+    plan.pending_overflow = rejected;
+    assert(!plan.validate(&plan_error));
+    assert(plan_error == "a rejected overflow cannot be marked continued");
+    rejected.continuation_token = 0;
+    plan.pending_overflow = rejected;
+    assert(plan.validate());
+  }
+
   return 0;
 }

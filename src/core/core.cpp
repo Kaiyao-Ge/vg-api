@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <functional>
+#include <utility>
 
 namespace vg::core {
 
@@ -1011,6 +1013,247 @@ bool build_access_certificate(const Arena& arena, AccessCertificateMode mode,
     const auto elapsed = std::chrono::steady_clock::now() - started;
     out->discovery_host_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
   }
+  return true;
+}
+
+namespace {
+// load_ref's wire width is 12 bytes (u64 + u32). sizeof(PointerRef) may
+// pad to 16; discovery must not invent a wider slot (ADR-028).
+constexpr size_t kPointerRefWireBytes = sizeof(uint64_t) + sizeof(uint32_t);
+
+bool decode_pointer_ref(const std::vector<uint8_t>& bytes, size_t offset, PointerRef* out) {
+  if (out == nullptr || offset + kPointerRefWireBytes > bytes.size()) return false;
+  PointerRef ref{};
+  std::memcpy(&ref.allocation, bytes.data() + offset, sizeof(ref.allocation));
+  std::memcpy(&ref.generation, bytes.data() + offset + sizeof(ref.allocation), sizeof(ref.generation));
+  *out = ref;
+  return true;
+}
+
+bool discovery_ref_seen(const std::vector<PointerRef>& seen, PointerRef ref) {
+  return std::any_of(seen.begin(), seen.end(), [&](PointerRef candidate) {
+    return candidate.allocation == ref.allocation && candidate.generation == ref.generation;
+  });
+}
+}  // namespace
+
+bool discover_reachable(const Arena& arena, const std::vector<PointerRef>& seeds, DiscoveryResult* out,
+                        std::string* error, const std::function<void()>& after_visit) {
+  if (out == nullptr) {
+    if (error) *error = "discovery result output is required";
+    return false;
+  }
+  *out = {};
+  const auto started = std::chrono::steady_clock::now();
+  const uint64_t frozen = arena.topology_epoch();
+  out->frozen_topology_epoch = frozen;
+
+  std::vector<PointerRef> worklist;
+  for (const auto& seed : seeds) {
+    if (seed.allocation == 0 || seed.generation == 0) {
+      if (error) *error = "discovery seed is not a well-formed pointer ref";
+      return false;
+    }
+    if (arena.lookup(seed.allocation, seed.generation) == nullptr) {
+      if (error) *error = "discovery seed is not an active allocation";
+      return false;
+    }
+    if (discovery_ref_seen(out->reachable, seed)) continue;
+    out->reachable.push_back(seed);
+    worklist.push_back(seed);
+  }
+  if (arena.topology_epoch() != frozen) {
+    if (error) *error = "topology epoch changed during discovery";
+    return false;
+  }
+
+  while (!worklist.empty()) {
+    if (arena.topology_epoch() != frozen) {
+      if (error) *error = "topology epoch changed during discovery";
+      return false;
+    }
+    const PointerRef current = worklist.back();
+    worklist.pop_back();
+    const Allocation* allocation = arena.lookup(current.allocation, current.generation);
+    if (allocation == nullptr) {
+      if (error) *error = "discovered allocation is no longer active";
+      return false;
+    }
+    out->scanned_bytes += allocation->size;
+    if (after_visit) after_visit();
+    if (arena.topology_epoch() != frozen) {
+      if (error) *error = "topology epoch changed during discovery";
+      return false;
+    }
+    // Re-lookup after the hook: a mid-walk topology bump already refused
+    // above; this only guards a hook that retired `current` without a
+    // topology tick (should not happen -- retire() ticks topology_epoch).
+    allocation = arena.lookup(current.allocation, current.generation);
+    if (allocation == nullptr) {
+      if (error) *error = "discovered allocation is no longer active";
+      return false;
+    }
+    for (size_t offset = 0; offset + kPointerRefWireBytes <= allocation->bytes.size();
+         offset += kPointerRefWireBytes) {
+      PointerRef child{};
+      if (!decode_pointer_ref(allocation->bytes, offset, &child)) continue;
+      // Walk only well-formed refs that resolve to Active. A zero generation
+      // or a stale id is a break in the chain, not a business store we
+      // chase (02 §7.2: discovery Node has no side effects and does not
+      // invent edges).
+      if (child.allocation == 0 || child.generation == 0) continue;
+      if (arena.lookup(child.allocation, child.generation) == nullptr) continue;
+      if (discovery_ref_seen(out->reachable, child)) continue;
+      out->reachable.push_back(child);
+      worklist.push_back(child);
+    }
+  }
+
+  for (const auto& ref : out->reachable) {
+    const Allocation* allocation = arena.lookup(ref.allocation, ref.generation);
+    if (allocation != nullptr) out->result_bytes += allocation->size;
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  out->discovery_host_ns =
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+  return true;
+}
+
+bool build_discovered_certificate(const Arena& arena, const DiscoveryResult& discovery,
+                                  AccessCertificate* out, std::string* error) {
+  if (out == nullptr) {
+    if (error) *error = "access certificate output is required";
+    return false;
+  }
+  if (arena.topology_epoch() != discovery.frozen_topology_epoch) {
+    if (error) *error = "topology epoch changed during discovery";
+    return false;
+  }
+  GraphEpochBuilder builder(&arena);
+  for (const auto& ref : discovery.reachable) {
+    if (!builder.add_reference(arena, ref, error)) return false;
+  }
+  GraphEpoch epoch;
+  if (!builder.seal(&epoch, error)) return false;
+  out->mode = AccessCertificateMode::DiscoverThenLease;
+  out->epoch = epoch;
+  out->discovery_host_ns = discovery.discovery_host_ns;
+  out->discovery_gpu_ns = 0;
+  out->scanned_bytes = discovery.scanned_bytes;
+  out->result_bytes = discovery.result_bytes;
+  out->working_set_bytes = discovery.result_bytes;
+  return true;
+}
+
+bool certificate_covers_discovery_witness(const AccessCertificate& certificate,
+                                          const std::vector<PointerRef>& witness, std::string* error) {
+  for (const auto& ref : witness) {
+    if (certificate.epoch.contains(ref)) continue;
+    if (error) *error = "discovery witness is not covered by the certificate";
+    return false;
+  }
+  return true;
+}
+
+bool WorkingSetBudget::allows(uint64_t bytes, std::string* error) const {
+  if (!has_limit) return true;
+  if (bytes <= byte_limit) return true;
+  if (error) *error = "working-set budget exceeded";
+  return false;
+}
+
+bool WorkingSetLease::covers(PointerRef ref) const {
+  return std::any_of(allocations.begin(), allocations.end(), [&](PointerRef candidate) {
+    return candidate.allocation == ref.allocation && candidate.generation == ref.generation;
+  });
+}
+
+bool WorkingSetLease::add(PointerRef ref, const std::vector<PointerRef>& proven, std::string* error) {
+  const bool proven_hold = std::any_of(proven.begin(), proven.end(), [&](PointerRef candidate) {
+    return candidate.allocation == ref.allocation && candidate.generation == ref.generation;
+  });
+  if (!proven_hold) {
+    if (error) *error = "lease cannot cover an unproven allocation";
+    return false;
+  }
+  if (covers(ref)) return true;
+  allocations.push_back(ref);
+  return true;
+}
+
+bool WorkingSetLease::valid(const std::vector<PointerRef>& proven, std::string* error) const {
+  for (const PointerRef& ref : allocations) {
+    const bool proven_hold = std::any_of(proven.begin(), proven.end(), [&](PointerRef candidate) {
+      return candidate.allocation == ref.allocation && candidate.generation == ref.generation;
+    });
+    if (proven_hold) continue;
+    if (error) *error = "lease cannot cover an unproven allocation";
+    return false;
+  }
+  return true;
+}
+
+bool EnvelopeOverflow::valid(std::string* error) const {
+  switch (disposition) {
+    case EnvelopeOverflowDisposition::None:
+      if (overflow_task_count != 0 || continuation_token != 0) {
+        if (error) *error = "an unused overflow record cannot carry leftover work or a continuation token";
+        return false;
+      }
+      return true;
+    case EnvelopeOverflowDisposition::Rejected:
+      if (continuation_token != 0) {
+        if (error) *error = "a rejected overflow cannot be marked continued";
+        return false;
+      }
+      return true;
+    case EnvelopeOverflowDisposition::Deferred:
+      if (overflow_task_count == 0 || continuation_token == 0) {
+        if (error) *error = "a deferred overflow requires leftover work and a continuation token";
+        return false;
+      }
+      return true;
+  }
+  if (error) *error = "unknown overflow disposition";
+  return false;
+}
+
+bool EnvelopeOverflow::continued() const {
+  return disposition == EnvelopeOverflowDisposition::Deferred && continuation_token != 0 &&
+         overflow_task_count != 0;
+}
+
+uint64_t EnvelopeContinuationTable::mint(std::vector<uint32_t> leftover_order) {
+  if (leftover_order.empty()) return 0;
+  uint64_t token = next_token_++;
+  if (token == 0) token = next_token_++;
+  leftover_.emplace(token, std::move(leftover_order));
+  return token;
+}
+
+bool EnvelopeContinuationTable::contains(uint64_t token) const {
+  return token != 0 && leftover_.find(token) != leftover_.end();
+}
+
+bool EnvelopeContinuationTable::lookup(uint64_t token, std::vector<uint32_t>* leftover,
+                                       std::string* error) const {
+  if (token == 0) {
+    if (error) *error = "envelope continuation token does not match";
+    return false;
+  }
+  const auto found = leftover_.find(token);
+  if (found == leftover_.end()) {
+    if (error) *error = "envelope continuation token does not match";
+    return false;
+  }
+  if (leftover) *leftover = found->second;
+  return true;
+}
+
+bool EnvelopeContinuationTable::take(uint64_t token, std::vector<uint32_t>* leftover,
+                                     std::string* error) {
+  if (!lookup(token, leftover, error)) return false;
+  leftover_.erase(token);
   return true;
 }
 
