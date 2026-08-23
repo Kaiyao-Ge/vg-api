@@ -66,7 +66,7 @@
 **Correction (2026-08-23，见 [ADR-041](../decisions/ADR-041-phase-d-hostassisted-boundary-and-native-contract-v1.md)）：**
 D7 已写出 HostAssisted 边界清单与 NativeContractResearch v1。五门实验有诚实
 分类；盈亏曲线样本不足，标未测。这是研究记录，不是产品关门，也不自动开始
-Phase E。原文退出句仍不改写。
+Phase E。原文退出句仍不改写。Phase E 的记录见 ADR-042，不回溯改写本段。
 
 ## 6. Phase E：Research Alpha
 
@@ -75,6 +75,13 @@ Phase E。原文退出句仍不改写。
 **产物**：versioned C ABI；compiler/tool binaries；Metal/Vulkan adapters；conformance；18 项实验状态；sample workloads；完整 run bundles；architecture paper/report。
 
 **退出**：所有 P0 风险关闭或有明确范围限制；文档与代码一致；另一 Agent 从干净 checkout 可完成 build -> conformance -> 一个 benchmark。
+
+**Correction (2026-08-23，见 [ADR-042](../decisions/ADR-042-phase-e-evidence-policy-and-external-reproducibility.md)）：**
+Research Alpha 按汇总 + 对外复现记录，不是产品关门。E001–E018 有
+gate 引用或显式 Unsupported/Deferred/unmeasured。Vulkan 仍为
+compile-review-only。公共 C ABI 维持 v1.0 最小集。一个 benchmark 的
+证据等级上限为 P0（可运行，host wall-clock）。compiler/tool binaries
+是源码目标，不是发行包装。原文退出句仍不改写。
 
 ## 7. 优先级风险表
 

@@ -2676,8 +2676,8 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
     }
     // TASK-D4 (E010): isolated behind request_tier2_select so D2/D3/D5
     // submit prologue work does not collide. Implementation lives in
-    // metal_tier2.mm -- ICB is not required; default is bucket + per-Node
-    // indirect classified EmulatedDevicePass.
+    // metal_tier2.mm -- GPU-encoded multi-PSO ICB is DevicePass; bucket
+    // + per-Node indirect remains the EmulatedDevicePass fallback.
     if (compiled.plan.request_tier2_select) {
       std::string tier2_error;
       if (!vg::metal::tier2::apply_select(static_cast<void*>(impl_->device),

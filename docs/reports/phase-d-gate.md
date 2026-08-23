@@ -10,7 +10,7 @@ Vulkan compile-review-only。`HostAssisted` / `Unsupported` 是合法结论。
 | 产物 | 状态 |
 |---|---|
 | E004 重访（发现集 < Universe） | recorded，`HostAssisted` |
-| E010 多 Node lowering | recorded，Metal `EmulatedDevicePass` / reference `Serialized` |
+| E010 多 Node lowering | recorded，Metal ICB `DevicePass`（失败回退分桶 `EmulatedDevicePass`） / reference `Serialized` |
 | E011 本提交工作集 | recorded，proxy 字节 + sparse `Unsupported` |
 | E014 抓包可视 / 同环境回放 | recorded，跨后端仅语义对照 |
 | E017 信封续跑 | recorded，`HostAssisted` overflow + 下一提交 |
@@ -19,6 +19,8 @@ Vulkan compile-review-only。`HostAssisted` / `Unsupported` 是合法结论。
 | NativeContractResearch v1 | [native-contract-research-v1.md](native-contract-research-v1.md) |
 
 这是研究关门，不是产品关门，也不是 Phase E 的入口。
+Phase E 由 [ADR-042](../decisions/ADR-042-phase-e-evidence-policy-and-external-reproducibility.md)
+单独记录，见 [phase-e-gate.md](phase-e-gate.md)。
 
 ## 五门实验
 
@@ -28,7 +30,7 @@ B 时代 `E004-access-certificate.json` 仍是历史行（DiscoverThenLease = Un
 | Gate | 分类 | ADR | Task | ctest |
 |---|---|---|---|---|
 | E004 discovery revisit | HostAssisted；discovered 2&lt;4 与 1&lt;4 | ADR-036 | TASK-D2 | `core.discovery`, `vertical-slice.metal.discovery` |
-| E010 heterogeneous nodes | EmulatedDevicePass（4+4 / 7+1 多重集） | ADR-038 | TASK-D4 | `unit.tier2-oracle`, `vertical-slice.metal.tier2-nodes` |
+| E010 heterogeneous nodes | ICB DevicePass（4+4 / 7+1 多重集）；分桶为回退 | ADR-038 | TASK-D4 | `unit.tier2-oracle`, `vertical-slice.metal.tier2-nodes` |
 | E011 working set | 手选 16B/预算 64 过；Universe 32B/预算 16 拒；sparse Unsupported | ADR-037 | TASK-D3 | `core.working-set`, `vertical-slice.metal.working-set` |
 | E014 capture view | reference 哈希稳定；消费后精确拒绝；Metal↔Vulkan 语义对照 | ADR-040 | TASK-D6 | `capture.view`, `capture.view.cli` |
 | E017 envelope continuation | quota 1 → 发布 1 + leftover 2；无令牌不偷；大 quota 一次过 | ADR-039 | TASK-D5 | `core.envelope-continuation`, `vertical-slice.metal.envelope-continuation` |

@@ -1,0 +1,59 @@
+{
+  "schema": "vg.p0-risk-register/v1",
+  "adr": "ADR-042",
+  "source": "docs/vg-project/12-roadmap-and-risks.md §7",
+  "judgement": "one-open-with-scope-limit; six-mitigated-with-scope-limits",
+  "risks": {
+    "certificate_unsound": {
+      "owner": "Core/Compiler",
+      "status": "mitigated-with-scope-limit",
+      "tests": [
+        "vertical-slice.metal.access-certificate",
+        "core.discovery",
+        "vertical-slice.metal.discovery",
+        "conformance.phase-a"
+      ],
+      "scope_limit": "no-certificate-composition-across-indirect-calls"
+    },
+    "epoch_recycle_race": {
+      "owner": "Core",
+      "status": "mitigated-with-scope-limit",
+      "tests": ["model.phase-a", "vertical-slice.metal.checked-facet-generation", "core.unit"],
+      "scope_limit": "model-sequence-1000-not-100k; no-recycle-pressure-harness"
+    },
+    "task_publication_weak_memory": {
+      "owner": "Core/Backend",
+      "status": "open-scope-limit",
+      "tests": ["model.phase-a"],
+      "scope_limit": "host-bounded-model-only; no-gpu-litmus"
+    },
+    "facet_in_flight_swap": {
+      "owner": "Core/Backend",
+      "status": "mitigated-with-scope-limit",
+      "tests": [
+        "vertical-slice.metal.representation-layer",
+        "vertical-slice.metal.checked-facet-generation",
+        "vertical-slice.metal.representation-churn"
+      ],
+      "scope_limit": "peak-bytes-unmeasured; phase-c-not-closed"
+    },
+    "adapter_weak_sync": {
+      "owner": "Backend",
+      "status": "mitigated-with-scope-limit",
+      "tests": ["vertical-slice.metal.effect-dag"],
+      "scope_limit": "three-of-four-shapes; no-cross-backend-differential"
+    },
+    "abi_schema_split": {
+      "owner": "Compiler/API",
+      "status": "mitigated-with-scope-limit",
+      "tests": ["schema.generate", "abi.c", "abi.cpp", "abi.facet-token"],
+      "scope_limit": "public-c-abi-minimal-v1; no-standalone-compatibility-report-file"
+    },
+    "fault_reported_as_success": {
+      "owner": "Core/Backend",
+      "status": "mitigated-with-scope-limit",
+      "tests": ["conformance.phase-a"],
+      "scope_limit": "no-adapter-fault-parity-gate; no-device-page-fault-propagation"
+    }
+  }
+}

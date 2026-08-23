@@ -70,9 +70,9 @@ enum class LoweringClass : uint32_t {
   HostAssisted,
   Serialized,
   Unsupported,
-  // TASK-D4 (E010): GPU-authored bucket + per-Node indirect that is *not*
-  // a native ICB / DGC select. Never use DevicePass for "host read counts,
-  // then re-encode" -- that is Serialized/HostAssisted, not GPU-driven.
+  // TASK-D4 (E010): GPU-authored bucket + per-Node indirect, used when a
+  // native ICB / DGC select did not run. Never use DevicePass for "host
+  // read counts, then re-encode" -- that is Serialized/HostAssisted.
   EmulatedDevicePass,
 };
 
@@ -209,11 +209,11 @@ struct ExecutionPlan {
   // buffer + next submit, never a silent enlarge.
   std::optional<uint32_t> envelope_task_quota;
   // TASK-D4 (E010): when true, submit() selects among
-  // `authorized_node_classes` (>=2 pre-authorized Node classes) via bucket
-  // compute + per-Node indirect. Default false / empty list leaves every
-  // pre-D4 caller unchanged. ICB is an optional capability upgrade, not
-  // required. A backend that host-walks selection must classify
-  // Serialized/HostAssisted -- never DevicePass.
+  // `authorized_node_classes` (>=2 pre-authorized Node classes). Metal
+  // prefers a GPU-encoded ICB (DevicePass) and falls back to bucket +
+  // per-Node indirect (EmulatedDevicePass). Default false / empty list
+  // leaves every pre-D4 caller unchanged. A backend that host-walks
+  // selection must classify Serialized/HostAssisted -- never DevicePass.
   bool request_tier2_select{};
   std::vector<uint32_t> authorized_node_classes;
 

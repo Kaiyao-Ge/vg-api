@@ -119,17 +119,21 @@ bool run_select_case(vg::metal::DeviceHal& metal, const std::vector<uint32_t>& n
     std::cerr << label << ": Metal selected-class multiset != reference oracle\n";
     return false;
   }
-  if (!has_event(submission.report, "tier2_node_select", vg::hal::LoweringClass::EmulatedDevicePass, 2) ||
-      !has_event(submission.report, "tier2_bucket_count", vg::hal::LoweringClass::EmulatedDevicePass, 2)) {
-    std::cerr << label << ": missing bucket/command report events or wrong classification\n";
+  const bool icb = has_event(submission.report, "tier2_node_select", vg::hal::LoweringClass::DevicePass, 2) &&
+                   has_event(submission.report, "tier2_icb_execute", vg::hal::LoweringClass::DevicePass, 1);
+  const bool bucket =
+      has_event(submission.report, "tier2_node_select", vg::hal::LoweringClass::EmulatedDevicePass, 2) &&
+      has_event(submission.report, "tier2_bucket_count", vg::hal::LoweringClass::EmulatedDevicePass, 2);
+  if (icb == bucket) {
+    std::cerr << label << ": expected exactly one of ICB DevicePass or bucket EmulatedDevicePass\n";
     return false;
   }
-  if (report_claims_device_pass_for_tier2(submission.report)) {
-    std::cerr << label << ": Tier2 report claimed DevicePass without a native ICB select\n";
+  if (bucket && report_claims_device_pass_for_tier2(submission.report)) {
+    std::cerr << label << ": bucket fallback claimed DevicePass\n";
     return false;
   }
 
-  std::cout << label << ": ok\n";
+  std::cout << label << ": ok (" << (icb ? "icb DevicePass" : "bucket fallback") << ")\n";
   return true;
 }
 

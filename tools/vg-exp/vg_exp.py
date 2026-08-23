@@ -14,6 +14,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +106,79 @@ PHASE_D_DEFINITION_FILES = {
 }
 PHASE_D_GATE_EXPERIMENTS = ("E004", "E010", "E011", "E014", "E017")
 
+# Phase E Research Alpha (ADR-042). Aggregates A–D ctests. Two JSON files
+# share id E004; this mapping loads only the D2 revisit. Vulkan is a
+# fixed compile-review-only sample per experiment and is never mixed
+# into passed. Benchmark smoke wraps one existing Metal vertical slice.
+PHASE_E_GATE_EXPERIMENTS = (
+    "E001", "E002", "E003", "E004", "E005", "E006", "E007", "E008", "E009",
+    "E010", "E011", "E012", "E013", "E014", "E015", "E016", "E017", "E018",
+)
+PHASE_E_DEFINITION_FILES = {
+    "E001": "E001-lifecycle-epoch.json",
+    "E002": "E002-typed-pointer-graph.json",
+    "E003": "E003-task-publication.json",
+    "E004": "E004-discovery-revisit.json",
+    "E005": "E005-consume-input-peak-memory.json",
+    "E006": "E006-access-witness.json",
+    "E007": "E007-root-pointer-vs-bindless.json",
+    "E008": "E008-sample-facet.json",
+    "E009": "E009-gpu-generated-same-node-work.json",
+    "E010": "E010-heterogeneous-node-lowering.json",
+    "E011": "E011-residency-working-set.json",
+    "E012": "E012-effect-dag-sync-quality.json",
+    "E013": "E013-pipeline-classification.json",
+    "E014": "E014-capture-replay.json",
+    "E015": "E015-fault-poison.json",
+    "E016": "E016-representation-epoch-churn.json",
+    "E017": "E017-envelope-quota-continuation.json",
+    "E018": "E018-graph-epoch-publication.json",
+}
+PHASE_E_EXPERIMENTS: dict[str, list[dict[str, str]]] = {
+    "E001": [{"ctest": "model.phase-a", "backend": "cpu-reference"}],
+    "E002": [
+        {"ctest": "vertical-slice.metal.pointer-graph", "backend": "metal"},
+        {"ctest": "compiler.compute-package-golden", "backend": "cpu-reference"},
+    ],
+    "E003": [{"ctest": "model.phase-a", "backend": "cpu-reference"}],
+    "E004": [
+        {"ctest": "core.discovery", "backend": "cpu-reference"},
+        {"ctest": "vertical-slice.metal.discovery", "backend": "metal"},
+    ],
+    "E005": [{"ctest": "vertical-slice.metal.consume-input", "backend": "metal"}],
+    "E006": [{"ctest": "conformance.phase-a", "backend": "cpu-reference"}],
+    "E007": [{"ctest": "vertical-slice.metal.indexed-binding", "backend": "metal"}],
+    "E008": [{"ctest": "vertical-slice.metal.sample-facet", "backend": "metal"}],
+    "E009": [
+        {"ctest": "vertical-slice.metal.tier1-indirect", "backend": "metal"},
+        {"ctest": "vertical-slice.metal.cull-compact", "backend": "metal"},
+    ],
+    "E010": [
+        {"ctest": "unit.tier2-oracle", "backend": "cpu-reference"},
+        {"ctest": "vertical-slice.metal.tier2-nodes", "backend": "metal"},
+    ],
+    "E011": [
+        {"ctest": "core.working-set", "backend": "cpu-reference"},
+        {"ctest": "vertical-slice.metal.working-set", "backend": "metal"},
+    ],
+    "E012": [{"ctest": "vertical-slice.metal.effect-dag", "backend": "metal"}],
+    "E013": [{"ctest": "vertical-slice.metal.pipeline-classification", "backend": "metal"}],
+    "E014": [
+        {"ctest": "capture.view", "backend": "cpu-reference"},
+        {"ctest": "capture.view.cli", "backend": "cpu-reference"},
+    ],
+    "E015": [{"ctest": "conformance.phase-a", "backend": "cpu-reference"}],
+    "E016": [{"ctest": "vertical-slice.metal.representation-churn", "backend": "metal"}],
+    "E017": [
+        {"ctest": "core.envelope-continuation", "backend": "cpu-reference"},
+        {"ctest": "vertical-slice.metal.envelope-continuation", "backend": "metal"},
+    ],
+    "E018": [{"ctest": "core.unit", "backend": "cpu-reference"}],
+}
+PHASE_E_BENCHMARK_CTEST = "vertical-slice.metal.tier2-nodes"
+PHASE_E_BENCHMARK_EXPERIMENT = "E010"
+PHASE_E_HISTORICAL_E004 = "experiments/definitions/E004-access-certificate.json"
+
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True) + "\n"
@@ -184,6 +258,18 @@ def load_phase_d_definitions() -> list[dict[str, Any]]:
     definitions: list[dict[str, Any]] = []
     for experiment_id in PHASE_D_GATE_EXPERIMENTS:
         path = ROOT / "experiments" / "definitions" / PHASE_D_DEFINITION_FILES[experiment_id]
+        definition = json.loads(path.read_text(encoding="utf-8"))
+        validate_definition(definition)
+        if definition["id"] != experiment_id:
+            raise ValueError(f"{path.name} must declare id {experiment_id}")
+        definitions.append(definition)
+    return definitions
+
+
+def load_phase_e_definitions() -> list[dict[str, Any]]:
+    definitions: list[dict[str, Any]] = []
+    for experiment_id in PHASE_E_GATE_EXPERIMENTS:
+        path = ROOT / "experiments" / "definitions" / PHASE_E_DEFINITION_FILES[experiment_id]
         definition = json.loads(path.read_text(encoding="utf-8"))
         validate_definition(definition)
         if definition["id"] != experiment_id:
@@ -671,6 +757,265 @@ def command_phase_d(args: argparse.Namespace) -> int:
     return 0
 
 
+def create_phase_e_run(build_dir: Path) -> Path:
+    definitions = load_phase_e_definitions()
+    now = dt.datetime.now(dt.timezone.utc)
+    run_id = f"{now:%Y%m%dT%H%M%SZ}-PHASEE-{git_identity()['commit'][:12]}-{safe_machine_id()}-{secrets.token_hex(4)}"
+    run_dir = ROOT / "artifacts" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    for name in ("lowering", "captures", "traces", "outputs"):
+        (run_dir / name).mkdir()
+    samples: list[dict[str, Any]] = []
+    logs: list[str] = []
+    for definition in definitions:
+        experiment_id = definition["id"]
+        for row in PHASE_E_EXPERIMENTS[experiment_id]:
+            test_name = row["ctest"]
+            completed = subprocess.run(
+                ["ctest", "--test-dir", str(build_dir), "-R", f"^{test_name}$", "--output-on-failure"],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            logs.append(f"[{experiment_id}] ctest -R {test_name}\n{completed.stdout}\n{completed.stderr}")
+            status = ctest_status(completed.returncode, completed.stdout, completed.stderr)
+            samples.append(
+                {
+                    "schema": "vg.sample/v1",
+                    "run_id": run_id,
+                    "experiment": experiment_id,
+                    "backend": row["backend"],
+                    "variant": test_name,
+                    "parameters": {"ctest": test_name},
+                    "phase": "phase-e",
+                    "batch": 0,
+                    "iteration": 0,
+                    "status": status,
+                    "metrics": {"return_code": completed.returncode},
+                    "output_hash": None,
+                    "lowering_report": None,
+                }
+            )
+        samples.append(
+            {
+                "schema": "vg.sample/v1",
+                "run_id": run_id,
+                "experiment": experiment_id,
+                "backend": "vulkan",
+                "variant": "compile-review-only",
+                "parameters": {},
+                "phase": "phase-e",
+                "batch": 0,
+                "iteration": 0,
+                "status": "compile-review-only",
+                "metrics": {},
+                "output_hash": None,
+                "lowering_report": None,
+            }
+        )
+    environment = {
+        "schema": "vg.environment/v1",
+        "utc": now.isoformat(),
+        "timezone": "UTC",
+        "machine_id": safe_machine_id(),
+        "os": platform.platform(),
+        "machine": platform.machine(),
+        "python": sys.version.split()[0],
+        "host_name": "redacted",
+        "git": git_identity(),
+        "capability_snapshot": None,
+    }
+    build = {"schema": "vg.build/v1", "build_dir": build_dir.name, "runner": "phase-e"}
+    (run_dir / "environment.json").write_text(canonical_json(environment), encoding="utf-8")
+    (run_dir / "build.json").write_text(canonical_json(build), encoding="utf-8")
+    (run_dir / "definition.resolved.json").write_text(
+        canonical_json(
+            {
+                "schema": "vg.phase-e/v1",
+                "experiments": definitions,
+                "gate_experiments": list(PHASE_E_GATE_EXPERIMENTS),
+                "definition_files": PHASE_E_DEFINITION_FILES,
+                "e004_historical_b_row": PHASE_E_HISTORICAL_E004,
+                "reports": [
+                    "docs/reports/phase-e-gate.md",
+                    "docs/reports/p0-risk-register.md",
+                    "docs/reports/external-repro-runbook.md",
+                    "docs/reports/architecture-research-alpha.md",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "stdout.log").write_text("\n".join(logs), encoding="utf-8")
+    (run_dir / "stderr.log").write_text("", encoding="utf-8")
+    (run_dir / "samples.jsonl").write_text(
+        "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples), encoding="utf-8"
+    )
+    executed = [sample for sample in samples if sample["backend"] != "vulkan"]
+    passed = sum(sample["status"] == "passed" for sample in executed)
+    summary = {
+        "schema": "vg.summary/v1",
+        "run_id": run_id,
+        "status": "ok" if passed == len(executed) else "failed",
+        "experiment_count": len(definitions),
+        "ctest_count": len(executed),
+        "passed": passed,
+        "failed": len(executed) - passed,
+        "vulkan_status": "compile-review-only",
+        "gate_experiments": list(PHASE_E_GATE_EXPERIMENTS),
+        "e004_historical_b_row": PHASE_E_HISTORICAL_E004,
+        "evidence_policy": "ADR-042",
+        "break_even_curves": "unmeasured",
+    }
+    (run_dir / "summary.json").write_text(canonical_json(summary), encoding="utf-8")
+    with (run_dir / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=["experiment", "backend", "variant", "status", "return_code"]
+        )
+        writer.writeheader()
+        for sample in samples:
+            writer.writerow(
+                {
+                    "experiment": sample["experiment"],
+                    "backend": sample["backend"],
+                    "variant": sample["variant"],
+                    "status": sample["status"],
+                    "return_code": sample["metrics"].get("return_code"),
+                }
+            )
+    (run_dir / "report.md").write_text(
+        "# Phase E Research Alpha\n\n"
+        + "\n".join(
+            f"- {sample['experiment']} [{sample['backend']}/{sample['variant']}]: {sample['status']}"
+            for sample in samples
+        )
+        + "\n\nE004 uses E004-discovery-revisit.json; the B-era E004-access-certificate.json row is historical (ADR-025/035/042).\n"
+        + "Vulkan samples are compile-review-only (ADR-024/042) and are not mixed into passed.\n"
+        + "This runner aggregates existing ctests; it does not invent measurements.\n"
+        + "See docs/reports/phase-e-gate.md.\n",
+        encoding="utf-8",
+    )
+    write_manifest(run_dir, run_id)
+    return run_dir
+
+
+def command_phase_e(args: argparse.Namespace) -> int:
+    run_dir = create_phase_e_run(Path(args.build_dir).resolve())
+    print(run_dir.relative_to(ROOT))
+    return 0
+
+
+def create_benchmark_run(build_dir: Path) -> Path:
+    now = dt.datetime.now(dt.timezone.utc)
+    run_id = f"{now:%Y%m%dT%H%M%SZ}-BENCH-{git_identity()['commit'][:12]}-{safe_machine_id()}-{secrets.token_hex(4)}"
+    run_dir = ROOT / "artifacts" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    for name in ("lowering", "captures", "traces", "outputs"):
+        (run_dir / name).mkdir()
+    started = time.perf_counter()
+    completed = subprocess.run(
+        ["ctest", "--test-dir", str(build_dir), "-R", f"^{PHASE_E_BENCHMARK_CTEST}$", "--output-on-failure"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    host_s = time.perf_counter() - started
+    status = ctest_status(completed.returncode, completed.stdout, completed.stderr)
+    sample = {
+        "schema": "vg.sample/v1",
+        "run_id": run_id,
+        "experiment": PHASE_E_BENCHMARK_EXPERIMENT,
+        "backend": "metal",
+        "variant": PHASE_E_BENCHMARK_CTEST,
+        "parameters": {"ctest": PHASE_E_BENCHMARK_CTEST, "evidence_grade": "P0"},
+        "phase": "benchmark",
+        "batch": 0,
+        "iteration": 0,
+        "status": status,
+        "metrics": {
+            "return_code": completed.returncode,
+            "host_wall_clock_s": host_s,
+        },
+        "output_hash": None,
+        "lowering_report": None,
+    }
+    environment = {
+        "schema": "vg.environment/v1",
+        "utc": now.isoformat(),
+        "timezone": "UTC",
+        "machine_id": safe_machine_id(),
+        "os": platform.platform(),
+        "machine": platform.machine(),
+        "python": sys.version.split()[0],
+        "host_name": "redacted",
+        "git": git_identity(),
+        "capability_snapshot": None,
+    }
+    build = {"schema": "vg.build/v1", "build_dir": build_dir.name, "runner": "benchmark"}
+    (run_dir / "environment.json").write_text(canonical_json(environment), encoding="utf-8")
+    (run_dir / "build.json").write_text(canonical_json(build), encoding="utf-8")
+    (run_dir / "definition.resolved.json").write_text(
+        canonical_json(
+            {
+                "schema": "vg.benchmark/v1",
+                "experiment": PHASE_E_BENCHMARK_EXPERIMENT,
+                "ctest": PHASE_E_BENCHMARK_CTEST,
+                "evidence_grade": "P0",
+                "note": "Host wall-clock only. No gpu_ns, hitch, or break-even claim (ADR-042).",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "stdout.log").write_text(completed.stdout, encoding="utf-8")
+    (run_dir / "stderr.log").write_text(completed.stderr, encoding="utf-8")
+    (run_dir / "samples.jsonl").write_text(json.dumps(sample, sort_keys=True) + "\n", encoding="utf-8")
+    summary = {
+        "schema": "vg.summary/v1",
+        "run_id": run_id,
+        "status": "ok" if status == "passed" else "failed",
+        "experiment": PHASE_E_BENCHMARK_EXPERIMENT,
+        "ctest": PHASE_E_BENCHMARK_CTEST,
+        "evidence_grade": "P0",
+        "host_wall_clock_s": host_s,
+        "gpu_ns": None,
+        "break_even_curves": "unmeasured",
+    }
+    (run_dir / "summary.json").write_text(canonical_json(summary), encoding="utf-8")
+    with (run_dir / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=["experiment", "ctest", "status", "evidence_grade", "host_wall_clock_s"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "experiment": PHASE_E_BENCHMARK_EXPERIMENT,
+                "ctest": PHASE_E_BENCHMARK_CTEST,
+                "status": status,
+                "evidence_grade": "P0",
+                "host_wall_clock_s": host_s,
+            }
+        )
+    (run_dir / "report.md").write_text(
+        "# Phase E P0 Benchmark Smoke\n\n"
+        f"- experiment: {PHASE_E_BENCHMARK_EXPERIMENT}\n"
+        f"- ctest: {PHASE_E_BENCHMARK_CTEST}\n"
+        f"- status: {status}\n"
+        f"- evidence_grade: P0 (demo / single sample; 10 §13)\n"
+        f"- host_wall_clock_s: {host_s:.6f}\n"
+        "- gpu_ns: not claimed\n"
+        "- break-even / hitch: unmeasured\n",
+        encoding="utf-8",
+    )
+    write_manifest(run_dir, run_id)
+    return run_dir
+
+
+def command_benchmark(args: argparse.Namespace) -> int:
+    run_dir = create_benchmark_run(Path(args.build_dir).resolve())
+    print(run_dir.relative_to(ROOT))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="VG Phase 0 experiment runner")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -681,6 +1026,8 @@ def main() -> int:
     phase_b = subparsers.add_parser("phase-b"); phase_b.add_argument("--build-dir", required=True); phase_b.set_defaults(func=command_phase_b)
     phase_c = subparsers.add_parser("phase-c"); phase_c.add_argument("--build-dir", required=True); phase_c.set_defaults(func=command_phase_c)
     phase_d = subparsers.add_parser("phase-d"); phase_d.add_argument("--build-dir", required=True); phase_d.set_defaults(func=command_phase_d)
+    phase_e = subparsers.add_parser("phase-e"); phase_e.add_argument("--build-dir", required=True); phase_e.set_defaults(func=command_phase_e)
+    benchmark = subparsers.add_parser("benchmark"); benchmark.add_argument("--build-dir", required=True); benchmark.set_defaults(func=command_benchmark)
     try:
         args = parser.parse_args()
         return args.func(args)

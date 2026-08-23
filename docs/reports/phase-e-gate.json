@@ -1,0 +1,193 @@
+{
+  "schema": "vg.phase-e-gate/v1",
+  "status": "gate-recorded-per-adr-042",
+  "scope": "ResearchAlpha",
+  "closure": "research-recorded-not-product-closed",
+  "break_even_curves": "unmeasured",
+  "vulkan_status": "compile-review-only",
+  "public_c_abi": {
+    "version": "VG_API_VERSION_1_0",
+    "surface": "minimal-create-destroy-enumerate",
+    "research_surface": "DeviceHAL-plus-vg-exp"
+  },
+  "tool_binaries": "in-tree-cmake-targets-not-packaged",
+  "sample_workloads": "existing-fixtures-only",
+  "phase_c_gate": "not-closed",
+  "p0_risk_register": "docs/reports/p0-risk-register.md",
+  "external_repro_runbook": "docs/reports/external-repro-runbook.md",
+  "architecture_report": "docs/reports/architecture-research-alpha.md",
+  "benchmark": {
+    "command": "tools/vg-exp/vg_exp.py benchmark",
+    "ctest": "vertical-slice.metal.tier2-nodes",
+    "experiment": "E010",
+    "evidence_grade": "P0"
+  },
+  "experiments": {
+    "E001": "recorded",
+    "E002": "recorded",
+    "E003": "recorded",
+    "E004": "recorded",
+    "E005": "recorded-experiment-phase-c-not-closed",
+    "E006": "recorded",
+    "E007": "recorded",
+    "E008": "recorded-experiment-phase-c-not-closed",
+    "E009": "recorded",
+    "E010": "recorded",
+    "E011": "recorded",
+    "E012": "recorded",
+    "E013": "recorded-non-blocking-for-phase-c",
+    "E014": "recorded",
+    "E015": "recorded",
+    "E016": "recorded-experiment-phase-c-not-closed",
+    "E017": "recorded",
+    "E018": "recorded"
+  },
+  "experiment_evidence": {
+    "E001": {
+      "definition": "experiments/definitions/E001-lifecycle-epoch.json",
+      "gate": "phase-a",
+      "classification": "reference-complete",
+      "ctests": ["model.phase-a"]
+    },
+    "E002": {
+      "definition": "experiments/definitions/E002-typed-pointer-graph.json",
+      "adr": "ADR-028",
+      "gate": "phase-b",
+      "classification": "CachedObject",
+      "ctests": ["vertical-slice.metal.pointer-graph", "compiler.compute-package-golden"]
+    },
+    "E003": {
+      "definition": "experiments/definitions/E003-task-publication.json",
+      "gate": "phase-a",
+      "classification": "reference-complete",
+      "scope_limit": "host-bounded-model-no-gpu-litmus",
+      "ctests": ["model.phase-a"]
+    },
+    "E004": {
+      "definition": "experiments/definitions/E004-discovery-revisit.json",
+      "historical_b_row": "experiments/definitions/E004-access-certificate.json",
+      "adr": "ADR-036",
+      "gate": "phase-d",
+      "classification": "HostAssisted",
+      "ctests": ["core.discovery", "vertical-slice.metal.discovery"]
+    },
+    "E005": {
+      "definition": "experiments/definitions/E005-consume-input-peak-memory.json",
+      "adr": "ADR-032",
+      "gate": "phase-c-not-closed",
+      "classification": "DevicePass",
+      "unmeasured": "fixture-peak-bytes",
+      "ctests": ["vertical-slice.metal.consume-input"]
+    },
+    "E006": {
+      "definition": "experiments/definitions/E006-access-witness.json",
+      "gate": "phase-a",
+      "classification": "reference-complete",
+      "ctests": ["conformance.phase-a"]
+    },
+    "E007": {
+      "definition": "experiments/definitions/E007-root-pointer-vs-bindless.json",
+      "adr": "ADR-029",
+      "gate": "phase-b",
+      "classification": "Direct",
+      "ctests": ["vertical-slice.metal.indexed-binding"]
+    },
+    "E008": {
+      "definition": "experiments/definitions/E008-sample-facet.json",
+      "adr": "ADR-031",
+      "gate": "phase-c-not-closed",
+      "classification": "DevicePass",
+      "ctests": ["vertical-slice.metal.sample-facet"]
+    },
+    "E009": {
+      "definition": "experiments/definitions/E009-gpu-generated-same-node-work.json",
+      "adr": "ADR-026",
+      "gate": "phase-b",
+      "classification": "DevicePass",
+      "unmeasured": "million-instance-perf-harness",
+      "ctests": ["vertical-slice.metal.tier1-indirect", "vertical-slice.metal.cull-compact"]
+    },
+    "E010": {
+      "definition": "experiments/definitions/E010-heterogeneous-node-lowering.json",
+      "adr": "ADR-038",
+      "gate": "phase-d",
+      "classification": "DevicePass",
+      "fallback_classification": "EmulatedDevicePass",
+      "reference_classification": "Serialized",
+      "ctests": ["unit.tier2-oracle", "vertical-slice.metal.tier2-nodes"]
+    },
+    "E011": {
+      "definition": "experiments/definitions/E011-residency-working-set.json",
+      "adr": "ADR-037",
+      "gate": "phase-d",
+      "classification": "proxy-bytes-hard-refuse",
+      "unsupported": "Metal-sparse",
+      "ctests": ["core.working-set", "vertical-slice.metal.working-set"]
+    },
+    "E012": {
+      "definition": "experiments/definitions/E012-effect-dag-sync-quality.json",
+      "adr": "ADR-027",
+      "gate": "phase-b",
+      "classification": "DevicePass",
+      "deferred": ["cross-queue", "repr-transition", "external-present"],
+      "ctests": ["vertical-slice.metal.effect-dag"]
+    },
+    "E013": {
+      "definition": "experiments/definitions/E013-pipeline-classification.json",
+      "adr": "ADR-034",
+      "gate": "phase-c-not-closed-non-blocking",
+      "classification": "DevicePass",
+      "ctests": ["vertical-slice.metal.pipeline-classification"]
+    },
+    "E014": {
+      "definition": "experiments/definitions/E014-capture-replay.json",
+      "adr": "ADR-040",
+      "gate": "phase-d",
+      "classification": "same-environment-reference; cross-backend-semantic-only",
+      "blocked_or_skipped": ["dynamic-graph", "driver-update"],
+      "ctests": ["capture.view", "capture.view.cli"]
+    },
+    "E015": {
+      "definition": "experiments/definitions/E015-fault-poison.json",
+      "gate": "phase-a",
+      "classification": "reference-complete",
+      "ctests": ["conformance.phase-a"]
+    },
+    "E016": {
+      "definition": "experiments/definitions/E016-representation-epoch-churn.json",
+      "adr": "ADR-033",
+      "gate": "phase-c-not-closed",
+      "classification": "DevicePass",
+      "unmeasured": "fixture-peak-bytes",
+      "ctests": ["vertical-slice.metal.representation-churn"]
+    },
+    "E017": {
+      "definition": "experiments/definitions/E017-envelope-quota-continuation.json",
+      "adr": "ADR-039",
+      "gate": "phase-d",
+      "classification": "HostAssisted",
+      "unsupported": "DelegatedEnvelope",
+      "ctests": ["core.envelope-continuation", "vertical-slice.metal.envelope-continuation"]
+    },
+    "E018": {
+      "definition": "experiments/definitions/E018-graph-epoch-publication.json",
+      "gate": "phase-a",
+      "classification": "reference-complete",
+      "ctests": ["core.unit"]
+    }
+  },
+  "runner": {
+    "tool": "tools/vg-exp/vg_exp.py phase-e",
+    "ctest": "tooling.phase-e-runner",
+    "official_run": "artifacts/runs/20260823T230413Z-PHASEE-5868a9795a30-f0105c3c7d770ce9-775e8790",
+    "note": "Loads E004-discovery-revisit.json only. Vulkan is a fixed compile-review-only sample per experiment. Official run: 25/25 executed rows passed; 18 Vulkan compile-review-only samples."
+  },
+  "unsupported_or_unmeasured": [
+    "break-even / hitch / million-instance / physical-RAM pressure: unmeasured",
+    "Phase C full exit (raster oracle as closure evidence): not-closed",
+    "E003 GPU litmus: not present (P0 scope limit)",
+    "public C ABI beyond v1.0 minimal table: not extended",
+    "compiler/tool binaries: in-tree targets, not a packaged release",
+    "DelegatedEnvelope / OS residency counter / Vulkan DGC execution: out of host scope"
+  ]
+}

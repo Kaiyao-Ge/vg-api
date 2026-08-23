@@ -82,3 +82,13 @@ APIs and which native-contract questions remain. `docs/reports/phase-d-gate.md`
 Revisit if a measured break-even curve exists, if Vulkan becomes
 executable, or if any assist listed in the boundary document is
 removed by a real native contract (not a host walk relabeled).
+
+## Revisit (2026-08-23)
+
+Metal E010 no longer *must* bucket. GPU-encoded ICB is the preferred
+path and reports `DevicePass` when it actually runs. Bucket + per-Node
+indirect remains the `EmulatedDevicePass` fallback. Decision 2's
+"must bucket" sentence was true at D7 close and is superseded by this
+revisit, not rewritten into a success it did not have then. Vulkan DGC
+is still unexecuted. Discovery, overflow, working-set proxy, and
+cross-backend capture assists are unchanged.

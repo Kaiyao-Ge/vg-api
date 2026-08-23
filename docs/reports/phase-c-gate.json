@@ -11,5 +11,30 @@
     "representation_transform": "complete"
   },
   "ctests": ["core.unit", "vertical-slice.metal.representation-layer"],
-  "note": "Do not treat E013/E016/ConsumeInput experiment runners as Phase C closure evidence."
+  "note": "Do not treat E013/E016/ConsumeInput experiment runners as Phase C closure evidence.",
+  "implemented_experiments": {
+    "E005": {
+      "classification": "DevicePass",
+      "unmeasured": "fixture-peak-bytes",
+      "ctests": ["vertical-slice.metal.consume-input"]
+    },
+    "E008": {
+      "classification": "DevicePass",
+      "ctests": ["vertical-slice.metal.sample-facet"]
+    },
+    "E013": {
+      "classification": "DevicePass",
+      "non_blocking": true,
+      "ctests": ["vertical-slice.metal.pipeline-classification"]
+    },
+    "E016": {
+      "classification": "DevicePass",
+      "unmeasured": "fixture-peak-bytes",
+      "ctests": ["vertical-slice.metal.representation-churn"]
+    }
+  },
+  "runner": {
+    "tool": "tools/vg-exp/vg_exp.py phase-c",
+    "ctest": "tooling.phase-c-runner"
+  }
 }

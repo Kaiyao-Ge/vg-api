@@ -19,3 +19,19 @@ pipeline classification + ConsumeInput）不在本交付范围。
 ctest：`core.unit`、`vertical-slice.metal.representation-layer`。
 
 Phase C 整体退出（`12-roadmap-and-risks.md`）**仍然开放**。
+
+## 已实现的实验行（不是关门证据）
+
+下列 vertical slice 已在 Metal+reference 上可跑。按 ADR-030/042，
+它们**不能**把本 gate 改写成 `gate-closed`：峰值字节未测，完整退出仍
+包含 basic raster oracle 与书面分类门槛。E013 仍是非硬门槛。
+
+| 实验 | 分类 | ctest |
+|---|---|---|
+| E005 ConsumeInput | Metal `DevicePass`；峰值字节 unmeasured | `vertical-slice.metal.consume-input` |
+| E008 SampleFacet | Metal `DevicePass` | `vertical-slice.metal.sample-facet` |
+| E013 pipeline classification | Metal `DevicePass`；非硬门槛 | `vertical-slice.metal.pipeline-classification` |
+| E016 RepresentationEpoch churn | Metal `DevicePass` + 背压；峰值字节 unmeasured | `vertical-slice.metal.representation-churn` |
+
+Runner：`python3 tools/vg-exp/vg_exp.py phase-c --build-dir build/dev-metal`
+（`tooling.phase-c-runner`，TASK-E4 注册）。Vulkan 四行均为 compile-review-only。

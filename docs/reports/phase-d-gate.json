@@ -7,7 +7,7 @@
   "vulkan_status": "compile-review-only",
   "host_assisted_boundary": "docs/reports/host-assisted-boundary.md",
   "native_contract_research_v1": "docs/reports/native-contract-research-v1.md",
-  "phase_e": "not-started",
+  "phase_e": "gate-recorded-per-adr-042",
   "experiments": {
     "E004": "recorded",
     "E010": "recorded",
@@ -29,9 +29,10 @@
       "definition": "experiments/definitions/E010-heterogeneous-node-lowering.json",
       "adr": "ADR-038",
       "task": "TASK-D4",
-      "classification": "EmulatedDevicePass",
+      "classification": "DevicePass",
+      "fallback_classification": "EmulatedDevicePass",
       "reference_classification": "Serialized",
-      "observed": "uniform 4+4 and skewed 7+1 selected-class multisets match the CPU oracle; unauthorized class refused; no ICB",
+      "observed": "GPU-encoded ICB is the preferred Metal path; uniform 4+4 and skewed 7+1 selected-class multisets must match the CPU oracle; unauthorized class refused; bucket remains fallback only",
       "ctests": ["unit.tier2-oracle", "vertical-slice.metal.tier2-nodes"]
     },
     "E011": {
@@ -69,7 +70,7 @@
   "unsupported_or_unmeasured": [
     "break-even curves: unmeasured (fixtures too small)",
     "E004 SoftwarePaged/FaultManaged: Unsupported (unchanged)",
-    "E010 ICB/DGC native select and Tier3: not implemented",
+    "E010 ICB GPU-encode is the preferred Metal path; bucket remains EmulatedDevicePass fallback; Vulkan DGC and Tier3: not implemented",
     "E011 Metal sparse: Unsupported; no OS residency counter",
     "E014 dynamic-graph: blocked; driver-update: skipped",
     "E017 DelegatedEnvelope: not present"

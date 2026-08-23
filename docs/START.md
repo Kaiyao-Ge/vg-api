@@ -6,7 +6,17 @@
 
 ## 当前事实状态
 
-截至本版文档：仓库只有理论母本、执行规范和少量研究脚本，尚未建立 CMake、公共头文件、runtime、compiler、backend 或测试代码。文档中的代码和目录均为规范/建议，不表示已经实现。第一个实现 Agent 必须从 [13-repository-layout.md](vg-project/13-repository-layout.md) 的“初始提交切片”开始，并以 [12-roadmap-and-risks.md](vg-project/12-roadmap-and-risks.md) Phase 0 的退出条件作为完成标准。
+Correction（2026-08-23，执行入口，不是 `vg-project/*` 原文）：仓库已经有
+CMake presets、公共 C ABI（`VG_API_VERSION_1_0` / `vgGetApi`）、portable
+core、CPU reference、Metal adapter、Vulkan compile-review-only 源码、
+`vg-exp` phase-a–phase-e、以及 A/B/D 的 gate 记录。Phase C 为
+`not-closed`（layer1 complete）。Phase D 是研究记录（ADR-041），不是
+Phase E 的自动入口。Phase E（Research Alpha）按 ADR-042 记录为
+对外复现汇总，不是产品关门。干净 checkout 的构建与复现命令见
+[reports/external-repro-runbook.md](reports/external-repro-runbook.md)。
+
+上一版「尚未建立 CMake / runtime / 测试」的句子描述的是文档初稿时的仓库，
+不再是当前 checkout 的事实。规范冲突优先级不变。
 
 规范冲突优先级：本 `START.md` 的硬边界 > 01/02 的目标与语义不变量 > 03/04/05 的架构、ABI 与 IR 合同 > 06/07 的后端规则 > 08-10 的实验/验证规则 > 11-13 的执行建议 > 理论母本中的探索性设计。发现冲突时不得自行挑选方便的一项；记录问题并修改上位规范或 ADR。
 
