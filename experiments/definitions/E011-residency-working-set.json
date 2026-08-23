@@ -1,0 +1,41 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E011",
+  "name": "residency-working-set",
+  "workload": "two_16byte_active_allocations_budget_vs_lease",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["whole-arena-universe", "hand-picked-lease", "discovery-lease", "sparse"],
+  "metrics": [
+    "working_set_requested_bytes",
+    "working_set_committed_bytes",
+    "working_set_proxy_bytes",
+    "budget_byte_limit",
+    "refused"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "note": "Allocations stay at 16–64 bytes; the experiment never approaches physical RAM. (1) whole-arena-universe sets ExecutionPlan::working_set_budget without a lease: requested bytes are the sum of every Active allocation->size (two 16-byte actives = 32). A budget of 16 refuses with 'working-set budget exceeded' -- never a silent clamp, never 'unified memory is infinite'. (2) hand-picked-lease names one 16-byte allocation under a 64-byte budget and succeeds; reported requested bytes differ from the Universe row on the same arena. (3) discovery-lease calls core::discover_reachable from a seed in one of two 16-byte actives (the seed has no outgoing PointerRef), fills WorkingSetLease from that reachable set, and submits under budget 16 -- requested=16, not Universe 32. A fake subset is not invented. (4) sparse is LoweringClass::Unsupported (Metal sparse heap/texture is not implemented; Vulkan sparse binding is compile-review-only explicit map/unmap, not automatic page fault). working_set_requested / working_set_committed / working_set_proxy are separate LoweringReport events; reasons say 'proxy' because there is no OS residency counter. This is not E016: max_in_flight_representations is representation-version cardinality, not this-submit residency."
+  },
+  "correctness": {
+    "oracle": "arithmetic: hand-picked lease of one 16-byte allocation under budget 64 succeeds with requested=16; Universe of two 16-byte actives under budget 16 refuses with 'working-set budget exceeded' and requested=32; the two requested figures differ; a default plan (no budget, no lease) still succeeds and emits no working-set events",
+    "tolerance": "exact (integer byte counts and the stable WorkingSetBudget::allows error string)"
+  },
+  "requirements": [
+    "graph_is_not_this_submit_residency",
+    "set_budget_hard_refuse_never_silent_clamp",
+    "unified_memory_is_not_infinite",
+    "requested_committed_proxy_are_separate_events",
+    "metal_sparse_unsupported",
+    "vulkan_sparse_is_not_automatic_fault"
+  ],
+  "variant_status": {
+    "whole-arena-universe": "implemented",
+    "hand-picked-lease": "implemented",
+    "discovery-lease": "implemented (core::discover_reachable; seed-only subset of a two-allocation arena)",
+    "sparse": "Unsupported (Metal event; Vulkan compile-review-only)"
+  },
+  "phase_d_classification": "proxy-bytes-hard-refuse",
+  "break_even_curve": "unmeasured",
+  "judgement": "Address graph and this-submit residency are separate: a hand-picked WorkingSetLease or a discover_reachable lease can stay inside a budget that Universe of the same arena exceeds. A set ExecutionPlan::working_set_budget is a hard refuse via WorkingSetBudget::allows ('working-set budget exceeded'), not a clamp and not an implicit enlarge. Reported bytes are request/commit/proxy, each labelled proxy because this host has no public OS residency counter (06 §10). Metal sparse is honest Unsupported. Physical-RAM pressure and an OS residency counter are unmeasured. Vulkan sparse is compile-review-only commentary that sparse binding is explicit map/unmap, not automatic fault (ADR-024/030/037/041).",
+  "vulkan_status": "compile-review-only (ADR-024/030/037/041); no Vulkan sparse runtime and no working-set submit hook were added (sparse ≠ automatic fault; no Vulkan hardware reachable on this host)"
+}

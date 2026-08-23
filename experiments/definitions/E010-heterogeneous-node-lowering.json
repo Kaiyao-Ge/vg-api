@@ -1,0 +1,35 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E010",
+  "name": "heterogeneous-node-lowering",
+  "workload": "two_authorized_node_classes_uniform_and_skewed_select",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["cpu-oracle-host-walk", "gpu-bucket-per-node-indirect"],
+  "metrics": [
+    "selected_node_class_multiset",
+    "bucket_count",
+    "command_count",
+    "temporary_bytes",
+    "pipeline_switch_count",
+    "lowering_class"
+  ],
+  "protocol": {
+    "deterministic": false,
+    "note": "GPU bucket assignment uses atomic_fetch_add, so per-bucket slot order is thread-arrival order. Selected node classes are compared against reference::select_tier2_nodes as a sorted multiset, never by GPU slot position. Default Metal path is bucket compute + per-Node dispatchThreadgroupsWithIndirectBuffer; the host does not read bucket counts before those indirect dispatches. ICB is an optional capability upgrade and is not used. A post-wait readback (last_selected_node_classes) is verification only."
+  },
+  "correctness": {
+    "oracle": "reference::select_tier2_nodes",
+    "tolerance": "exact (sorted multiset of selected node classes; unauthorized class is a hard refuse)"
+  },
+  "requirements": [
+    "at_least_two_preauthorized_node_classes",
+    "selected_multiset_matches_oracle",
+    "unauthorized_node_class_refused",
+    "no_cpu_read_counts_then_reencode_marked_device_pass",
+    "tier3_remains_unsupported"
+  ],
+  "phase_d_classification": "EmulatedDevicePass",
+  "break_even_curve": "unmeasured",
+  "judgement": "Metal selects among two pre-authorized Node classes with a GPU bucket kernel plus one indirect dispatch per class. The selected-class multiset matches the CPU oracle on uniform (4+4) and skewed (7+1) 8-task graphs. An unauthorized class is refused. The report carries bucket/command counts and is classified EmulatedDevicePass -- not DevicePass -- because no native ICB select ran. The reference backend host-walks the same graph and reports Serialized. Tier3 (GPU invents a Node / grows the envelope) is not implemented and stays Unsupported. No hitch or cost curve is claimed; D7 records break-even as unmeasured.",
+  "vulkan_status": "compile-review-only (ADR-024/038/041); comments in vulkan_device_hal.{h,cpp} document DGC-or-bucket as the analogue and are not wired to request_tier2_select"
+}

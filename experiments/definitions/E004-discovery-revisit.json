@@ -1,0 +1,39 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E004",
+  "name": "access-certificate-discovery-revisit",
+  "workload": "seed_topology_reachable_subset",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["discover-then-lease-seed-walk", "forged-witness-refuse", "topology-epoch-freeze"],
+  "metrics": [
+    "discovery_host_ns",
+    "discovery_gpu_ns",
+    "scanned_bytes",
+    "result_bytes",
+    "working_set_bytes",
+    "certificate_reference_count",
+    "universe_reference_count",
+    "discovered_lt_universe"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "arena_allocations": 4,
+    "discovery_seeds": 1,
+    "note": "Phase D revisit of E004 (ADR-035, ADR-036). Does not overwrite experiments/definitions/E004-access-certificate.json -- that B-era row's degenerate full-arena DiscoverThenLease scan is historical. Four-node pointer chain stored as 12-byte PointerRefs in allocation bytes (load_ref wire layout); seed at node 0 reaches 2 nodes; Universe on the same Arena is 4. Host walk / host round-trip is HostAssisted, never DevicePass."
+  },
+  "correctness": {
+    "oracle": "core::discover_reachable + core::build_discovered_certificate + core::certificate_covers_discovery_witness",
+    "tolerance": "exact (discovered reference count strictly less than Active Universe count; certificate covers the discovery witness; forged extra allocation refused; topology_epoch bump mid-walk refused)"
+  },
+  "requirements": [
+    "graph_epoch_consistency",
+    "discovered_strictly_smaller_than_universe",
+    "host_assisted_never_device_pass",
+    "honest_unsupported_software_paged_fault_managed",
+    "no_os_page_migration_claim"
+  ],
+  "phase_d_classification": "HostAssisted",
+  "break_even_curve": "unmeasured",
+  "judgement": "Phase D revisit: DiscoverThenLease now walks a caller-supplied seed topology (02 §7.2) and can certify a reachable set strictly smaller than Universe on the same Arena (2 of 4 on the 4-node chain; isolated seed 1 of 4). The walk is a host read of 12-byte PointerRefs and a host round-trip, honestly classified HostAssisted -- never DevicePass, and never an OS page-migration claim (semantic reachable set / proxy; 06 §10). Certificate covers the discovery witness; a forged extra allocation is refused; a topology_epoch bump mid-walk is refused. SoftwarePaged/FaultManaged stay Unsupported. B-era E004-access-certificate.json is not rewritten. Break-even vs full-arena scan is unmeasured (two ratios only). Vulkan is compile-review-only per ADR-024/ADR-035/041.",
+  "vulkan_status": "compile-review-only (ADR-024/ADR-035/041); vulkan_device_hal.cpp documents the HostAssisted host-walk mapping and does not execute discovery"
+}

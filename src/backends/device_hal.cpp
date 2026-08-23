@@ -79,6 +79,30 @@ bool ExecutionPlan::validate(std::string* error) const {
       return false;
     }
   }
+  if (working_set_budget.has_value() && working_set_lease.has_value() &&
+      working_set_budget->has_limit && working_set_lease->byte_limit > working_set_budget->byte_limit) {
+    if (error) *error = "working-set lease exceeds the plan's working-set budget";
+    return false;
+  }
+  if (pending_overflow.has_value() && !pending_overflow->valid(error)) return false;
+  if (request_tier2_select) {
+    if (authorized_node_classes.size() < 2) {
+      if (error) *error = "tier2 select requires at least two authorized node classes";
+      return false;
+    }
+    if (task_graph.tasks().empty()) {
+      if (error) *error = "tier2 select requires a published task graph";
+      return false;
+    }
+    for (size_t i = 0; i < authorized_node_classes.size(); ++i) {
+      for (size_t j = i + 1; j < authorized_node_classes.size(); ++j) {
+        if (authorized_node_classes[i] == authorized_node_classes[j]) {
+          if (error) *error = "tier2 authorized node classes must be unique";
+          return false;
+        }
+      }
+    }
+  }
   return true;
 }
 

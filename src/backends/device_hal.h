@@ -70,6 +70,10 @@ enum class LoweringClass : uint32_t {
   HostAssisted,
   Serialized,
   Unsupported,
+  // TASK-D4 (E010): GPU-authored bucket + per-Node indirect that is *not*
+  // a native ICB / DGC select. Never use DevicePass for "host read counts,
+  // then re-encode" -- that is Serialized/HostAssisted, not GPU-driven.
+  EmulatedDevicePass,
 };
 
 struct LoweringEvent {
@@ -186,6 +190,32 @@ struct ExecutionPlan {
   // say so by leaving Capability::CheckedFacetGeneration clear rather than
   // silently running the submission unchecked.
   core::ValidationProfile validation_profile{core::ValidationProfile::CheckedNative};
+  // TASK-D1 / ADR-035: unset preserves every pre-D caller. TASK-D3:
+  // submit() enforces a set working_set_budget via apply_working_set_budget()
+  // -- requested bytes that exceed it are a hard refuse (the
+  // WorkingSetBudget::allows error), never a silent clamp. validate() still
+  // rejects lease.byte_limit > budget.byte_limit before submit.
+  std::optional<core::WorkingSetBudget> working_set_budget;
+  std::optional<core::WorkingSetLease> working_set_lease;
+  std::optional<core::EnvelopeOverflow> pending_overflow;
+  // TASK-D2 / ADR-036: caller-supplied seeds for a DiscoverThenLease walk
+  // (02 §7.2). Default empty = no discovery stage, so every pre-D2 caller
+  // -- including B-era DiscoverThenLease's full-arena scan -- is unchanged.
+  std::vector<core::PointerRef> discovery_seeds;
+  // TASK-D5 / ADR-039: per-submit envelope cap on how many tasks this
+  // commit may publish. Unset = no envelope cap (every pre-D5 caller).
+  // Distinct from TaskGraphBuilder::set_quota (ADR-010, build-time only).
+  // 0 is a set cap of zero, not "unset". Crossing the cap is overflow
+  // buffer + next submit, never a silent enlarge.
+  std::optional<uint32_t> envelope_task_quota;
+  // TASK-D4 (E010): when true, submit() selects among
+  // `authorized_node_classes` (>=2 pre-authorized Node classes) via bucket
+  // compute + per-Node indirect. Default false / empty list leaves every
+  // pre-D4 caller unchanged. ICB is an optional capability upgrade, not
+  // required. A backend that host-walks selection must classify
+  // Serialized/HostAssisted -- never DevicePass.
+  bool request_tier2_select{};
+  std::vector<uint32_t> authorized_node_classes;
 
   bool validate(std::string* error = nullptr) const;
   // Checked separately from validate() because it needs the live arena: a
@@ -253,6 +283,10 @@ struct Submission {
   uint64_t cpu_submit_ns{};
   uint64_t cpu_encode_ns{};
   std::optional<uint64_t> gpu_ns;
+  // TASK-D5 / ADR-039: leftover from this submit. Unset means continuation
+  // was not in play. A Deferred record carries a non-zero token for the
+  // next submit's pending_overflow; Rejected never answers continued().
+  std::optional<core::EnvelopeOverflow> envelope_overflow;
   // Stage 5's sealed output (03 §7). Sealed only when the submitted plan
   // carried representation_requests; otherwise left default-constructed, so
   // sealed() distinguishes "no Stage 5 ran" from "Stage 5 ran and froze
@@ -360,6 +394,67 @@ bool run_representation_stage(const std::vector<RepresentationRequest>& requests
                                                        std::string*)>& physical,
                               Submission* submission, std::string* error = nullptr);
 
+// TASK-D3 / ADR-037: this-submit residency, not the address graph. If
+// plan.working_set_lease is set, requested bytes are the sum of those
+// allocations' sizes (missing/stale lookup is a refuse). Else if
+// working_set_budget is set, requested bytes are Universe -- every Active
+// allocation->size. A set budget that does not allow the request fails
+// with WorkingSetBudget::allows's "working-set budget exceeded"; never a
+// silent clamp, and unified memory is never treated as infinite. No-op
+// when neither field is set, so every pre-D3 caller is unchanged.
+//
+// LoweringReport events (stable names): working_set_requested /
+// working_set_committed / working_set_proxy. Reasons say "proxy" because
+// this helper has no OS residency counter. Sparse residency is reported
+// as Unsupported (Metal sparse heap/texture is not implemented; Vulkan
+// sparse binding is explicit map/unmap, not automatic page fault).
+//
+// Metal submit hook (one line; parent must add in metal_device_hal.mm
+// after graph_epoch_matches and `submission->report = compiled.report`,
+// after run_discovery_stage if that hook is present, before Stage 5):
+//   if (!hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
+bool apply_working_set_budget(const ExecutionPlan& plan, core::Arena& arena,
+                              Submission* submission, std::string* error = nullptr);
+
+// TASK-D2 / ADR-036: HostAssisted discovery stage (02 §7.2). Empty
+// discovery_seeds is a no-op so pre-D2 callers are unchanged. A non-empty
+// list host-walks 12-byte PointerRefs in allocation bytes, freezes
+// topology_epoch, seals a certificate over seeds+reachable, and fills a
+// WorkingSetLease from that set via lease.add(ref, discovered, ...).
+// Witness beyond the certificate (including a plan.working_set_lease that
+// names an extra allocation) is a refuse. Classification is always
+// HostAssisted -- never DevicePass: this is a host walk / host
+// round-trip, a semantic reachable set / proxy, not OS page migration.
+// SoftwarePaged / FaultManaged stay Unsupported.
+//
+// Metal submit hook (one line; parent must add in metal_device_hal.mm
+// after graph_epoch_matches and the submission->report = compiled.report
+// copy, before Stage 5 / dispatch -- same place as
+// apply_working_set_budget):
+//   if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
+bool run_discovery_stage(const ExecutionPlan& plan, core::Arena& arena,
+                         Submission* submission, std::string* error = nullptr);
+
+// TASK-D5 / ADR-039: portable envelope continuation. Host-splits
+// TaskGraph::deterministic_order (HostAssisted). ADR-010 set_quota stays
+// build-time only; this helper never silently enlarges envelope_task_quota.
+//
+// - quota unset and no valid Deferred pending: no-op, publish_order = full
+//   deterministic_order, envelope_overflow left unset
+// - task count <= quota and no valid Deferred pending: publish all
+// - task count > quota and no valid Deferred pending: publish first N,
+//   mint a token, set submission.envelope_overflow Deferred
+// - pending Deferred valid: require table token match, publish leftovers
+//   only, clear leftover. A larger quota on this submit does not republish
+//   the prefix.
+// - pending Rejected or a bad token: refuse (distinct from
+//   "publication ring quota overflow")
+bool apply_envelope_continuation(const ExecutionPlan& plan,
+                                 core::EnvelopeContinuationTable* table,
+                                 Submission* submission,
+                                 std::vector<uint32_t>* publish_order,
+                                 std::string* error = nullptr);
+
 class DeviceHal {
  public:
   virtual ~DeviceHal() = default;
@@ -377,8 +472,16 @@ class DeviceHal {
   core::FacetPool& facet_pool() { return facet_pool_; }
   const core::FacetPool& facet_pool() const { return facet_pool_; }
 
+  // Issued continuation tokens live on the device so leftover cannot be
+  // stolen by a later submit that omits pending_overflow (ADR-039).
+  core::EnvelopeContinuationTable& envelope_continuations() { return envelope_continuations_; }
+  const core::EnvelopeContinuationTable& envelope_continuations() const {
+    return envelope_continuations_;
+  }
+
  protected:
   core::FacetPool facet_pool_;
+  core::EnvelopeContinuationTable envelope_continuations_;
 };
 
 std::unique_ptr<DeviceHal> make_reference_device_hal();

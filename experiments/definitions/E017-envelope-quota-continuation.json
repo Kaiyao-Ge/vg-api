@@ -1,0 +1,35 @@
+{
+  "schema": "vg.experiment/v1",
+  "id": "E017",
+  "name": "envelope-quota-continuation",
+  "workload": "sealed_task_graph_deterministic_order_over_envelope_cap",
+  "backends": ["cpu-reference", "metal"],
+  "variants": ["large-static-quota", "overflow-buffer-next-submit", "missing-continuation-token", "rejected-pending"],
+  "metrics": [
+    "published_task_count",
+    "overflow_task_count",
+    "continuation_token_nonzero",
+    "duplicate_published_tasks",
+    "host_round_trips"
+  ],
+  "protocol": {
+    "deterministic": true,
+    "publication": "overflow-buffer-next-submit",
+    "note": "ADR-039. envelope_task_quota is a per-submit cap, distinct from TaskGraphBuilder::set_quota (ADR-010, build-time only). Large static quota publishes the full deterministic_order in one submit with envelope_overflow unset. Small quota (1) over a 3-task chain: first submit publishes the prefix, records EnvelopeOverflow Deferred with overflow_task_count=2 and continuation_token!=0 (HostAssisted host split). Second submit copies that record onto plan.pending_overflow and publishes leftover only. A second submit without the token must not drain leftover. A Rejected pending record is a refuse and never answers continued(). Firmware DelegatedEnvelope is out of scope; HostAssisted is the honest classification."
+  },
+  "correctness": {
+    "oracle": "reference execute_task_graph deterministic_order; union of first+continuation published_tasks equals the oracle sequence with no duplicates",
+    "tolerance": "exact"
+  },
+  "requirements": [
+    "no_silent_quota_enlarge",
+    "deferred_requires_nonzero_token",
+    "rejected_never_continued",
+    "missing_token_does_not_steal_leftover",
+    "envelope_errors_distinct_from_publication_ring_overflow"
+  ],
+  "phase_d_classification": "HostAssisted",
+  "break_even_curve": "unmeasured",
+  "judgement": "First-stage portable continuation is overflow buffer + next submit, host-split on TaskGraph::deterministic_order and classified HostAssisted. ADR-010 set_quota remains build-time only. A 3-task chain with quota 1 publishes 1 and defers 2; a missing token does not steal leftover. No DelegatedEnvelope and no firmware envelope extension are claimed. Large-graph continuation cost is unmeasured.",
+  "vulkan_status": "compile-review-only (ADR-024/035/041); comments only, no execution evidence"
+}

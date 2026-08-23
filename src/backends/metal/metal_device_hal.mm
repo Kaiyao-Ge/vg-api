@@ -1,4 +1,5 @@
 #include "backends/metal/metal_device_hal.h"
+#include "backends/metal/metal_tier2.h"
 
 #include "backends/reference/reference_executor.h"
 #include "compiler/pipeline_classification.h"
@@ -88,6 +89,33 @@ core::TaskRecord unpack_task_record(const uint32_t* in) {
   task.payload_size = in[10];
   task.payload_or_offset = static_cast<uint64_t>(in[12]) | (static_cast<uint64_t>(in[13]) << 32);
   return task;
+}
+
+// TASK-D5 / ADR-039: publish only the envelope window. A quota split or
+// leftover drain must not GPU-publish the parked suffix (gid == packed
+// slot, so a full-graph dispatch would still write leftover).
+bool publish_envelope_order(const core::TaskGraph& graph, const std::vector<uint32_t>& order,
+                            std::vector<core::TaskRecord>* published, std::string* error) {
+  if (published == nullptr) {
+    if (error) *error = "envelope published-task output is required";
+    return false;
+  }
+  published->clear();
+  if (order.empty()) return true;
+  core::PublicationRing ring(static_cast<uint32_t>(order.size()));
+  const auto& tasks = graph.tasks();
+  published->reserve(order.size());
+  for (uint32_t index : order) {
+    uint32_t slot = 0;
+    std::string task_error;
+    if (index >= tasks.size() || !ring.publish_task(tasks[index], &slot, &task_error) ||
+        !ring.consume(slot, &task_error)) {
+      if (error) *error = task_error.empty() ? "envelope task index is out of range" : task_error;
+      return false;
+    }
+    published->push_back(tasks[index]);
+  }
+  return true;
 }
 
 hal::CapabilitySnapshot make_hal_snapshot(id<MTLDevice> device, DeviceSnapshot* out) {
@@ -1842,6 +1870,11 @@ bool plan_computes_over_allocation(const hal::ExecutionPlan& plan, uint64_t allo
 // regardless of which path executed the submission.
 void attach_access_certificate(const hal::CompiledPlan& compiled, const core::Arena& arena, hal::Submission* submission) {
   if (!submission->result.ok || !compiled.plan.requested_certificate_mode.has_value()) return;
+  // TASK-D2 / ADR-036: a non-empty seed list already attached the
+  // discovered (strict subset) certificate in run_discovery_stage.
+  // build_access_certificate here would overwrite it with the B-era
+  // full-arena DiscoverThenLease scan (ADR-025 / ADR-035).
+  if (!compiled.plan.discovery_seeds.empty()) return;
   std::vector<core::PointerRef> touched;
   for (const auto& instruction : compiled.plan.module.instructions)
     touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});
@@ -2154,6 +2187,10 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
 
   submission->abi_version = hal::kDeviceHalAbiVersion;
   submission->report = compiled.report;
+  // TASK-D2 / ADR-036 then TASK-D3 / ADR-037: discovery (if seeds are set)
+  // then this-submit residency. Empty seeds / unset budget are no-ops.
+  if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
+  if (!hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
 
   // Stage 5 precedes Stage 6/7 (03 §7): the Region representations a
   // submission depends on are published, and the facets that depend on them
@@ -2264,12 +2301,15 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
     if (submission->result.ok && signal_value != 0) impl_->timeline_event.signaledValue = signal_value;
     submission->timeline_value = impl_->timeline_event != nil ? impl_->timeline_event.signaledValue : 0;
     if (submission->result.ok && !compiled.plan.task_graph.tasks().empty()) {
-      auto task_result = reference::execute_task_graph(compiled.plan.task_graph);
-      if (!task_result.ok) {
+      std::vector<uint32_t> order;
+      if (!hal::apply_envelope_continuation(compiled.plan, &envelope_continuations_, submission, &order,
+                                            error))
+        return false;
+      std::string publish_error;
+      if (!publish_envelope_order(compiled.plan.task_graph, order, &submission->published_tasks,
+                                  &publish_error)) {
         submission->result.ok = false;
-        submission->result.message = task_result.message;
-      } else {
-        submission->published_tasks = std::move(task_result.published_tasks);
+        submission->result.message = publish_error;
       }
     }
     const auto host_end = std::chrono::steady_clock::now();
@@ -2530,6 +2570,28 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
   submission->result.poison = core::PoisonState::Valid;
 
   if (!compiled.plan.task_graph.tasks().empty()) {
+    // TASK-D5 / ADR-039: apply the envelope window first. Unset quota keeps
+    // the pre-D5 full GPU publish. A set cap that does not cover the graph
+    // (or a leftover drain) is HostAssisted -- pack/dispatch of the full
+    // graph would still write parked tasks because gid == packed slot.
+    std::vector<uint32_t> order;
+    if (!hal::apply_envelope_continuation(compiled.plan, &envelope_continuations_, submission, &order,
+                                          error))
+      return false;
+    const auto& tasks = compiled.plan.task_graph.tasks();
+    const bool host_split =
+        order.size() != tasks.size() || submission->envelope_overflow.has_value();
+    if (order.empty()) {
+      // quota 0, or an empty leftover drain: publish nothing this submit.
+    } else if (host_split) {
+      std::string publish_error;
+      if (!publish_envelope_order(compiled.plan.task_graph, order, &submission->published_tasks,
+                                  &publish_error)) {
+        submission->result.ok = false;
+        submission->result.message = publish_error;
+        return true;
+      }
+    } else {
     // Pack -> dispatch the GPU publish kernel -> read back -> verify every
     // slot reached Published -> unpack, walking slots in the task graph's
     // deterministic dependency order so submission->published_tasks is
@@ -2541,14 +2603,6 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
     // do. dispatch_task_publish is fully synchronous (waitUntilCompleted),
     // so the Shared-storage buffers are already safe to read from the host
     // by the time it returns; no additional synchronization is needed.
-    std::vector<uint32_t> order;
-    std::string order_error;
-    if (!compiled.plan.task_graph.deterministic_order(&order, &order_error)) {
-      submission->result.ok = false;
-      submission->result.message = order_error;
-      return true;
-    }
-    const auto& tasks = compiled.plan.task_graph.tasks();
     const uint32_t count = static_cast<uint32_t>(tasks.size());
 
     id<MTLBuffer> state_buffer = [impl_->device newBufferWithLength:std::max<size_t>(count * sizeof(uint32_t), 1)
@@ -2619,6 +2673,23 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       }
       submission->report.add("tier1_indirect_dispatch", hal::LoweringClass::Direct, order.size(), 0,
                              "GPU-authored indirect dispatch dims, no host round trip before dispatch");
+    }
+    // TASK-D4 (E010): isolated behind request_tier2_select so D2/D3/D5
+    // submit prologue work does not collide. Implementation lives in
+    // metal_tier2.mm -- ICB is not required; default is bucket + per-Node
+    // indirect classified EmulatedDevicePass.
+    if (compiled.plan.request_tier2_select) {
+      std::string tier2_error;
+      if (!vg::metal::tier2::apply_select(static_cast<void*>(impl_->device),
+                                          static_cast<void*>(impl_->command_queue),
+                                          static_cast<void*>(fields_buffer), count, compiled.plan,
+                                          submission, &stats.encoder_count, &stats.command_buffer_count,
+                                          &stats.queue_wait_count, &tier2_error)) {
+        submission->result.ok = false;
+        submission->result.message = tier2_error;
+        return true;
+      }
+    }
     }
   }
   submission->cpu_encode_ns = stats.cpu_encode_ns;

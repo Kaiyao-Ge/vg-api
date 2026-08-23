@@ -483,6 +483,16 @@ class DeviceHal final : public vg::hal::DeviceHal {
   // Task ring, never from host-side TaskRecord.x/y/z (contrast Metal, where
   // Tier1/ICB remains a target rather than a requirement -- see ADR-021 vs
   // ADR-022).
+  //
+  // TASK-D4 (E010) compile-review-only: Vulkan has no Tier2 execution here
+  // (no reachable hardware, ADR-024). The analogue of Metal's default
+  // bucket compute + per-Node indirect is a GPU histogram / prefix-sum
+  // over authorized node classes followed by one vkCmdDispatchIndirect
+  // per class. VK_EXT_device_generated_commands (DGC) is the optional
+  // capability upgrade matching Metal ICB -- not required, and never the
+  // floor. Host-read-counts-then-vkCmdDispatch is Serialized/HostAssisted,
+  // never DevicePass. Tier3 (GPU invents a Node / grows the envelope)
+  // remains Unsupported.
   bool dispatch_task_ring_and_tier1(const TaskRingBuffers& buffers, const std::vector<uint32_t>& order,
                                     const std::vector<VkDeviceAddress>& addresses, std::string* error);
   // Records and submits a single dispatch on a transient command buffer.

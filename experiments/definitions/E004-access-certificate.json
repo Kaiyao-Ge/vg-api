@@ -24,6 +24,7 @@
     "tolerance": "exact"
   },
   "requirements": ["graph_epoch_consistency", "honest_unsupported_reporting"],
+  "phase_d_revisit": "experiments/definitions/E004-discovery-revisit.json",
   "judgement": "CertifiedPinned/Universe/DiscoverThenLease each produce a real, epoch-stamped AccessCertificate on both backends (ADR-025); SoftwarePaged/FaultManaged are honestly reported LoweringClass::Unsupported on both backends rather than approximated -- under this project's unified-memory Metal/reference model there is no GPU-resident subset distinct from the arena itself, so DiscoverThenLease's discovery break-even is degenerate (it certifies the same set as Universe, at additional measured host-rescan cost) rather than a smaller leased subset; this is an accurate adapter result, not a gap. Vulkan is compile-review-only per ADR-024 and is not a backend for this experiment's actual results.",
   "vulkan_status": "compile-review-only (ADR-024); vulkan_device_hal.cpp does not implement requested_certificate_mode in this milestone"
 }

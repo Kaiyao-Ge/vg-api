@@ -1,0 +1,77 @@
+{
+  "schema": "vg.phase-d-gate/v1",
+  "status": "gate-recorded-per-adr-041",
+  "scope": "DynamicGraphAndResidencyResearch",
+  "closure": "research-recorded-not-product-closed",
+  "break_even_curves": "unmeasured",
+  "vulkan_status": "compile-review-only",
+  "host_assisted_boundary": "docs/reports/host-assisted-boundary.md",
+  "native_contract_research_v1": "docs/reports/native-contract-research-v1.md",
+  "phase_e": "not-started",
+  "experiments": {
+    "E004": "recorded",
+    "E010": "recorded",
+    "E011": "recorded",
+    "E014": "recorded",
+    "E017": "recorded"
+  },
+  "experiment_evidence": {
+    "E004": {
+      "definition": "experiments/definitions/E004-discovery-revisit.json",
+      "historical_b_row": "experiments/definitions/E004-access-certificate.json",
+      "adr": "ADR-036",
+      "task": "TASK-D2",
+      "classification": "HostAssisted",
+      "observed": "discovered 2 of 4 and 1 of 4 on the same Arena; forged lease refused; topology freeze refused",
+      "ctests": ["core.discovery", "vertical-slice.metal.discovery"]
+    },
+    "E010": {
+      "definition": "experiments/definitions/E010-heterogeneous-node-lowering.json",
+      "adr": "ADR-038",
+      "task": "TASK-D4",
+      "classification": "EmulatedDevicePass",
+      "reference_classification": "Serialized",
+      "observed": "uniform 4+4 and skewed 7+1 selected-class multisets match the CPU oracle; unauthorized class refused; no ICB",
+      "ctests": ["unit.tier2-oracle", "vertical-slice.metal.tier2-nodes"]
+    },
+    "E011": {
+      "definition": "experiments/definitions/E011-residency-working-set.json",
+      "adr": "ADR-037",
+      "task": "TASK-D3",
+      "classification": "proxy-bytes-hard-refuse",
+      "observed": "hand-picked 16B lease under budget 64 passes; Universe 32B under budget 16 refuses; sparse Unsupported",
+      "ctests": ["core.working-set", "vertical-slice.metal.working-set"]
+    },
+    "E014": {
+      "definition": "experiments/definitions/E014-capture-replay.json",
+      "adr": "ADR-040",
+      "task": "TASK-D6",
+      "classification": "same-environment-reference; cross-backend-semantic-only",
+      "observed": "stable capture_hash/ir_hash; consumed refuse string unchanged; no GPU addresses in the view report",
+      "blocked_or_skipped": ["dynamic-graph", "driver-update"],
+      "ctests": ["capture.view", "capture.view.cli"]
+    },
+    "E017": {
+      "definition": "experiments/definitions/E017-envelope-quota-continuation.json",
+      "adr": "ADR-039",
+      "task": "TASK-D5",
+      "classification": "HostAssisted",
+      "observed": "quota 1 publishes 1 and defers 2; missing token does not steal leftover; large quota is one submit",
+      "ctests": ["core.envelope-continuation", "vertical-slice.metal.envelope-continuation"]
+    }
+  },
+  "runner": {
+    "tool": "tools/vg-exp/vg_exp.py phase-d",
+    "ctest": "tooling.phase-d-runner",
+    "official_run": "artifacts/runs/20260823T194226Z-PHASED-8df2d090a607-f0105c3c7d770ce9-51d45f62",
+    "note": "Loads E004-discovery-revisit.json only. Vulkan is a fixed compile-review-only sample per experiment."
+  },
+  "unsupported_or_unmeasured": [
+    "break-even curves: unmeasured (fixtures too small)",
+    "E004 SoftwarePaged/FaultManaged: Unsupported (unchanged)",
+    "E010 ICB/DGC native select and Tier3: not implemented",
+    "E011 Metal sparse: Unsupported; no OS residency counter",
+    "E014 dynamic-graph: blocked; driver-update: skipped",
+    "E017 DelegatedEnvelope: not present"
+  ]
+}
