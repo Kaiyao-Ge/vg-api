@@ -2,6 +2,7 @@
 #include "backends/metal/metal_device_hal.h"
 #include "backends/reference/reference_device_hal.h"
 #include "backends/reference/reference_executor.h"
+#include "capture/capture.h"
 #include "compiler/compiler.h"
 #include "ir/ir.h"
 
@@ -2035,6 +2036,277 @@ bool run_consume_input(const std::string& root) {
       return false;
     }
     std::cout << "consume-input: same-allocation ConsumeInput rejected at compile\n";
+  }
+
+  // Catalog fault-injection (09 E005): transform 前/中/后 fault;
+  // capture replay request; 外部引用存在. These run the real rejection
+  // paths and print what the program actually does -- they do not invent a
+  // second Arena fault injector (existing IR poison stays scoped to
+  // compile()/submit() instruction execution).
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const auto original = image.bytes;
+    const uint32_t generation = image.generation;
+    const uint32_t epoch_before = image.representation_epoch;
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    if (!arena.acquire(image.id, generation)) {
+      std::cerr << "consume-input: fault-before acquire failed\n";
+      return false;
+    }
+    vg::hal::Submission submission;
+    std::string error;
+    if (compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error)) {
+      std::cerr << "consume-input: fault-before must refuse while the allocation is in flight\n";
+      return false;
+    }
+    if (error.find("representation epoch is referenced in flight") == std::string::npos) {
+      std::cerr << "consume-input: fault-before refused for the wrong reason: " << error << "\n";
+      return false;
+    }
+    if (image.bytes != original || image.generation != generation ||
+        image.representation_epoch != epoch_before ||
+        image.state != vg::core::ObjectState::Active) {
+      std::cerr << "consume-input: fault-before must leave the old representation untouched\n";
+      return false;
+    }
+    if (!arena.release(image.id, generation)) {
+      std::cerr << "consume-input: fault-before release failed\n";
+      return false;
+    }
+    std::cout << "consume-input: fault-before refused (in-flight), old backing kept ("
+              << image.bytes.size() << " bytes, epoch=" << image.representation_epoch << ")\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const auto original = image.bytes;
+    const uint32_t generation = image.generation;
+    const uint32_t epoch_before = image.representation_epoch;
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    vg::core::FacetPool pool;
+    vg::hal::Submission submission;
+    std::string error;
+    if (vg::hal::run_representation_stage(
+            {request}, arena, pool,
+            [](const vg::hal::RepresentationRequest&, vg::core::FacetRef,
+               vg::hal::RepresentationTransformCost*, std::string* physical_error) {
+              if (physical_error) *physical_error = "injected physical transform fault";
+              return false;
+            },
+            &submission, &error)) {
+      std::cerr << "consume-input: fault-during must fail the physical step\n";
+      return false;
+    }
+    if (error.find("injected physical transform fault") == std::string::npos) {
+      std::cerr << "consume-input: fault-during refused for the wrong reason: " << error << "\n";
+      return false;
+    }
+    // 02 §9: a fault is not transactional rollback. transform() already
+    // published the new epoch before the physical step ran; consume must
+    // not have happened, and the superseded host bytes must still be here.
+    if (submission.consumed_allocation_count != 0 || submission.released_backing_bytes != 0) {
+      std::cerr << "consume-input: fault-during must not consume (consumed="
+                << submission.consumed_allocation_count
+                << " released=" << submission.released_backing_bytes << ")\n";
+      return false;
+    }
+    if (image.bytes != original || image.generation != generation ||
+        image.state != vg::core::ObjectState::Active) {
+      std::cerr << "consume-input: fault-during must keep the old host backing\n";
+      return false;
+    }
+    if (image.representation_epoch != epoch_before + 1) {
+      std::cerr << "consume-input: fault-during rolled back the published epoch (got "
+                << image.representation_epoch << ")\n";
+      return false;
+    }
+    if (arena.lookup(image.id, generation, epoch_before) != nullptr ||
+        arena.lookup(image.id, generation, image.representation_epoch) == nullptr) {
+      std::cerr << "consume-input: fault-during must leave the new epoch visible and the old one stale\n";
+      return false;
+    }
+    std::cout << "consume-input: fault-during kept old backing (" << image.bytes.size()
+              << " bytes), epoch advanced " << epoch_before << "->" << image.representation_epoch
+              << ", consume did not run\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const uint32_t generation = image.generation;
+    const uint32_t epoch_before = image.representation_epoch;
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    vg::hal::Submission submission;
+    std::string error;
+    if (!compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error) ||
+        !submission.result.ok || submission.released_backing_bytes == 0) {
+      std::cerr << "consume-input: fault-after setup ConsumeInput failed: " << error << "\n";
+      return false;
+    }
+    const auto stale_module = make_epoch_probe_module(image, epoch_before);
+    const auto stale = vg::reference::execute(stale_module, arena);
+    if (stale.ok || stale.outputs_valid || stale.poison == vg::core::PoisonState::Valid ||
+        stale.fault.code != "STALE_OR_BOUNDS") {
+      std::cerr << "consume-input: fault-after old-epoch load must be STALE_OR_BOUNDS (ok="
+                << stale.ok << " code=" << stale.fault.code << ")\n";
+      return false;
+    }
+    if (!image.bytes.empty() || image.generation != generation ||
+        image.state != vg::core::ObjectState::Active) {
+      std::cerr << "consume-input: fault-after must not roll consume back\n";
+      return false;
+    }
+    std::cout << "consume-input: fault-after old-epoch load " << stale.fault.code
+              << ", consume not rolled back (released=" << submission.released_backing_bytes << ")\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    const auto original = image.bytes;
+    const uint32_t epoch_before = image.representation_epoch;
+    const auto image_module = make_epoch_probe_module(image, epoch_before);
+    const auto pre = vg::capture::make_capture(image_module, arena);
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    vg::hal::Submission submission;
+    std::string error;
+    if (!compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error) ||
+        !submission.result.ok) {
+      std::cerr << "consume-input: capture-replay setup ConsumeInput failed: " << error << "\n";
+      return false;
+    }
+    vg::capture::ReplayResult pre_replay;
+    if (!vg::capture::replay(pre, &pre_replay, &error) || !pre_replay.execution.ok) {
+      std::cerr << "consume-input: pre-consume capture must still replay: " << error << " "
+                << pre_replay.execution.message << "\n";
+      return false;
+    }
+    const auto post = vg::capture::make_capture(image_module, arena);
+    if (post.allocations.size() != 2) {
+      std::cerr << "consume-input: post-consume capture allocation count=" << post.allocations.size()
+                << "\n";
+      return false;
+    }
+    uint64_t post_image_bytes = 0;
+    for (const auto& snapshot : post.allocations) {
+      if (snapshot.id == image.id) post_image_bytes = snapshot.bytes.size();
+    }
+    vg::capture::ReplayResult post_replay;
+    if (vg::capture::replay(post, &post_replay, &error)) {
+      std::cerr << "consume-input: post-consume capture must not be importable after bytes were released\n";
+      return false;
+    }
+    if (error.find("cannot restore a consumed representation") == std::string::npos) {
+      std::cerr << "consume-input: post-consume replay was refused for the wrong reason: " << error << "\n";
+      return false;
+    }
+    std::cout << "consume-input: capture-replay pre-package ok, post-package lost " << original.size()
+              << " linear bytes (snapshot now " << post_image_bytes << "), " << error << "\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    prepare_image(arena, &view);
+    vg::hal::ExecutionPlan plan;
+    plan.capabilities = metal_device->capabilities();
+    auto& probe = arena.allocate(64);
+    plan.module = make_epoch_probe_module(probe, probe.representation_epoch);
+    plan.published = true;
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    request.consume_proof.no_external_references = false;
+    plan.representation_requests.push_back(request);
+    std::string validate_error;
+    if (plan.validate(&validate_error)) {
+      std::cerr << "consume-input: external-ref proof unexpectedly validated\n";
+      return false;
+    }
+    if (validate_error.find("an external reference to the old representation still exists") ==
+        std::string::npos) {
+      std::cerr << "consume-input: external-ref proof was refused for the wrong reason: "
+                << validate_error << "\n";
+      return false;
+    }
+    std::cout << "consume-input: external-ref proof rejected by plan.validate\n";
+  }
+
+  {
+    vg::core::Arena arena;
+    vg::core::CanonicalView view;
+    auto& image = prepare_image(arena, &view);
+    vg::core::FacetRef live{};
+    std::string error;
+    if (!metal_device->facet_pool().acquire(arena, view, vg::core::FacetKind::Sample, &live, &error)) {
+      std::cerr << "consume-input: live-facet acquire failed: " << error << "\n";
+      return false;
+    }
+    if (!metal_device->facet_pool().begin_gpu_use(arena, live, &error)) {
+      std::cerr << "consume-input: live-facet begin_gpu_use failed: " << error << "\n";
+      return false;
+    }
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = complete_consume_proof();
+    vg::hal::Submission submission;
+    if (compile_and_submit_representation(*metal_device, arena, module, request, &submission, &error)) {
+      std::cerr << "consume-input: live-facet ConsumeInput must be refused while the token is held\n";
+      return false;
+    }
+    if (error.find("a facet token still names the old representation") == std::string::npos) {
+      std::cerr << "consume-input: live-facet was refused for the wrong reason: " << error << "\n";
+      return false;
+    }
+    vg::core::FacetStatus status = vg::core::FacetStatus::Ok;
+    if (metal_device->facet_pool().lookup(arena, live, &status) == nullptr) {
+      std::cerr << "consume-input: live-facet token must still resolve after a refused consume (status="
+                << vg::core::to_string(status) << ")\n";
+      return false;
+    }
+    if (image.bytes.size() != 16) {
+      std::cerr << "consume-input: live-facet refuse must keep the old backing\n";
+      return false;
+    }
+    if (!metal_device->facet_pool().end_gpu_use(live, &error)) {
+      std::cerr << "consume-input: live-facet end_gpu_use failed: " << error << "\n";
+      return false;
+    }
+    std::cout << "consume-input: external live-facet token still live, ConsumeInput refused\n";
   }
 
   std::cout << "consume-input: ok\n";

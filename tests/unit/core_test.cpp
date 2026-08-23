@@ -1,6 +1,7 @@
 #include "backends/device_hal.h"
 #include "backends/reference/reference_device_hal.h"
 #include "backends/reference/reference_executor.h"
+#include "capture/capture.h"
 #include "compiler/compiler.h"
 #include "core/core.h"
 #include "core/task_schema.h"
@@ -732,6 +733,139 @@ int main() {
     assert(consume_error == "stale allocation or representation epoch for consume");
     assert(exclusive_arena.consume(exclusive_id, exclusive_generation, exclusive_epoch, discharged,
                                    &consume_error));
+  }
+
+  // --- E005 catalog fault-injection, host-visible paths. These observe the
+  // existing Stage 5 / consume / capture machinery rather than inventing an
+  // Arena-scoped fault injector. ---
+  {
+    vg::core::Arena stage_arena;
+    auto& backing = stage_arena.allocate(16);
+    backing.bytes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const auto original = backing.bytes;
+    const uint32_t generation = backing.generation;
+    const uint32_t epoch_before = backing.representation_epoch;
+    vg::core::CanonicalView view;
+    view.allocation = backing.id;
+    view.allocation_generation = generation;
+    view.width = 2;
+    view.height = 2;
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = discharged;
+    vg::core::FacetPool pool;
+    vg::hal::Submission submission;
+    std::string stage_error;
+    assert(!vg::hal::run_representation_stage(
+        {request}, stage_arena, pool,
+        [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost*,
+           std::string* physical_error) {
+          if (physical_error) *physical_error = "injected physical transform fault";
+          return false;
+        },
+        &submission, &stage_error));
+    assert(stage_error.find("injected physical transform fault") != std::string::npos);
+    assert(submission.consumed_allocation_count == 0);
+    assert(submission.released_backing_bytes == 0);
+    assert(backing.bytes == original);
+    assert(backing.generation == generation);
+    assert(backing.state == vg::core::ObjectState::Active);
+    assert(backing.representation_epoch == epoch_before + 1);
+    assert(stage_arena.lookup(backing.id, generation, epoch_before) == nullptr);
+    assert(stage_arena.lookup(backing.id, generation, backing.representation_epoch) != nullptr);
+  }
+
+  {
+    vg::core::Arena cap_arena;
+    auto& backing = cap_arena.allocate(16);
+    backing.bytes.assign(16, 0);
+    backing.bytes[0] = 255;
+    vg::ir::Module module;
+    module.version = 1;
+    module.root_schema = "vg.test/v1";
+    vg::ir::Instruction load;
+    load.op = "load";
+    load.allocation = backing.id;
+    load.generation = backing.generation;
+    load.representation_epoch = backing.representation_epoch;
+    load.offset = 0;
+    load.size = 4;
+    module.instructions.push_back(load);
+    module.declared_effects.push_back({backing.id, 0, 4, vg::ir::Access::Read, backing.representation_epoch});
+    const auto pre = vg::capture::make_capture(module, cap_arena);
+    uint32_t new_epoch = 0;
+    assert(cap_arena.transform(backing.id, backing.generation, &new_epoch));
+    uint64_t released = 0;
+    std::string cap_error;
+    assert(cap_arena.consume_representation(backing.id, backing.generation, new_epoch, discharged, &released,
+                                           &cap_error));
+    assert(released == 16);
+    assert(backing.bytes.empty());
+    vg::capture::ReplayResult pre_replay;
+    assert(vg::capture::replay(pre, &pre_replay, &cap_error));
+    assert(pre_replay.execution.ok);
+    const auto post = vg::capture::make_capture(module, cap_arena);
+    assert(post.allocations.size() == 1);
+    assert(post.allocations[0].size == 16);
+    assert(post.allocations[0].bytes.empty());
+    // consume_representation clears bytes but leaves Allocation::size, so the
+    // snapshot is not importable (bytes.size() != size). That is the lost
+    // replay: the package cannot be reconstituted, not merely executed stale.
+    vg::capture::ReplayResult post_replay;
+    assert(!vg::capture::replay(post, &post_replay, &cap_error));
+    assert(cap_error == "cannot restore a consumed representation");
+  }
+
+  {
+    vg::core::Arena hold_arena;
+    auto& backing = hold_arena.allocate(16);
+    backing.bytes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const auto original = backing.bytes;
+    const uint32_t epoch_before = backing.representation_epoch;
+    vg::core::CanonicalView view;
+    view.allocation = backing.id;
+    view.allocation_generation = backing.generation;
+    view.width = 2;
+    view.height = 2;
+    vg::core::FacetPool pool;
+    vg::core::FacetRef live{};
+    std::string hold_error;
+    assert(pool.acquire(hold_arena, view, vg::core::FacetKind::Sample, &live, &hold_error));
+    assert(pool.references(backing.id, backing.generation, epoch_before));
+    vg::hal::RepresentationRequest request;
+    request.view = view;
+    request.target_kind = vg::core::FacetKind::Sample;
+    request.consume_input = true;
+    request.consume_proof = discharged;
+    vg::hal::Submission submission;
+    assert(!vg::hal::run_representation_stage(
+        {request}, hold_arena, pool,
+        [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost* cost,
+           std::string*) {
+          cost->distinct_backing = true;
+          cost->new_backing_bytes = 16;
+          return true;
+        },
+        &submission, &hold_error));
+    assert(hold_error.find("a facet token still names the old representation") != std::string::npos);
+    assert(backing.bytes == original);
+    assert(backing.representation_epoch == epoch_before);
+    assert(pool.lookup(hold_arena, live) != nullptr);
+    assert(pool.retire(live, &hold_error));
+    assert(!pool.references(backing.id, backing.generation, epoch_before));
+    assert(vg::hal::run_representation_stage(
+        {request}, hold_arena, pool,
+        [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost* cost,
+           std::string*) {
+          cost->distinct_backing = true;
+          cost->new_backing_bytes = 16;
+          return true;
+        },
+        &submission, &hold_error));
+    assert(submission.consumed_allocation_count == 1);
+    assert(backing.bytes.empty());
   }
 
   // --- E016 backpressure: "禁止无界创建版本" and "内存不足时可预测失败而非系统

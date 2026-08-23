@@ -286,6 +286,11 @@ class FacetPool {
   // weaker than lookup(): it sees only what the uploaded table encodes, and so
   // cannot observe an epoch that went stale after the snapshot.
   bool generation_valid(FacetRef ref) const;
+  // 02 §4.2 / 06 §11: a live token or an outstanding GPU use of this
+  // allocation at `epoch` is an external reference ConsumeInput must see.
+  // Retired slots still count while in_flight > 0, because the command buffer
+  // that called begin_gpu_use() may still dereference the old backing.
+  bool references(uint64_t allocation, uint32_t generation, uint32_t epoch) const;
 
  private:
   void retire_slot(uint32_t index);

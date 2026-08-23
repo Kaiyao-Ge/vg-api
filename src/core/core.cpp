@@ -570,6 +570,15 @@ bool FacetPool::generation_valid(FacetRef ref) const {
   return slot.active && slot.generation == ref.generation;
 }
 
+bool FacetPool::references(uint64_t allocation, uint32_t generation, uint32_t epoch) const {
+  for (const FacetSlot& slot : slots_) {
+    if (slot.view.allocation != allocation || slot.view.allocation_generation != generation) continue;
+    if (slot.representation_epoch != epoch) continue;
+    if (slot.active || slot.in_flight > 0) return true;
+  }
+  return false;
+}
+
 void FacetPool::retire_slot(uint32_t index) {
   FacetSlot& slot = slots_[index];
   slot.active = false;

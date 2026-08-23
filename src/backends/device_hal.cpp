@@ -147,6 +147,15 @@ bool run_representation_stage(const std::vector<RepresentationRequest>& requests
                   " at generation " + std::to_string(request.view.allocation_generation) +
                   ", which is not active in this Arena");
     const uint64_t superseded_bytes = allocation->bytes.size();
+    // ConsumeInput is only legal once there is no external reference to the
+    // old representation (02 §4.2). A FacetRef is such a reference, and
+    // retire_stale() after transform() would erase a token-only hold before
+    // consume_representation() could see it. Check the live epoch first.
+    if (request.consume_input &&
+        pool.references(request.view.allocation, request.view.allocation_generation,
+                        allocation->representation_epoch)) {
+      return fail(label + " asked for ConsumeInput, but a facet token still names the old representation");
+    }
 
     uint32_t new_epoch = 0;
     std::string transform_error;

@@ -260,7 +260,8 @@ if(BUILD_TESTING)
     add_test(NAME vertical-slice.metal COMMAND vg_metal_vertical_slice_test ${CMAKE_CURRENT_SOURCE_DIR})
 
     add_executable(vg_metal_task_timeline_test tests/vertical_slice/metal_task_timeline_test.cpp)
-    target_link_libraries(vg_metal_task_timeline_test PRIVATE vg_backend_metal vg_backend_reference vg_core)
+    target_link_libraries(vg_metal_task_timeline_test PRIVATE vg_backend_metal vg_backend_reference vg_core
+                          vg_capture)
     target_include_directories(vg_metal_task_timeline_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
     target_compile_features(vg_metal_task_timeline_test PRIVATE cxx_std_20)
     add_test(NAME vertical-slice.metal.task-tier0 COMMAND vg_metal_task_timeline_test task-tier0 ${CMAKE_CURRENT_SOURCE_DIR})
