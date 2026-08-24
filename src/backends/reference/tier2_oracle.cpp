@@ -1,13 +1,12 @@
 #include "backends/reference/tier2_oracle.h"
 
+#include <algorithm>
+
 namespace vg::reference {
 namespace {
 
 bool is_authorized(uint32_t node_class, const std::vector<uint32_t>& authorized) {
-  for (uint32_t candidate : authorized) {
-    if (candidate == node_class) return true;
-  }
-  return false;
+  return std::ranges::any_of(authorized, [node_class](uint32_t candidate) { return candidate == node_class; });
 }
 
 }  // namespace

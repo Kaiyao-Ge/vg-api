@@ -446,6 +446,11 @@ bool apply_envelope_continuation(const ExecutionPlan& plan,
 
 class DeviceHal {
  public:
+  DeviceHal() = default;
+  DeviceHal(const DeviceHal&) = delete;
+  DeviceHal& operator=(const DeviceHal&) = delete;
+  DeviceHal(DeviceHal&&) = delete;
+  DeviceHal& operator=(DeviceHal&&) = delete;
   virtual ~DeviceHal() = default;
   [[nodiscard]] virtual const CapabilitySnapshot& capabilities() const = 0;
   virtual bool compile(const ExecutionPlan& plan, CompiledPlan* compiled,

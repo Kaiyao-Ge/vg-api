@@ -141,6 +141,8 @@ class DeviceHal final : public vg::hal::DeviceHal {
 
   DeviceHal(const DeviceHal&) = delete;
   DeviceHal& operator=(const DeviceHal&) = delete;
+  DeviceHal(DeviceHal&&) = delete;
+  DeviceHal& operator=(DeviceHal&&) = delete;
 
   const vg::hal::CapabilitySnapshot& capabilities() const override;
   bool compile(const vg::hal::ExecutionPlan& plan,

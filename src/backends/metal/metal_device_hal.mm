@@ -17,6 +17,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -337,6 +338,8 @@ class FacetUseGuard {
   FacetUseGuard(core::FacetPool& pool, core::FacetRef ref) : pool_(pool), ref_(ref) {}
   FacetUseGuard(const FacetUseGuard&) = delete;
   FacetUseGuard& operator=(const FacetUseGuard&) = delete;
+  FacetUseGuard(FacetUseGuard&&) = delete;
+  FacetUseGuard& operator=(FacetUseGuard&&) = delete;
   ~FacetUseGuard() {
     if (held_) pool_.end_gpu_use(ref_);
   }
@@ -383,6 +386,12 @@ constexpr uint32_t kBytesPerTexel = 4;
 constexpr const char* kRasterClipSpaceNote =
     "Metal clip space, +Y up: px = (x * 0.5 + 0.5) * width, py = (0.5 - y * 0.5) * height";
 
+NSString* ns_utf8(std::string_view text) {
+  return [[[NSString alloc] initWithBytes:text.data()
+                                   length:text.size()
+                                 encoding:NSUTF8StringEncoding] autorelease];
+}
+
 // TASK-B12: real host-side wall-clock timing and structural counts for one
 // dispatch_and_wait()/dispatch_task_publish() call, accumulated by the
 // caller into Submission's own fields across however many command buffers a
@@ -411,6 +420,11 @@ struct DispatchStats {
 }  // namespace
 
 struct DeviceHal::Impl {
+  Impl() = default;
+  Impl(const Impl&) = delete;
+  Impl& operator=(const Impl&) = delete;
+  Impl(Impl&&) = delete;
+  Impl& operator=(Impl&&) = delete;
   ~Impl() {
     for (auto& entry : allocation_map) release_buffer(entry.second.buffer);
     for (auto& entry : facet_map) release_facet_textures(entry.second);
@@ -543,16 +557,16 @@ struct DeviceHal::Impl {
   }
 
   struct MslModule {
-    const std::string& ir_hash;
-    const std::string& source;
+    std::string_view ir_hash;
+    std::string_view source;
   };
   struct ShaderEntry {
-    const std::string& source;
-    const std::string& entry;
+    std::string_view source;
+    std::string_view entry;
   };
   struct LibraryText {
-    const std::string& source;
-    const std::string& hash;
+    std::string_view source;
+    std::string_view hash;
   };
   struct LodClamp {
     float min;
@@ -572,8 +586,8 @@ struct DeviceHal::Impl {
   // rather than guessing at GPU family enums ahead of time.
   bool ensure_pipeline(const MslModule& compiled_msl, std::string* error,
                       const std::string& function_name = "vg_linear_compute") {
-    const std::string& ir_hash = compiled_msl.ir_hash;
-    const std::string& msl_source = compiled_msl.source;
+    const std::string_view ir_hash = compiled_msl.ir_hash;
+    const std::string_view msl_source = compiled_msl.source;
     if (pipeline != nil && cached_ir_hash == ir_hash) return true;
     pipeline = nil;
     library = nil;
@@ -581,7 +595,7 @@ struct DeviceHal::Impl {
 
     NSError* compile_error = nil;
     MTLCompileOptions* options = [MTLCompileOptions new];
-    id<MTLLibrary> new_library = [device newLibraryWithSource:[NSString stringWithUTF8String:msl_source.c_str()]
+    id<MTLLibrary> new_library = [device newLibraryWithSource:ns_utf8(msl_source)
                                                         options:options
                                                           error:&compile_error];
     if (new_library == nil) {
@@ -618,13 +632,13 @@ struct DeviceHal::Impl {
 
   bool ensure_effect_dag_pipeline(const MslModule& compiled_msl,
                                   id<MTLComputePipelineState>* out_pipeline, std::string* error) {
-    const std::string& ir_hash = compiled_msl.ir_hash;
-    const std::string& msl_source = compiled_msl.source;
-    auto it = effect_dag_pipelines.find(ir_hash);
+    const std::string_view ir_hash = compiled_msl.ir_hash;
+    const std::string_view msl_source = compiled_msl.source;
+    auto it = effect_dag_pipelines.find(std::string(ir_hash));
     if (it != effect_dag_pipelines.end()) { *out_pipeline = it->second.second; return true; }
     NSError* compile_error = nil;
     MTLCompileOptions* options = [MTLCompileOptions new];
-    id<MTLLibrary> new_library = [device newLibraryWithSource:[NSString stringWithUTF8String:msl_source.c_str()]
+    id<MTLLibrary> new_library = [device newLibraryWithSource:ns_utf8(msl_source)
                                                         options:options
                                                           error:&compile_error];
     if (new_library == nil) {
@@ -645,7 +659,7 @@ struct DeviceHal::Impl {
                                                  : "unknown effect DAG pass pipeline creation error";
       return false;
     }
-    effect_dag_pipelines.emplace(ir_hash, std::make_pair(new_library, new_pipeline));
+    effect_dag_pipelines.emplace(std::string(ir_hash), std::make_pair(new_library, new_pipeline));
     *out_pipeline = new_pipeline;
     return true;
   }
@@ -691,9 +705,9 @@ struct DeviceHal::Impl {
   // Shared prologue for every facet use: resolve the capability token, reject
   // a kind mismatch, and produce the diagnostic the FacetPool itself
   // classified rather than a generic "stale" string.
-  const core::FacetSlot* resolve_facet(const core::Arena& arena, const core::FacetPool& pool,
+  static const core::FacetSlot* resolve_facet(const core::Arena& arena, const core::FacetPool& pool,
                                        core::FacetRef ref, core::FacetKind expected_kind,
-                                       std::string* error) const {
+                                       std::string* error) {
     core::FacetStatus status = core::FacetStatus::Ok;
     const core::FacetSlot* slot = pool.lookup(arena, ref, &status);
     if (slot == nullptr) {
@@ -980,7 +994,7 @@ struct DeviceHal::Impl {
   // B8 Tier0 requirement that dispatch sizing come from real TaskRecord
   // fields, not a placeholder.
   bool dispatch_and_wait(const std::vector<id<MTLBuffer>>& buffers, const std::vector<core::TaskRecord>& tasks,
-                        core::TimelineGate gate, DispatchStats* stats, std::string* error) {
+                        core::TimelineGate gate, DispatchStats* stats, std::string* error) const {
     const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
@@ -1042,7 +1056,7 @@ struct DeviceHal::Impl {
   // never itself bound at an index -- a real, distinct cost this milestone
   // deliberately reports rather than hides.
   bool dispatch_indexed_and_wait(const std::vector<id<MTLBuffer>>& object_buffers, core::TimelineGate gate,
-                                DispatchStats* stats, std::string* error) {
+                                DispatchStats* stats, std::string* error) const {
     const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
@@ -1103,7 +1117,7 @@ struct DeviceHal::Impl {
   bool dispatch_effect_dag(const std::vector<id<MTLComputePipelineState>>& pipelines,
                            const std::vector<std::vector<id<MTLBuffer>>>& buffers,
                            core::EffectGraphShape shape, const core::EffectGraph& graph,
-                           uint32_t node_count, DispatchStats* stats, std::string* error) {
+                           uint32_t node_count, DispatchStats* stats, std::string* error) const {
     const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
@@ -1246,7 +1260,7 @@ struct DeviceHal::Impl {
   // One thread per task (grid = (count,1,1) threadgroups of (1,1,1)
   // threads), so no two threads ever contend for the same ring slot --
   // each slot's Empty->Writing CAS can only ever be attempted once.
-  bool dispatch_task_publish(TaskRingBuffers buffers, uint32_t count, DispatchStats* stats, std::string* error) {
+  bool dispatch_task_publish(TaskRingBuffers buffers, uint32_t count, DispatchStats* stats, std::string* error) const {
     const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
@@ -1338,7 +1352,7 @@ struct DeviceHal::Impl {
                                           uint32_t sample_count) const {
     compiler::PipelineKey key;
     key.code_object_hash = ir::sha256_hex(shader.source);
-    key.entry = shader.entry;
+    key.entry = std::string(shader.entry);
     key.function_constants = std::move(constants);
     key.attachment_formats = std::move(attachment_formats);
     key.sample_count = sample_count;
@@ -1350,12 +1364,12 @@ struct DeviceHal::Impl {
   // source share the compiled library and differ only in the function constant
   // values applied to it.
   id<MTLLibrary> ensure_library(const LibraryText& text, std::string* error) {
-    auto it = library_by_hash.find(text.hash);
+    auto it = library_by_hash.find(std::string(text.hash));
     if (it != library_by_hash.end()) return it->second;
     NSError* compile_error = nil;
     MTLCompileOptions* options = [MTLCompileOptions new];
     id<MTLLibrary> library_object =
-        [device newLibraryWithSource:[NSString stringWithUTF8String:text.source.c_str()]
+        [device newLibraryWithSource:ns_utf8(text.source)
                              options:options
                                error:&compile_error];
     if (library_object == nil) {
@@ -1363,7 +1377,7 @@ struct DeviceHal::Impl {
                                                 : "unknown MSL compile error";
       return nil;
     }
-    library_by_hash.emplace(text.hash, library_object);
+    library_by_hash.emplace(std::string(text.hash), library_object);
     return library_object;
   }
 
@@ -1378,7 +1392,7 @@ struct DeviceHal::Impl {
   // specialization is "fetched with no values supplied", not "fetched
   // unspecialized" -- and a source with no constants at all is unaffected by
   // being asked the same way.
-  id<MTLFunction> ensure_function(id<MTLLibrary> library_object, const compiler::PipelineKey& key,
+  static id<MTLFunction> ensure_function(id<MTLLibrary> library_object, const compiler::PipelineKey& key,
                                   std::string* error) {
     NSString* name = [NSString stringWithUTF8String:key.entry.c_str()];
     MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
@@ -1803,7 +1817,7 @@ struct DeviceHal::Impl {
   // milestone (see ADR-026).
   bool dispatch_task_tier1_indirect(const std::vector<id<MTLBuffer>>& buffers, id<MTLBuffer> fields_buffer,
                                     const std::vector<uint32_t>& order, id<MTLBuffer> indirect_args_buffer,
-                                    DispatchStats* stats, std::string* error) {
+                                    DispatchStats* stats, std::string* error) const {
     const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
@@ -1878,10 +1892,10 @@ bool module_touches_allocation(const ir::Module& module, uint64_t allocation) {
 // Stage 6/7 dispatch (03 §7). A plan that also computes over that same
 // allocation is asking for two incompatible things.
 bool plan_computes_over_allocation(const hal::ExecutionPlan& plan, uint64_t allocation) {
-  if (module_touches_allocation(plan.module, allocation)) return true;
-  for (const auto& pass : plan.effect_dag_passes)
-    if (module_touches_allocation(pass, allocation)) return true;
-  return false;
+  return module_touches_allocation(plan.module, allocation) ||
+         std::ranges::any_of(plan.effect_dag_passes, [allocation](const ir::Module& pass) {
+           return module_touches_allocation(pass, allocation);
+         });
 }
 
 // E004: shared by both the host-assisted and GPU-dispatch submit() paths.
@@ -1921,333 +1935,299 @@ void DeviceHal::reclaim_released_backing(const core::Arena& arena) const {
 const hal::CapabilitySnapshot& DeviceHal::capabilities() const { return impl_->snapshot.hal; }
 const DeviceSnapshot& DeviceHal::snapshot() const { return impl_->snapshot; }
 
+struct DeviceHal::CompileOps {
+  static void init(hal::CompiledPlan* compiled, const hal::ExecutionPlan& plan) {
+    compiled->abi_version = hal::kDeviceHalAbiVersion;
+    compiled->plan = plan;
+    compiled->report = {};
+    compiled->report.backend = hal::BackendKind::Metal;
+  }
+
+  static bool fail(hal::CompiledPlan* compiled, const char* operation, std::string diagnostic,
+                   std::string* error, uint64_t count = 1, uint64_t bytes = 0, const char* reason = nullptr) {
+    compiled->report.supported = false;
+    compiled->report.diagnostic = std::move(diagnostic);
+    compiled->report.add(operation, hal::LoweringClass::Unsupported, count, bytes,
+                         reason != nullptr ? std::string(reason) : compiled->report.diagnostic);
+    if (error) *error = compiled->report.diagnostic;
+    return false;
+  }
+
+  static bool reject_unsupported(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
+                                 std::string* error) {
+    if (plan.requested_certificate_mode == core::AccessCertificateMode::SoftwarePaged ||
+        plan.requested_certificate_mode == core::AccessCertificateMode::FaultManaged) {
+      init(compiled, plan);
+      return fail(compiled, "access_certificate",
+                  "requested access certificate mode is not implemented on this backend", error);
+    }
+    const bool indexed_binding = !is_pointer_graph_module(plan.module) && plan.request_indexed_binding;
+    if (indexed_binding && (!plan.effect_dag_passes.empty() || !plan.task_graph.tasks().empty())) {
+      init(compiled, plan);
+      return fail(compiled, "compute_package",
+                  "indexed binding combined with effect DAG passes or a task graph is out of scope (TASK-B16)",
+                  error);
+    }
+    return true;
+  }
+
+  static bool select_package(DeviceHal& metal, const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
+                             std::string* error) {
+    const bool pointer_graph = is_pointer_graph_module(plan.module);
+    const bool indexed_binding = !pointer_graph && plan.request_indexed_binding;
+    if (indexed_binding) {
+      auto indexed_package = compiler::build_indexed_compute_package(plan.module);
+      if (!indexed_package.ok) { if (error) *error = indexed_package.message; return false; }
+      init(compiled, plan);
+      if (!metal.impl_->probe_gpu_addresses()) {
+        return fail(compiled, "compute_package",
+                    "indexed binding requires MTLBuffer.gpuAddress, unavailable on this OS/device", error, 1,
+                    indexed_package.package.referenced_allocations.size());
+      }
+      compiled->indexed_compute_package = std::move(indexed_package.package);
+      compiled->report.add("compute_package", hal::LoweringClass::Direct, 1, 1,
+                           "MSL source generated by B16 (indexed table binding: " +
+                               std::to_string(compiled->indexed_compute_package->referenced_allocations.size()) +
+                               " referenced allocations addressed through 1 argument-buffer-style gpuAddress table)");
+      return true;
+    }
+    auto package = pointer_graph ? compiler::build_pointer_graph_compute_package(plan.module)
+                                 : compiler::build_linear_compute_package(plan.module);
+    if (!package.ok) { if (error) *error = package.message; return false; }
+    init(compiled, plan);
+    compiled->compute_package = std::move(package.package);
+    compiled->report.add("compute_package",
+                         pointer_graph ? hal::LoweringClass::CachedObject : hal::LoweringClass::Direct, 1,
+                         compiled->compute_package->bindings.size(),
+                         pointer_graph ? "MSL source generated by B15 (CachedObject: static index binding, no device pointer chase)"
+                                       : "MSL source generated by B4");
+    return true;
+  }
+
+  static bool representation_requests(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
+                                     std::string* error) {
+    for (size_t index = 0; index < plan.representation_requests.size(); ++index) {
+      const auto& request = plan.representation_requests[index];
+      std::string request_error;
+      if (!view_expressible(request.view, request.target_kind, request.view.byte_size(), &request_error)) {
+        compiled->representation_supported = false;
+        return fail(compiled, "representation_transform",
+                    "representation request " + std::to_string(index) +
+                        " is not expressible on this Metal device: " + request_error,
+                    error, 1, request.view.byte_size());
+      }
+      if (request.consume_input && plan_computes_over_allocation(plan, request.view.allocation)) {
+        compiled->representation_supported = false;
+        return fail(compiled, "consume_input",
+                    "representation request " + std::to_string(index) +
+                        " is Unsupported: it asks for ConsumeInput on allocation " +
+                        std::to_string(request.view.allocation) +
+                        ", whose linear representation this plan's compute module also reads or writes; the "
+                        "consume releases that backing before the dispatch could run",
+                    error);
+      }
+      compiled->report.add("representation_transform", hal::LoweringClass::DevicePass, 1,
+                           request.view.byte_size(),
+                           "blit every subresource of the linear backing into a Private device-optimal "
+                           "MTLTexture and publish a new RepresentationEpoch at submit()");
+      if (request.consume_input)
+        compiled->report.add("consume_input", hal::LoweringClass::Direct, 1, 0,
+                             "recorded for submit(): the Private texture is storage distinct from the linear "
+                             "backing it supersedes, so a complete ConsumeProof can release that backing at "
+                             "once instead of holding it to command-buffer completion (06 §11)");
+    }
+    return true;
+  }
+
+  static bool timeline(DeviceHal& metal, const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
+                       std::string* error) {
+    if ((plan.timeline_wait != 0 || plan.timeline_signal != 0) && !metal.impl_->snapshot.supports_shared_events) {
+      return fail(compiled, "timeline", "timeline requested but device does not support MTLSharedEvent", error);
+    }
+    return true;
+  }
+
+  static bool effect_dag(DeviceHal& metal, const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
+                         std::string* error) {
+    if (plan.effect_dag_passes.empty()) return true;
+    core::EffectGraphBuilder builder;
+    std::vector<compiler::ComputePackage> packages;
+    std::string pass_error;
+    for (const auto& pass : plan.effect_dag_passes) {
+      const auto pass_package = compiler::build_linear_compute_package(pass);
+      if (!pass_package.ok) {
+        return fail(compiled, "effect_dag_lowering",
+                    "effect DAG pass compilation failed: " + pass_package.message, error);
+      }
+      std::string pipeline_error_for_pass;
+      id<MTLComputePipelineState> pass_pipeline = nil;
+      if (!metal.impl_->ensure_effect_dag_pipeline({pass_package.package.canonical_ir_hash,
+                                                    pass_package.package.metal_source},
+                                                   &pass_pipeline, &pipeline_error_for_pass)) {
+        return fail(compiled, "effect_dag_lowering",
+                    "effect DAG pass compilation failed: " + pipeline_error_for_pass, error);
+      }
+      packages.push_back(pass_package.package);
+      builder.add_node(pass.declared_effects);
+    }
+    for (const auto& dependency : plan.effect_dag_dependencies) {
+      if (!builder.add_dependency(dependency.first, dependency.second, &pass_error)) {
+        return fail(compiled, "effect_dag_lowering", "effect DAG pass compilation failed: " + pass_error,
+                    error);
+      }
+    }
+    core::EffectGraph graph;
+    uint32_t node_count = 0;
+    if (!builder.seal(&graph, &node_count, &pass_error)) {
+      return fail(compiled, "effect_dag_lowering", "effect DAG pass compilation failed: " + pass_error, error);
+    }
+    const core::EffectGraphShape shape = core::classify_effect_graph_shape(graph, node_count);
+    if (shape == core::EffectGraphShape::Unsupported) {
+      return fail(compiled, "effect_dag_lowering",
+                  "effect DAG graph shape is not one of the 3 in-scope shapes (ADR-027)", error, node_count);
+    }
+    compiled->effect_dag_packages = std::move(packages);
+    compiled->effect_dag_graph = graph;
+    compiled->effect_dag_node_count = node_count;
+    compiled->effect_dag_shape = shape;
+    const char* shape_name = "ForkJoin";
+    if (shape == core::EffectGraphShape::LinearChain) shape_name = "LinearChain";
+    else if (shape == core::EffectGraphShape::IndependentBranches) shape_name = "IndependentBranches";
+    compiled->report.add("effect_dag_lowering", hal::LoweringClass::Direct, node_count, 0, shape_name);
+    return true;
+  }
+
+  static bool pipelines(DeviceHal& metal, const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
+                        std::string* error) {
+    const bool pointer_graph = is_pointer_graph_module(plan.module);
+    const bool indexed_binding = compiled->indexed_compute_package.has_value();
+    const bool has_atomic = std::ranges::any_of(plan.module.instructions,
+                                                [](const ir::Instruction& i) { return i.op == "atomic_add"; });
+    std::string pipeline_error;
+    const bool pipeline_ok = indexed_binding
+        ? metal.impl_->ensure_pipeline({compiled->indexed_compute_package->canonical_ir_hash,
+                                        compiled->indexed_compute_package->metal_source},
+                                       &pipeline_error, "vg_indexed_compute")
+        : metal.impl_->ensure_pipeline({compiled->compute_package->canonical_ir_hash,
+                                        compiled->compute_package->metal_source},
+                                       &pipeline_error,
+                                       pointer_graph ? "vg_pointer_graph_compute" : "vg_linear_compute");
+    if (pipeline_ok) {
+      compiled->report.supported = true;
+      compiled->report.add("metal_pipeline", hal::LoweringClass::Direct, 1, 0, "MTLComputePipelineState compiled");
+      if (!plan.task_graph.tasks().empty())
+        compiled->report.add("task_publication", hal::LoweringClass::Direct, plan.task_graph.tasks().size(), 0,
+                             "Metal task ring GPU publication kernel");
+      if (plan.timeline_signal != 0)
+        compiled->report.add("timeline", hal::LoweringClass::Direct, 1, 0, "MTLSharedEvent wait/signal");
+      return effect_dag(metal, plan, compiled, error);
+    }
+    if (has_atomic) {
+      compiled->report.supported = true;
+      compiled->report.add("metal_pipeline", hal::LoweringClass::HostAssisted, 1, 0,
+                           "native 64-bit atomic compile failed, falling back to host execution: " + pipeline_error);
+      if (!plan.task_graph.tasks().empty())
+        compiled->report.add("task_publication", hal::LoweringClass::HostAssisted, plan.task_graph.tasks().size(), 0,
+                             "host-assisted fallback: reference task graph executor");
+      if (plan.timeline_signal != 0)
+        compiled->report.add("timeline", hal::LoweringClass::HostAssisted, 1, 0,
+                             "host-assisted fallback: MTLSharedEvent.signaledValue set from host");
+      return true;
+    }
+    return fail(compiled, "metal_pipeline", "Metal pipeline compilation failed: " + pipeline_error, error, 1, 0,
+                pipeline_error.c_str());
+  }
+};
+
 bool DeviceHal::compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled, std::string* error) {
   if (compiled == nullptr) {
     if (error) *error = "compiled plan output is required";
     return false;
   }
   if (!plan.validate(error)) return false;
-  if (plan.requested_certificate_mode == core::AccessCertificateMode::SoftwarePaged ||
-      plan.requested_certificate_mode == core::AccessCertificateMode::FaultManaged) {
-    compiled->abi_version = hal::kDeviceHalAbiVersion;
-    compiled->plan = plan;
-    compiled->report = {};
-    compiled->report.backend = hal::BackendKind::Metal;
-    compiled->report.supported = false;
-    compiled->report.diagnostic = "requested access certificate mode is not implemented on this backend";
-    compiled->report.add("access_certificate", hal::LoweringClass::Unsupported, 1, 0, compiled->report.diagnostic);
-    if (error) *error = compiled->report.diagnostic;
-    return false;
-  }
-  // TASK-B15 (E002): pointer-graph modules get a dedicated compute package
-  // and are reported CachedObject (ADR-028) -- their load_via/store_via
-  // targets are bound by static index, never a real GPU-side pointer chase.
-  const bool pointer_graph = is_pointer_graph_module(plan.module);
-  // TASK-B16 (E007): request_indexed_binding is meaningless for a
-  // pointer-graph module (mutually exclusive by construction: a
-  // pointer-graph module's opcodes are never load/store-only, which
-  // build_indexed_compute_package requires), so pointer_graph wins the
-  // branch outright rather than needing a combined error path.
-  const bool indexed_binding = !pointer_graph && plan.request_indexed_binding;
-  if (indexed_binding && (!plan.effect_dag_passes.empty() || !plan.task_graph.tasks().empty())) {
-    // Out of scope for this milestone -- mirrors ADR-026's "combining Tier1
-    // with atomic_add is out of scope" precedent: E007 only needs a
-    // standalone binding-cost comparison, not every possible combination.
-    compiled->abi_version = hal::kDeviceHalAbiVersion;
-    compiled->plan = plan;
-    compiled->report = {};
-    compiled->report.backend = hal::BackendKind::Metal;
-    compiled->report.supported = false;
-    compiled->report.diagnostic = "indexed binding combined with effect DAG passes or a task graph is out of scope (TASK-B16)";
-    compiled->report.add("compute_package", hal::LoweringClass::Unsupported, 1, 0, compiled->report.diagnostic);
-    if (error) *error = compiled->report.diagnostic;
-    return false;
-  }
-
-  compiler::ComputePackageResult package;
-  compiler::IndexedComputePackageResult indexed_package;
-  if (indexed_binding) {
-    indexed_package = compiler::build_indexed_compute_package(plan.module);
-    if (!indexed_package.ok) { if (error) *error = indexed_package.message; return false; }
-  } else {
-    package = pointer_graph ? compiler::build_pointer_graph_compute_package(plan.module)
-                           : compiler::build_linear_compute_package(plan.module);
-    if (!package.ok) { if (error) *error = package.message; return false; }
-  }
-
-  compiled->abi_version = hal::kDeviceHalAbiVersion;
-  compiled->plan = plan;
-  compiled->report = {};
-  compiled->report.backend = hal::BackendKind::Metal;
-  if (indexed_binding) {
-    // gpuAddress is queried lazily here rather than trusted from the
-    // capability snapshot's own gpu_addresses bit -- this milestone's
-    // honest-degradation result depends on a real, just-in-time check of
-    // what this OS/device combination actually supports, not a stale
-    // capability bit.
-    if (!impl_->probe_gpu_addresses()) {
-      compiled->report.supported = false;
-      compiled->report.diagnostic = "indexed binding requires MTLBuffer.gpuAddress, unavailable on this OS/device";
-      compiled->report.add("compute_package", hal::LoweringClass::Unsupported, 1,
-                           indexed_package.package.referenced_allocations.size(), compiled->report.diagnostic);
-      if (error) *error = compiled->report.diagnostic;
-      return false;
-    }
-    compiled->indexed_compute_package = indexed_package.package;
-    // Real device-pointer dereference through one argument-buffer-style
-    // table -- Direct, not CachedObject, since every access genuinely goes
-    // through a live GPU virtual address, not a statically-resolved index.
-    // bytes reuses the existing binding-count convention: 1 (the table),
-    // the direct contrast against build_linear_compute_package's N bindings.
-    compiled->report.add("compute_package", hal::LoweringClass::Direct, 1, 1,
-                         "MSL source generated by B16 (indexed table binding: " +
-                         std::to_string(indexed_package.package.referenced_allocations.size()) +
-                         " referenced allocations addressed through 1 argument-buffer-style gpuAddress table)");
-  } else {
-    compiled->compute_package = package.package;
-    compiled->report.add("compute_package", pointer_graph ? hal::LoweringClass::CachedObject : hal::LoweringClass::Direct,
-                         1, package.package.bindings.size(),
-                         pointer_graph ? "MSL source generated by B15 (CachedObject: static index binding, no device pointer chase)"
-                                       : "MSL source generated by B4");
-  }
-
-  // Stage 5's input (03 §7/§8: "每个 Region 的所需 facet 与 representation
-  // version 已固定"). This backend has a real transform -- a linear ->
-  // Private-optimal blit that publishes a new RepresentationEpoch (02 §8) --
-  // so a request it can express is accepted here and actually performed by
-  // submit(). What compile() must not do is perform it: a ConsumeInput is a
-  // destructive act on the live arena, and compile() is handed no arena at
-  // all. So a request carrying consume_input is recorded as work submit() will
-  // do, never consumed at compile time, and never inferred by the adapter on
-  // its own (06 §11: "adapter 不自行推断破坏性转换").
-  //
-  // A request whose shape this device cannot express is reported Unsupported
-  // with the VG-concept reason and fails the compile, rather than being dropped
-  // while compile() reports success as if none had been asked for (START.md §4
-  // invariant 10).
-  for (size_t index = 0; index < plan.representation_requests.size(); ++index) {
-    const auto& request = plan.representation_requests[index];
-    std::string request_error;
-    if (!view_expressible(request.view, request.target_kind, request.view.byte_size(), &request_error)) {
-      compiled->representation_supported = false;
-      compiled->report.supported = false;
-      compiled->report.diagnostic = "representation request " + std::to_string(index) +
-                                    " is not expressible on this Metal device: " + request_error;
-      compiled->report.add("representation_transform", hal::LoweringClass::Unsupported, 1,
-                           request.view.byte_size(), compiled->report.diagnostic);
-      if (error) *error = compiled->report.diagnostic;
-      return false;
-    }
-    // Same refusal Vulkan's can_lower_representation_requests makes: ConsumeInput
-    // releases the linear backing at once, and Stage 5 runs before this
-    // submission's compute. Computing over that same allocation would dispatch
-    // against a buffer whose bytes were just handed back (START.md §4, invariant 10).
-    if (request.consume_input && plan_computes_over_allocation(plan, request.view.allocation)) {
-      compiled->representation_supported = false;
-      compiled->report.supported = false;
-      compiled->report.diagnostic =
-          "representation request " + std::to_string(index) +
-          " is Unsupported: it asks for ConsumeInput on allocation " +
-          std::to_string(request.view.allocation) +
-          ", whose linear representation this plan's compute module also reads or writes; the "
-          "consume releases that backing before the dispatch could run";
-      compiled->report.add("consume_input", hal::LoweringClass::Unsupported, 1, 0,
-                           compiled->report.diagnostic);
-      if (error) *error = compiled->report.diagnostic;
-      return false;
-    }
-    compiled->report.add("representation_transform", hal::LoweringClass::DevicePass, 1,
-                         request.view.byte_size(),
-                         "blit every subresource of the linear backing into a Private device-optimal "
-                         "MTLTexture and publish a new RepresentationEpoch at submit()");
-    if (request.consume_input)
-      compiled->report.add("consume_input", hal::LoweringClass::Direct, 1, 0,
-                           "recorded for submit(): the Private texture is storage distinct from the linear "
-                           "backing it supersedes, so a complete ConsumeProof can release that backing at "
-                           "once instead of holding it to command-buffer completion (06 §11)");
-  }
-
-  // A timeline wait/signal that this device cannot honor natively must be
-  // rejected outright, not silently dropped -- MTLSharedEvent is the only
-  // timeline mechanism this backend has (see Impl::timeline_event's doc
-  // comment for why no separate host-side mirror exists to fall back to).
-  if ((plan.timeline_wait != 0 || plan.timeline_signal != 0) && !impl_->snapshot.supports_shared_events) {
-    compiled->report.supported = false;
-    compiled->report.diagnostic = "timeline requested but device does not support MTLSharedEvent";
-    compiled->report.add("timeline", hal::LoweringClass::Unsupported, 1, 0, compiled->report.diagnostic);
-    if (error) *error = compiled->report.diagnostic;
-    return false;
-  }
-
-  const bool has_atomic = std::ranges::any_of(plan.module.instructions,
-                                      [](const ir::Instruction& i) { return i.op == "atomic_add"; });
-
-  std::string pipeline_error;
-  const bool pipeline_ok = indexed_binding
-      ? impl_->ensure_pipeline({indexed_package.package.canonical_ir_hash, indexed_package.package.metal_source},
-                              &pipeline_error, "vg_indexed_compute")
-      : impl_->ensure_pipeline({package.package.canonical_ir_hash, package.package.metal_source}, &pipeline_error,
-                              pointer_graph ? "vg_pointer_graph_compute" : "vg_linear_compute");
-  if (pipeline_ok) {
-    compiled->report.supported = true;
-    compiled->report.add("metal_pipeline", hal::LoweringClass::Direct, 1, 0, "MTLComputePipelineState compiled");
-    if (!plan.task_graph.tasks().empty())
-      compiled->report.add("task_publication", hal::LoweringClass::Direct, plan.task_graph.tasks().size(), 0,
-                           "Metal task ring GPU publication kernel");
-    if (plan.timeline_signal != 0)
-      compiled->report.add("timeline", hal::LoweringClass::Direct, 1, 0, "MTLSharedEvent wait/signal");
-
-    if (!plan.effect_dag_passes.empty()) {
-      // TASK-B14 (E012): compile every pass independently (a fresh
-      // build_linear_compute_package call each time, rather than trusting
-      // `plan.module`/`package` above to be pass 0 by convention) and build
-      // the EffectGraph from each pass's declared_effects plus
-      // effect_dag_dependencies, mirroring TaskGraphBuilder's (before,
-      // after) dependency-pair shape.
-      core::EffectGraphBuilder builder;
-      std::vector<compiler::ComputePackage> packages;
-      bool passes_ok = true;
-      std::string pass_error;
-      for (const auto& pass : plan.effect_dag_passes) {
-        const auto pass_package = compiler::build_linear_compute_package(pass);
-        if (!pass_package.ok) { passes_ok = false; pass_error = pass_package.message; break; }
-        std::string pipeline_error_for_pass;
-        id<MTLComputePipelineState> pass_pipeline = nil;
-        if (!impl_->ensure_effect_dag_pipeline({pass_package.package.canonical_ir_hash,
-                                               pass_package.package.metal_source}, &pass_pipeline,
-                                               &pipeline_error_for_pass)) {
-          passes_ok = false;
-          pass_error = pipeline_error_for_pass;
-          break;
-        }
-        packages.push_back(pass_package.package);
-        builder.add_node(pass.declared_effects);
-      }
-      if (passes_ok) {
-        for (const auto& dependency : plan.effect_dag_dependencies) {
-          if (!builder.add_dependency(dependency.first, dependency.second, &pass_error)) { passes_ok = false; break; }
-        }
-      }
-      core::EffectGraph graph;
-      uint32_t node_count = 0;
-      if (passes_ok && !builder.seal(&graph, &node_count, &pass_error)) passes_ok = false;
-
-      if (!passes_ok) {
-        compiled->report.supported = false;
-        compiled->report.diagnostic = "effect DAG pass compilation failed: " + pass_error;
-        compiled->report.add("effect_dag_lowering", hal::LoweringClass::Unsupported, 1, 0,
-                             compiled->report.diagnostic);
-        if (error) *error = compiled->report.diagnostic;
-        return false;
-      }
-
-      const core::EffectGraphShape shape = core::classify_effect_graph_shape(graph, node_count);
-      if (shape == core::EffectGraphShape::Unsupported) {
-        // Honest scope-boundary result, not a guessed fence placement (ADR-027):
-        // "cross queue", representation-transition, and external-present
-        // shaped graphs are deliberately reported Unsupported here rather
-        // than lowered with an unverified synchronization strategy.
-        compiled->report.supported = false;
-        compiled->report.diagnostic = "effect DAG graph shape is not one of the 3 in-scope shapes (ADR-027)";
-        compiled->report.add("effect_dag_lowering", hal::LoweringClass::Unsupported, node_count, 0,
-                             compiled->report.diagnostic);
-        if (error) *error = compiled->report.diagnostic;
-        return false;
-      }
-
-      compiled->effect_dag_packages = std::move(packages);
-      compiled->effect_dag_graph = graph;
-      compiled->effect_dag_node_count = node_count;
-      compiled->effect_dag_shape = shape;
-      const char* shape_name = shape == core::EffectGraphShape::LinearChain       ? "LinearChain"
-                               : shape == core::EffectGraphShape::IndependentBranches ? "IndependentBranches"
-                                                                                       : "ForkJoin";
-      compiled->report.add("effect_dag_lowering", hal::LoweringClass::Direct, node_count, 0, shape_name);
-    }
-    return true;
-  }
-
-  if (has_atomic) {
-    // Native 64-bit atomics aren't available on this GPU/driver/OS
-    // combination. Never silently truncate to a 32-bit atomic -- fall back
-    // to an explicit host round trip using the same byte semantics as the
-    // reference oracle, and say so in the diagnostic. Task publication and
-    // timeline signaling fall back to the same host path: the compute
-    // kernel and the task ring kernel are separate pipelines, but once
-    // submission already has to leave the GPU for correctness, routing
-    // everything through the reference oracle is simpler than -- and
-    // exactly as correct as -- keeping only the task ring on GPU.
-    compiled->report.supported = true;
-    compiled->report.add("metal_pipeline", hal::LoweringClass::HostAssisted, 1, 0,
-                         "native 64-bit atomic compile failed, falling back to host execution: " + pipeline_error);
-    if (!plan.task_graph.tasks().empty())
-      compiled->report.add("task_publication", hal::LoweringClass::HostAssisted, plan.task_graph.tasks().size(), 0,
-                           "host-assisted fallback: reference task graph executor");
-    if (plan.timeline_signal != 0)
-      compiled->report.add("timeline", hal::LoweringClass::HostAssisted, 1, 0,
-                           "host-assisted fallback: MTLSharedEvent.signaledValue set from host");
-    return true;
-  }
-
-  compiled->report.supported = false;
-  compiled->report.diagnostic = "Metal pipeline compilation failed: " + pipeline_error;
-  compiled->report.add("metal_pipeline", hal::LoweringClass::Unsupported, 1, 0, pipeline_error);
-  if (error) *error = compiled->report.diagnostic;
-  return false;
+  if (!CompileOps::reject_unsupported(plan, compiled, error)) return false;
+  if (!CompileOps::select_package(*this, plan, compiled, error)) return false;
+  if (!CompileOps::representation_requests(plan, compiled, error)) return false;
+  if (!CompileOps::timeline(*this, plan, compiled, error)) return false;
+  return CompileOps::pipelines(*this, plan, compiled, error);
 }
 
-bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, hal::Submission* submission,
-                       std::string* error) {
-  if (submission == nullptr) { if (error) *error = "submission output is required"; return false; }
-  if (!compiled.report.supported) { if (error) *error = "compiled plan is unsupported"; return false; }
-  if (!compiled.compute_package.has_value() && !compiled.indexed_compute_package.has_value()) {
-    if (error) *error = "compiled plan has no compute package";
-    return false;
+
+struct DeviceHal::SubmitOps {
+  enum class Flow { Fail, Finish, Continue };
+
+  static bool take(Flow flow, bool* result) {
+    if (flow == Flow::Continue) return false;
+    *result = (flow == Flow::Finish);
+    return true;
   }
-  if (!compiled.plan.graph_epoch_matches(arena, error)) return false;
 
-  submission->abi_version = hal::kDeviceHalAbiVersion;
-  submission->report = compiled.report;
-  // TASK-D2 / ADR-036 then TASK-D3 / ADR-037: discovery (if seeds are set)
-  // then this-submit residency. Empty seeds / unset budget are no-ops.
-  if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
-  if (!hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
+  static void apply_stats(const DispatchStats& stats, hal::Submission* submission) {
+    submission->cpu_encode_ns = stats.cpu_encode_ns;
+    submission->cpu_submit_ns = stats.cpu_submit_ns;
+    submission->report.encoder_count = stats.encoder_count;
+    submission->report.command_buffer_count = stats.command_buffer_count;
+    submission->report.barrier_count = stats.barrier_count;
+    submission->report.queue_wait_count = stats.queue_wait_count;
+  }
 
-  // Stage 5 precedes Stage 6/7 (03 §7): the Region representations a
-  // submission depends on are published, and the facets that depend on them
-  // acquired, before any dispatch encodes against them. The epoch/facet/consume
-  // bookkeeping itself is the shared helper's -- if each backend kept its own,
-  // the two could disagree about when a token goes stale and the cross-backend
-  // differential of 10 §6 would be comparing two different semantics. Only the
-  // physical step below is this backend's, and it is a real device pass.
-  //
-  // distinct_backing is true because it is true: the Private texture is storage
-  // independent of the linear allocation it supersedes, so releasing that
-  // backing under a ConsumeInput really does hand memory back (the reference
-  // backend reports false for the opposite, equally honest reason -- its
-  // transform is the identity). This flag is the whole Metal-side obligation
-  // ConsumeInput has, besides genuinely not needing the old linear bytes once
-  // the blit has completed, which it does not.
-  //
-  // A plan carrying no request leaves every Stage 5 field of `submission` at
-  // its default and costs nothing, so every pre-Stage-5 caller is unaffected.
-  {
+  static std::map<uint64_t, std::pair<uint32_t, uint32_t>> generations(const ir::Module& module) {
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> map;
+    for (const auto& instruction : module.instructions)
+      map.emplace(instruction.allocation,
+                  std::make_pair(instruction.generation, instruction.representation_epoch));
+    return map;
+  }
+
+  static bool bind(DeviceHal& metal, core::Arena& arena, uint64_t allocation, uint32_t generation,
+                   uint32_t epoch, id<MTLBuffer>* buffer, core::Allocation** touched,
+                   hal::Submission* submission) {
+    *touched = arena.lookup(core::RepresentationRef{allocation, generation, epoch});
+    if (*touched == nullptr) {
+      submission->result.ok = false;
+      submission->result.poison = core::PoisonState::Poisoned;
+      submission->result.message = "stale generation, representation epoch, or out-of-bounds allocation reference";
+      return false;
+    }
+    *buffer = metal.impl_->ensure_buffer(**touched);
+    if (*buffer == nil) {
+      submission->result.ok = false;
+      submission->result.message = "Metal buffer allocation failed";
+      return false;
+    }
+    return true;
+  }
+
+  static bool begin(const hal::CompiledPlan& compiled, core::Arena& arena, hal::Submission* submission,
+                    std::string* error) {
+    if (submission == nullptr) { if (error) *error = "submission output is required"; return false; }
+    if (!compiled.report.supported) { if (error) *error = "compiled plan is unsupported"; return false; }
+    if (!compiled.compute_package.has_value() && !compiled.indexed_compute_package.has_value()) {
+      if (error) *error = "compiled plan has no compute package";
+      return false;
+    }
+    if (!compiled.plan.graph_epoch_matches(arena, error)) return false;
+    submission->abi_version = hal::kDeviceHalAbiVersion;
+    submission->report = compiled.report;
+    if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
+    if (!hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
+    return true;
+  }
+
+  static bool stage5(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
+                     hal::Submission* submission, std::string* error) {
     std::string representation_error;
     if (!hal::run_representation_stage(
-            compiled.plan.representation_requests, arena, facet_pool(),
+            compiled.plan.representation_requests, arena, metal.facet_pool(),
             [&](const hal::RepresentationRequest& request, core::FacetRef facet,
                 hal::RepresentationTransformCost* cost, std::string* physical_error) {
               Impl::TransformCost transform_cost;
-              if (!impl_->transform_into_private_facet(arena, facet_pool(), request.view,
-                                                       request.target_kind, facet, &transform_cost,
-                                                       physical_error))
+              if (!metal.impl_->transform_into_private_facet(arena, metal.facet_pool(), request.view,
+                                                             request.target_kind, facet, &transform_cost,
+                                                             physical_error))
                 return false;
               cost->new_backing_bytes = transform_cost.new_backing_bytes;
               cost->temporary_bytes = transform_cost.temporary_bytes;
-              // No MTLHeap is involved on this path -- the texture comes
-              // straight from the device -- so there is no fragmentation this
-              // backend can observe, and 0 is the measurement rather than a
-              // placeholder.
               cost->heap_fragmentation_bytes = 0;
               cost->used_device_optimal = true;
               cost->distinct_backing = true;
@@ -2257,13 +2237,9 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       if (error) *error = representation_error;
       return false;
     }
-    // The helper owns the host-side consume; this backend must actually drop
-    // the Shared blit source and any MTLTexture whose FacetRef no longer
-    // resolves, or released_backing_bytes would describe a saving that never
-    // happened on the device (06 §11, Vulkan 07 §14's same follow-through).
     uint32_t retired_textures = 0;
     uint64_t released_linear = 0;
-    impl_->reclaim_released_backing(arena, facet_pool(), &retired_textures, &released_linear);
+    metal.impl_->reclaim_released_backing(arena, metal.facet_pool(), &retired_textures, &released_linear);
     if (retired_textures != 0) {
       submission->report.add("facet_texture_retire", hal::LoweringClass::Direct, retired_textures, 0,
                              "MTLTextures belonging to retired facet slots or superseded "
@@ -2274,27 +2250,23 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
                              "the superseded linear representation's device buffer was destroyed at once "
                              "rather than retained to command-buffer completion (06 §11, E005)");
     }
+    return true;
   }
 
-  const uint64_t wait_value = compiled.plan.timeline_wait;
-  const uint64_t signal_value = compiled.plan.timeline_signal;
-  // Pre-checked host-side, exactly like reference::execute()'s
-  // Timeline::validate_wait/signal: this backend fails fast on an
-  // unsatisfied wait or a non-monotonic signal rather than letting the GPU
-  // block forever on encodeWaitForEvent: for a value nothing will ever
-  // reach in these single-command-buffer submissions.
-  if (wait_value != 0 || signal_value != 0) {
+  static Flow precheck_timeline(DeviceHal& metal, uint64_t wait_value, uint64_t signal_value,
+                                hal::Submission* submission) {
+    if (wait_value == 0 && signal_value == 0) return Flow::Continue;
     std::string timeline_error;
-    if (!impl_->ensure_timeline_event(&timeline_error)) {
+    if (!metal.impl_->ensure_timeline_event(&timeline_error)) {
       submission->result.ok = false;
       submission->result.outputs_valid = false;
       submission->result.poison = core::PoisonState::Poisoned;
       submission->result.message = timeline_error;
       submission->result.fault.code = "TIMELINE_UNAVAILABLE";
       submission->result.fault.message = timeline_error;
-      return true;
+      return Flow::Finish;
     }
-    const uint64_t current = impl_->timeline_event.signaledValue;
+    const uint64_t current = metal.impl_->timeline_event.signaledValue;
     if (wait_value != 0 && current < wait_value) {
       submission->result.ok = false;
       submission->result.outputs_valid = false;
@@ -2302,7 +2274,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       submission->result.message = "timeline wait point is unsatisfied";
       submission->result.fault.code = "TIMELINE_WAIT_UNSATISFIED";
       submission->result.fault.message = submission->result.message;
-      return true;
+      return Flow::Finish;
     }
     if (signal_value != 0 && signal_value <= current) {
       submission->result.ok = false;
@@ -2311,21 +2283,24 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       submission->result.message = "timeline signal must be strictly monotonic";
       submission->result.fault.code = "TIMELINE_SIGNAL_NOT_MONOTONIC";
       submission->result.fault.message = submission->result.message;
-      return true;
+      return Flow::Finish;
     }
+    return Flow::Continue;
   }
 
-  if (has_host_assisted_pipeline(compiled.report)) {
+  static Flow host_assisted(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
+                            uint64_t signal_value, hal::Submission* submission, std::string* error) {
+    if (!has_host_assisted_pipeline(compiled.report)) return Flow::Continue;
     const auto host_start = std::chrono::steady_clock::now();
     submission->result = reference::execute(
         compiled.plan.module, arena, compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate);
-    if (submission->result.ok && signal_value != 0) impl_->timeline_event.signaledValue = signal_value;
-    submission->timeline_value = impl_->timeline_event != nil ? impl_->timeline_event.signaledValue : 0;
+    if (submission->result.ok && signal_value != 0) metal.impl_->timeline_event.signaledValue = signal_value;
+    submission->timeline_value = metal.impl_->timeline_event != nil ? metal.impl_->timeline_event.signaledValue : 0;
     if (submission->result.ok && !compiled.plan.task_graph.tasks().empty()) {
       std::vector<uint32_t> order;
-      if (!hal::apply_envelope_continuation(compiled.plan, &envelope_continuations_, submission, &order,
+      if (!hal::apply_envelope_continuation(compiled.plan, &metal.envelope_continuations(), submission, &order,
                                             error))
-        return false;
+        return Flow::Fail;
       std::string publish_error;
       if (!publish_envelope_order(compiled.plan.task_graph, order, &submission->published_tasks,
                                   &publish_error)) {
@@ -2334,17 +2309,14 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       }
     }
     const auto host_end = std::chrono::steady_clock::now();
-    // No GPU dispatch happens on this path -- it's a host-assisted fallback
-    // (see compile()'s "native 64-bit atomic compile failed" branch), so all
-    // of the wall-clock time is attributed to cpu_submit_ns and none to
-    // cpu_encode_ns/the encoder-and-command-buffer counters, which stay 0.
     submission->cpu_submit_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(host_end - host_start).count();
     attach_access_certificate(compiled, arena, submission);
-    return true;
+    return Flow::Finish;
   }
 
-  if (!compiled.plan.certificate.ranges.empty()) {
+  static Flow certificate(const hal::CompiledPlan& compiled, hal::Submission* submission) {
+    if (compiled.plan.certificate.ranges.empty()) return Flow::Continue;
     const auto verification = ir::verify(compiled.plan.module);
     for (const auto& effect : verification.inferred_effects) {
       if (!compiled.plan.certificate.covers(effect)) {
@@ -2352,103 +2324,71 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
         submission->result.poison = core::PoisonState::Poisoned;
         submission->result.message = "certificate does not cover inferred effect";
         submission->result.missing_effects.push_back(effect);
-        return true;
+        return Flow::Finish;
       }
     }
+    return Flow::Continue;
   }
 
-  if (!compiled.plan.effect_dag_passes.empty()) {
-    // TASK-B14 (E012): entirely bypasses the single-module buffer-bind +
-    // dispatch_and_wait path below -- plan.module is only pass 0 by
-    // convention (kept solely so ExecutionPlan::validate()'s ir::verify()
-    // call has something to check), so dispatching it separately here would
-    // double-dispatch pass 0's work. task_graph combined with
-    // effect_dag_passes is out of scope for this milestone (mirrors ADR-026's
-    // "combining Tier1 with atomic_add is out of scope" precedent).
+  static Flow effect_dag(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
+                         hal::Submission* submission) {
+    if (compiled.plan.effect_dag_passes.empty()) return Flow::Continue;
     if (compiled.effect_dag_shape == core::EffectGraphShape::Unsupported ||
         compiled.effect_dag_packages.size() != compiled.plan.effect_dag_passes.size()) {
       submission->result.ok = false;
       submission->result.message = "compiled plan has no usable effect DAG lowering";
-      return true;
+      return Flow::Finish;
     }
-
     std::vector<id<MTLComputePipelineState>> pass_pipelines;
     std::vector<std::vector<id<MTLBuffer>>> pass_buffers;
     std::map<uint64_t, core::Allocation*> touched_by_id;
     std::map<uint64_t, id<MTLBuffer>> buffer_by_allocation_id;
-
     for (size_t pass_index = 0; pass_index < compiled.plan.effect_dag_passes.size(); ++pass_index) {
       const auto& pass_module = compiled.plan.effect_dag_passes[pass_index];
       const auto& pass_package = compiled.effect_dag_packages[pass_index];
-
       std::string pipeline_error;
       id<MTLComputePipelineState> pass_pipeline = nil;
-      if (!impl_->ensure_effect_dag_pipeline({pass_package.canonical_ir_hash, pass_package.metal_source},
-                                             &pass_pipeline, &pipeline_error)) {
+      if (!metal.impl_->ensure_effect_dag_pipeline({pass_package.canonical_ir_hash, pass_package.metal_source},
+                                                   &pass_pipeline, &pipeline_error)) {
         submission->result.ok = false;
         submission->result.message = "Metal effect DAG pipeline compile failed: " + pipeline_error;
-        return true;
+        return Flow::Finish;
       }
       pass_pipelines.push_back(pass_pipeline);
-
-      std::map<uint64_t, std::pair<uint32_t, uint32_t>> pass_generation_by_allocation;
-      for (const auto& instruction : pass_module.instructions)
-        pass_generation_by_allocation.emplace(
-            instruction.allocation, std::make_pair(instruction.generation, instruction.representation_epoch));
-
+      const auto pass_generation_by_allocation = generations(pass_module);
       std::vector<id<MTLBuffer>> buffers_for_pass;
       for (const auto& binding : pass_package.bindings) {
         auto it = pass_generation_by_allocation.find(binding.allocation);
-        core::Allocation* allocation = it == pass_generation_by_allocation.end()
-            ? nullptr
-            : arena.lookup(core::RepresentationRef{binding.allocation, it->second.first, it->second.second});
-        if (allocation == nullptr) {
-          submission->result.ok = false;
-          submission->result.poison = core::PoisonState::Poisoned;
-          submission->result.message = "stale generation, representation epoch, or out-of-bounds allocation reference";
-          return true;
-        }
-        id<MTLBuffer> buffer = impl_->ensure_buffer(*allocation);
-        if (buffer == nil) {
-          submission->result.ok = false;
-          submission->result.message = "Metal buffer allocation failed";
-          return true;
-        }
+        id<MTLBuffer> buffer = nil;
+        core::Allocation* allocation = nullptr;
+        if (it == pass_generation_by_allocation.end() ||
+            !bind(metal, arena, binding.allocation, it->second.first, it->second.second, &buffer, &allocation,
+                  submission))
+          return Flow::Finish;
         buffers_for_pass.push_back(buffer);
         touched_by_id.emplace(allocation->id, allocation);
         buffer_by_allocation_id[allocation->id] = buffer;
       }
       pass_buffers.push_back(std::move(buffers_for_pass));
     }
-
     DispatchStats stats;
     std::string dispatch_error;
-    if (!impl_->dispatch_effect_dag(pass_pipelines, pass_buffers, compiled.effect_dag_shape,
-                                    compiled.effect_dag_graph, compiled.effect_dag_node_count, &stats,
-                                    &dispatch_error)) {
+    if (!metal.impl_->dispatch_effect_dag(pass_pipelines, pass_buffers, compiled.effect_dag_shape,
+                                          compiled.effect_dag_graph, compiled.effect_dag_node_count, &stats,
+                                          &dispatch_error)) {
       submission->result.ok = false;
       submission->result.message = "Metal effect DAG dispatch failed: " + dispatch_error;
-      return true;
+      return Flow::Finish;
     }
-    submission->timeline_value = impl_->timeline_event != nil ? impl_->timeline_event.signaledValue : 0;
-
-    // Shared storage + dispatch_effect_dag's synchronous waitUntilCompleted
-    // mean it is safe to read every touched allocation's bytes back now, once,
-    // after all passes have run -- a shared allocation that appears in
-    // multiple passes (the ForkJoin conflict case) is deduped by id here so
-    // it is only copied back once.
+    submission->timeline_value = metal.impl_->timeline_event != nil ? metal.impl_->timeline_event.signaledValue : 0;
     for (const auto& entry : touched_by_id) {
       id<MTLBuffer> buffer = buffer_by_allocation_id[entry.first];
       std::memcpy(entry.second->bytes.data(), [buffer contents], entry.second->bytes.size());
     }
-
     uint32_t witness_index = 0;
     for (const auto& pass_module : compiled.plan.effect_dag_passes) {
       for (const auto& instruction : pass_module.instructions) {
-        const ir::Access access = instruction.op == "load"       ? ir::Access::Read
-                                  : instruction.op == "store"     ? ir::Access::Write
-                                  : instruction.op == "atomic_add" ? ir::Access::Atomic
-                                                                    : ir::Access::Publish;
+        const ir::Access access = ir::access_from_op(instruction.op, ir::Access::Publish);
         const ir::Effect effect{instruction.allocation, instruction.offset, instruction.size, access,
                                 instruction.representation_epoch};
         submission->result.trace.push_back(effect);
@@ -2457,61 +2397,40 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
     }
     submission->result.ok = true;
     submission->result.poison = core::PoisonState::Valid;
-    submission->cpu_encode_ns = stats.cpu_encode_ns;
-    submission->cpu_submit_ns = stats.cpu_submit_ns;
-    submission->report.encoder_count = stats.encoder_count;
-    submission->report.command_buffer_count = stats.command_buffer_count;
-    submission->report.barrier_count = stats.barrier_count;
-    submission->report.queue_wait_count = stats.queue_wait_count;
+    apply_stats(stats, submission);
     attach_access_certificate(compiled, arena, submission);
-    return true;
+    return Flow::Finish;
   }
 
-  if (compiled.indexed_compute_package.has_value()) {
-    // TASK-B16 (E007): self-contained -- guaranteed no task_graph/effect_dag
-    // interaction to handle here, since compile() rejected that combination
-    // outright (mirrors the effect_dag branch above's own early return).
+  static Flow indexed(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
+                      uint64_t wait_value, uint64_t signal_value, hal::Submission* submission) {
+    if (!compiled.indexed_compute_package.has_value()) return Flow::Continue;
     const auto& indexed_package = *compiled.indexed_compute_package;
-    std::map<uint64_t, std::pair<uint32_t, uint32_t>> generation_by_allocation;
-    for (const auto& instruction : compiled.plan.module.instructions)
-      generation_by_allocation.emplace(instruction.allocation,
-                                       std::make_pair(instruction.generation, instruction.representation_epoch));
-
+    const auto generation_by_allocation = generations(compiled.plan.module);
     std::vector<id<MTLBuffer>> object_buffers;
     std::vector<core::Allocation*> touched;
     for (uint64_t allocation_id : indexed_package.referenced_allocations) {
       auto it = generation_by_allocation.find(allocation_id);
-      core::Allocation* allocation = it == generation_by_allocation.end()
-          ? nullptr
-          : arena.lookup(core::RepresentationRef{allocation_id, it->second.first, it->second.second});
-      if (allocation == nullptr) {
-        submission->result.ok = false;
-        submission->result.poison = core::PoisonState::Poisoned;
-        submission->result.message = "stale generation, representation epoch, or out-of-bounds allocation reference";
-        return true;
-      }
-      id<MTLBuffer> buffer = impl_->ensure_buffer(*allocation);
-      if (buffer == nil) {
-        submission->result.ok = false;
-        submission->result.message = "Metal buffer allocation failed";
-        return true;
-      }
+      id<MTLBuffer> buffer = nil;
+      core::Allocation* allocation = nullptr;
+      if (it == generation_by_allocation.end() ||
+          !bind(metal, arena, allocation_id, it->second.first, it->second.second, &buffer, &allocation,
+                submission))
+        return Flow::Finish;
       object_buffers.push_back(buffer);
       touched.push_back(allocation);
     }
-
     DispatchStats stats;
     std::string dispatch_error;
-    if (!impl_->dispatch_indexed_and_wait(object_buffers, {.wait = wait_value, .signal = signal_value}, &stats, &dispatch_error)) {
+    if (!metal.impl_->dispatch_indexed_and_wait(object_buffers, {.wait = wait_value, .signal = signal_value}, &stats,
+                                                &dispatch_error)) {
       submission->result.ok = false;
       submission->result.message = "Metal indexed dispatch failed: " + dispatch_error;
-      return true;
+      return Flow::Finish;
     }
-    submission->timeline_value = impl_->timeline_event != nil ? impl_->timeline_event.signaledValue : 0;
-
+    submission->timeline_value = metal.impl_->timeline_event != nil ? metal.impl_->timeline_event.signaledValue : 0;
     for (size_t index = 0; index < touched.size(); ++index)
       std::memcpy(touched[index]->bytes.data(), [object_buffers[index] contents], touched[index]->bytes.size());
-
     for (size_t index = 0; index < compiled.plan.module.instructions.size(); ++index) {
       const auto& instruction = compiled.plan.module.instructions[index];
       const ir::Access access = instruction.op == "load" ? ir::Access::Read : ir::Access::Write;
@@ -2522,141 +2441,61 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
     }
     submission->result.ok = true;
     submission->result.poison = core::PoisonState::Valid;
-    submission->cpu_encode_ns = stats.cpu_encode_ns;
-    submission->cpu_submit_ns = stats.cpu_submit_ns;
-    submission->report.encoder_count = stats.encoder_count;
-    submission->report.command_buffer_count = stats.command_buffer_count;
-    submission->report.barrier_count = stats.barrier_count;
-    submission->report.queue_wait_count = stats.queue_wait_count;
+    apply_stats(stats, submission);
     attach_access_certificate(compiled, arena, submission);
-    return true;
+    return Flow::Finish;
   }
 
-  const auto& package = *compiled.compute_package;
-  std::map<uint64_t, std::pair<uint32_t, uint32_t>> generation_by_allocation;
-  for (const auto& instruction : compiled.plan.module.instructions)
-    generation_by_allocation.emplace(instruction.allocation,
-                                     std::make_pair(instruction.generation, instruction.representation_epoch));
-
-  std::vector<id<MTLBuffer>> buffers;
-  std::vector<core::Allocation*> touched;
-  for (const auto& binding : package.bindings) {
-    auto it = generation_by_allocation.find(binding.allocation);
-    core::Allocation* allocation = it == generation_by_allocation.end()
-        ? nullptr
-        : arena.lookup(core::RepresentationRef{binding.allocation, it->second.first, it->second.second});
-    if (allocation == nullptr) {
-      submission->result.ok = false;
-      submission->result.poison = core::PoisonState::Poisoned;
-      submission->result.message = "stale generation, representation epoch, or out-of-bounds allocation reference";
-      return true;
-    }
-    id<MTLBuffer> buffer = impl_->ensure_buffer(*allocation);
-    if (buffer == nil) {
-      submission->result.ok = false;
-      submission->result.message = "Metal buffer allocation failed";
-      return true;
-    }
-    buffers.push_back(buffer);
-    touched.push_back(allocation);
-  }
-
-  DispatchStats stats;
-  std::string dispatch_error;
-  if (!impl_->dispatch_and_wait(buffers, {}, {.wait = wait_value, .signal = signal_value}, &stats, &dispatch_error)) {
-    submission->result.ok = false;
-    submission->result.message = "Metal dispatch failed: " + dispatch_error;
-    return true;
-  }
-  submission->timeline_value = impl_->timeline_event != nil ? impl_->timeline_event.signaledValue : 0;
-
-  for (size_t index = 0; index < touched.size(); ++index)
-    std::memcpy(touched[index]->bytes.data(), [buffers[index] contents], touched[index]->bytes.size());
-
-  for (size_t index = 0; index < compiled.plan.module.instructions.size(); ++index) {
-    const auto& instruction = compiled.plan.module.instructions[index];
-    const ir::Access access = instruction.op == "load"       ? ir::Access::Read
-                              : instruction.op == "store"     ? ir::Access::Write
-                              : instruction.op == "atomic_add" ? ir::Access::Atomic
-                              : instruction.op == "load_ref"   ? ir::Access::Read
-                              : instruction.op == "load_via"   ? ir::Access::Read
-                              : instruction.op == "store_via"  ? ir::Access::Write
-                                                                : ir::Access::Publish;
-    const ir::Effect effect{instruction.allocation, instruction.offset, instruction.size, access,
-                            instruction.representation_epoch};
-    submission->result.trace.push_back(effect);
-    submission->result.witness.record(effect, static_cast<uint32_t>(index));
-  }
-  submission->result.ok = true;
-  submission->result.poison = core::PoisonState::Valid;
-
-  if (!compiled.plan.task_graph.tasks().empty()) {
-    // TASK-D5 / ADR-039: apply the envelope window first. Unset quota keeps
-    // the pre-D5 full GPU publish. A set cap that does not cover the graph
-    // (or a leftover drain) is HostAssisted -- pack/dispatch of the full
-    // graph would still write parked tasks because gid == packed slot.
+  static Flow publish_tasks(DeviceHal& metal, const hal::CompiledPlan& compiled,
+                            const std::vector<id<MTLBuffer>>& buffers, DispatchStats* stats,
+                            hal::Submission* submission, std::string* error) {
+    if (compiled.plan.task_graph.tasks().empty()) return Flow::Continue;
     std::vector<uint32_t> order;
-    if (!hal::apply_envelope_continuation(compiled.plan, &envelope_continuations_, submission, &order,
+    if (!hal::apply_envelope_continuation(compiled.plan, &metal.envelope_continuations(), submission, &order,
                                           error))
-      return false;
+      return Flow::Fail;
     const auto& tasks = compiled.plan.task_graph.tasks();
-    const bool host_split =
-        order.size() != tasks.size() || submission->envelope_overflow.has_value();
-    if (order.empty()) {
-      // quota 0, or an empty leftover drain: publish nothing this submit.
-    } else if (host_split) {
+    const bool host_split = order.size() != tasks.size() || submission->envelope_overflow.has_value();
+    if (order.empty()) return Flow::Continue;
+    if (host_split) {
       std::string publish_error;
-      if (!publish_envelope_order(compiled.plan.task_graph, order, &submission->published_tasks,
-                                  &publish_error)) {
+      if (!publish_envelope_order(compiled.plan.task_graph, order, &submission->published_tasks, &publish_error)) {
         submission->result.ok = false;
         submission->result.message = publish_error;
-        return true;
+        return Flow::Finish;
       }
-    } else {
-    // Pack -> dispatch the GPU publish kernel -> read back -> verify every
-    // slot reached Published -> unpack, walking slots in the task graph's
-    // deterministic dependency order so submission->published_tasks is
-    // sequence-identical to reference::execute_task_graph()'s oracle output.
-    // Each task writes only its own disjoint slot (gid == its own task
-    // index, not a separately-assigned ring position), so the GPU's actual
-    // parallel completion order across slots has no effect on correctness
-    // -- only the final per-slot state and the host-chosen readback order
-    // do. dispatch_task_publish is fully synchronous (waitUntilCompleted),
-    // so the Shared-storage buffers are already safe to read from the host
-    // by the time it returns; no additional synchronization is needed.
+      return Flow::Continue;
+    }
     const auto count = static_cast<uint32_t>(tasks.size());
-
-    id<MTLBuffer> state_buffer = [impl_->device newBufferWithLength:std::max<size_t>(count * sizeof(uint32_t), 1)
-                                                              options:MTLResourceStorageModeShared];
+    id<MTLBuffer> state_buffer = [metal.impl_->device newBufferWithLength:std::max<size_t>(count * sizeof(uint32_t), 1)
+                                                                  options:MTLResourceStorageModeShared];
     id<MTLBuffer> fields_buffer =
-        [impl_->device newBufferWithLength:std::max<size_t>(count * kTaskRingWordsPerRecord * sizeof(uint32_t), 1)
-                                    options:MTLResourceStorageModeShared];
+        [metal.impl_->device newBufferWithLength:std::max<size_t>(count * kTaskRingWordsPerRecord * sizeof(uint32_t), 1)
+                                         options:MTLResourceStorageModeShared];
     id<MTLBuffer> inputs_buffer =
-        [impl_->device newBufferWithLength:std::max<size_t>(count * kTaskRingWordsPerRecord * sizeof(uint32_t), 1)
-                                    options:MTLResourceStorageModeShared];
+        [metal.impl_->device newBufferWithLength:std::max<size_t>(count * kTaskRingWordsPerRecord * sizeof(uint32_t), 1)
+                                         options:MTLResourceStorageModeShared];
     if (state_buffer == nil || fields_buffer == nil || inputs_buffer == nil) {
       submission->result.ok = false;
       submission->result.message = "Metal task ring buffer allocation failed";
-      return true;
+      return Flow::Finish;
     }
     std::memset([state_buffer contents], 0, count * sizeof(uint32_t));
     auto* inputs = static_cast<uint32_t*>([inputs_buffer contents]);
     for (uint32_t i = 0; i < count; ++i) pack_task_record(tasks[i], inputs + i * kTaskRingWordsPerRecord);
-
     std::string task_pipeline_error;
-    if (!impl_->ensure_task_ring_pipeline(&task_pipeline_error)) {
+    if (!metal.impl_->ensure_task_ring_pipeline(&task_pipeline_error)) {
       submission->result.ok = false;
       submission->result.message = "Metal task ring pipeline compile failed: " + task_pipeline_error;
-      return true;
+      return Flow::Finish;
     }
     std::string publish_error;
-    if (!impl_->dispatch_task_publish({.state = state_buffer, .fields = fields_buffer, .inputs = inputs_buffer},
-                                      count, &stats, &publish_error)) {
+    if (!metal.impl_->dispatch_task_publish({.state = state_buffer, .fields = fields_buffer, .inputs = inputs_buffer},
+                                            count, stats, &publish_error)) {
       submission->result.ok = false;
       submission->result.message = "Metal task ring dispatch failed: " + publish_error;
-      return true;
+      return Flow::Finish;
     }
-
     const auto* states = static_cast<const uint32_t*>([state_buffer contents]);
     const auto* fields = static_cast<const uint32_t*>([fields_buffer contents]);
     submission->published_tasks.reserve(count);
@@ -2664,66 +2503,117 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       if (states[index] != static_cast<uint32_t>(core::PublicationState::Published)) {
         submission->result.ok = false;
         submission->result.message = "task ring slot did not reach Published state";
-        return true;
+        return Flow::Finish;
       }
       submission->published_tasks.push_back(unpack_task_record(fields + index * kTaskRingWordsPerRecord));
     }
-
-    impl_->last_tier1_indirect_dims.clear();
-    if (compiled.plan.request_tier1_indirect && capabilities().supports(hal::Capability::IndirectTier1)) {
-      id<MTLBuffer> indirect_args_buffer = [impl_->device
+    metal.impl_->last_tier1_indirect_dims.clear();
+    if (compiled.plan.request_tier1_indirect && metal.capabilities().supports(hal::Capability::IndirectTier1)) {
+      id<MTLBuffer> indirect_args_buffer = [metal.impl_->device
           newBufferWithLength:std::max<size_t>(count * sizeof(MTLDispatchThreadgroupsIndirectArguments), 1)
                        options:MTLResourceStorageModeShared];
       if (indirect_args_buffer == nil) {
         submission->result.ok = false;
         submission->result.message = "Metal Tier1 indirect-args buffer allocation failed";
-        return true;
+        return Flow::Finish;
       }
       std::string tier1_error;
-      if (!impl_->dispatch_task_tier1_indirect(buffers, fields_buffer, order, indirect_args_buffer, &stats,
-                                               &tier1_error)) {
+      if (!metal.impl_->dispatch_task_tier1_indirect(buffers, fields_buffer, order, indirect_args_buffer, stats,
+                                                     &tier1_error)) {
         submission->result.ok = false;
         submission->result.message = "Metal Tier1 indirect dispatch failed: " + tier1_error;
-        return true;
+        return Flow::Finish;
       }
       const auto* args = static_cast<const uint32_t*>([indirect_args_buffer contents]);
       const size_t stride_words = sizeof(MTLDispatchThreadgroupsIndirectArguments) / sizeof(uint32_t);
-      impl_->last_tier1_indirect_dims.reserve(order.size());
+      metal.impl_->last_tier1_indirect_dims.reserve(order.size());
       for (size_t i = 0; i < order.size(); ++i) {
         const uint32_t* dims = args + i * stride_words;
-        impl_->last_tier1_indirect_dims.push_back({dims[0], dims[1], dims[2]});
+        metal.impl_->last_tier1_indirect_dims.push_back({dims[0], dims[1], dims[2]});
       }
       submission->report.add("tier1_indirect_dispatch", hal::LoweringClass::Direct, order.size(), 0,
                              "GPU-authored indirect dispatch dims, no host round trip before dispatch");
     }
-    // TASK-D4 (E010): isolated behind request_tier2_select so D2/D3/D5
-    // submit prologue work does not collide. Implementation lives in
-    // metal_tier2.mm -- GPU-encoded multi-PSO ICB is DevicePass; bucket
-    // + per-Node indirect remains the EmulatedDevicePass fallback.
     if (compiled.plan.request_tier2_select) {
       std::string tier2_error;
-      if (!vg::metal::tier2::apply_select({.device = static_cast<void*>(impl_->device),
-                                          .command_queue = static_cast<void*>(impl_->command_queue),
+      if (!vg::metal::tier2::apply_select({.device = static_cast<void*>(metal.impl_->device),
+                                          .command_queue = static_cast<void*>(metal.impl_->command_queue),
                                           .fields_buffer = static_cast<void*>(fields_buffer)},
                                          count, compiled.plan, submission,
-                                         {&stats.encoder_count, &stats.command_buffer_count,
-                                          &stats.queue_wait_count},
+                                         {&stats->encoder_count, &stats->command_buffer_count,
+                                          &stats->queue_wait_count},
                                          &tier2_error)) {
         submission->result.ok = false;
         submission->result.message = tier2_error;
-        return true;
+        return Flow::Finish;
       }
     }
-    }
+    return Flow::Continue;
   }
-  submission->cpu_encode_ns = stats.cpu_encode_ns;
-  submission->cpu_submit_ns = stats.cpu_submit_ns;
-  submission->report.encoder_count = stats.encoder_count;
-  submission->report.command_buffer_count = stats.command_buffer_count;
-  submission->report.barrier_count = stats.barrier_count;
-  submission->report.queue_wait_count = stats.queue_wait_count;
-  attach_access_certificate(compiled, arena, submission);
-  return true;
+
+  static bool linear(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
+                     uint64_t wait_value, uint64_t signal_value, hal::Submission* submission,
+                     std::string* error) {
+    const auto& package = *compiled.compute_package;
+    const auto generation_by_allocation = generations(compiled.plan.module);
+    std::vector<id<MTLBuffer>> buffers;
+    std::vector<core::Allocation*> touched;
+    for (const auto& binding : package.bindings) {
+      auto it = generation_by_allocation.find(binding.allocation);
+      id<MTLBuffer> buffer = nil;
+      core::Allocation* allocation = nullptr;
+      if (it == generation_by_allocation.end() ||
+          !bind(metal, arena, binding.allocation, it->second.first, it->second.second, &buffer, &allocation,
+                submission))
+        return true;
+      buffers.push_back(buffer);
+      touched.push_back(allocation);
+    }
+    DispatchStats stats;
+    std::string dispatch_error;
+    if (!metal.impl_->dispatch_and_wait(buffers, {}, {.wait = wait_value, .signal = signal_value}, &stats,
+                                        &dispatch_error)) {
+      submission->result.ok = false;
+      submission->result.message = "Metal dispatch failed: " + dispatch_error;
+      return true;
+    }
+    submission->timeline_value = metal.impl_->timeline_event != nil ? metal.impl_->timeline_event.signaledValue : 0;
+    for (size_t index = 0; index < touched.size(); ++index)
+      std::memcpy(touched[index]->bytes.data(), [buffers[index] contents], touched[index]->bytes.size());
+    for (size_t index = 0; index < compiled.plan.module.instructions.size(); ++index) {
+      const auto& instruction = compiled.plan.module.instructions[index];
+      const ir::Access access = ir::access_from_op(instruction.op, ir::Access::Publish);
+      const ir::Effect effect{instruction.allocation, instruction.offset, instruction.size, access,
+                              instruction.representation_epoch};
+      submission->result.trace.push_back(effect);
+      submission->result.witness.record(effect, static_cast<uint32_t>(index));
+    }
+    submission->result.ok = true;
+    submission->result.poison = core::PoisonState::Valid;
+    bool result = true;
+    if (take(publish_tasks(metal, compiled, buffers, &stats, submission, error), &result)) return result;
+    apply_stats(stats, submission);
+    attach_access_certificate(compiled, arena, submission);
+    return true;
+  }
+};
+
+bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, hal::Submission* submission,
+                       std::string* error) {
+  if (!SubmitOps::begin(compiled, arena, submission, error)) return false;
+  if (!SubmitOps::stage5(*this, compiled, arena, submission, error)) return false;
+  const uint64_t wait_value = compiled.plan.timeline_wait;
+  const uint64_t signal_value = compiled.plan.timeline_signal;
+  bool result = false;
+  if (SubmitOps::take(SubmitOps::precheck_timeline(*this, wait_value, signal_value, submission), &result))
+    return result;
+  if (SubmitOps::take(SubmitOps::host_assisted(*this, compiled, arena, signal_value, submission, error), &result))
+    return result;
+  if (SubmitOps::take(SubmitOps::certificate(compiled, submission), &result)) return result;
+  if (SubmitOps::take(SubmitOps::effect_dag(*this, compiled, arena, submission), &result)) return result;
+  if (SubmitOps::take(SubmitOps::indexed(*this, compiled, arena, wait_value, signal_value, submission), &result))
+    return result;
+  return SubmitOps::linear(*this, compiled, arena, wait_value, signal_value, submission, error);
 }
 
 bool DeviceHal::probe_buffer(size_t length, bool private_storage, BufferSnapshot* result,

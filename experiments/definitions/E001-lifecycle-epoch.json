@@ -9,5 +9,5 @@
   "protocol": {"deterministic": true, "random_sequences": 100000},
   "correctness": {"oracle": "reference-lifecycle-model", "tolerance": "exact"},
   "requirements": ["generation", "representation_epoch", "graph_epoch"],
-  "judgement": "all stale references are rejected without accessing a reused allocation; random model is 100000 sequences",
+  "judgement": "all stale references are rejected without accessing a reused allocation; random model is 100000 sequences"
 }

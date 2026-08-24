@@ -4,6 +4,7 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 
 namespace vg::ir {
 namespace {
@@ -19,9 +20,9 @@ constexpr uint32_t K[64] = {
 inline uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
 }
 
-std::string sha256_hex(const std::string& input) {
+std::string sha256_hex(std::string_view input) {
   uint64_t bits = static_cast<uint64_t>(input.size()) * 8;
-  std::string data = input; data.push_back(static_cast<char>(0x80));
+  std::string data(input); data.push_back(static_cast<char>(0x80));
   while ((data.size() % 64) != 56) data.push_back('\0');
   for (int i = 7; i >= 0; --i) data.push_back(static_cast<char>((bits >> (i * 8)) & 0xff));
   std::array<uint32_t, 8> h = {0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u};
@@ -35,10 +36,21 @@ std::string sha256_hex(const std::string& input) {
       uint32_t s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >> 10);
       w[i] = w[i-16] + s0 + w[i-7] + s1;
     }
-    uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],x=h[7];
+    uint32_t a = h[0];
+    uint32_t b = h[1];
+    uint32_t c = h[2];
+    uint32_t d = h[3];
+    uint32_t e = h[4];
+    uint32_t f = h[5];
+    uint32_t g = h[6];
+    uint32_t x = h[7];
     for (int i = 0; i < 64; ++i) {
-      uint32_t S1=rotr(e,6)^rotr(e,11)^rotr(e,25), ch=(e&f)^((~e)&g);
-      uint32_t t1=x+S1+ch+K[i]+w[i], S0=rotr(a,2)^rotr(a,13)^rotr(a,22), maj=(a&b)^(a&c)^(b&c), t2=S0+maj;
+      uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      uint32_t ch = (e & f) ^ ((~e) & g);
+      uint32_t t1 = x + S1 + ch + K[i] + w[i];
+      uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+      uint32_t t2 = S0 + maj;
       x=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
     }
     h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=x;

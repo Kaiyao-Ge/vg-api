@@ -1,5 +1,6 @@
 #include "backends/device_hal.h"
 
+#include <algorithm>
 #include <cstddef>
 
 namespace vg::hal {
@@ -22,11 +23,9 @@ void report_host_split(Submission* submission, uint64_t count, const char* reaso
 bool leftover_matches_graph(const ExecutionPlan& plan, const std::vector<uint32_t>& leftover,
                             std::string* error) {
   const auto task_count = static_cast<uint32_t>(plan.task_graph.tasks().size());
-  for (uint32_t index : leftover) {
-    if (index >= task_count) {
-      if (error) *error = "envelope continuation leftover does not match this graph";
-      return false;
-    }
+  if (!std::ranges::all_of(leftover, [task_count](uint32_t index) { return index < task_count; })) {
+    if (error) *error = "envelope continuation leftover does not match this graph";
+    return false;
   }
   return true;
 }

@@ -3,6 +3,7 @@
 #include "ir/ir.h"
 #include "ir/json.h"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -20,8 +21,9 @@ uint64_t LoweringReport::count(LoweringClass classification) const {
 }
 
 bool LoweringReport::has_hidden_host_wait() const {
-  for (const auto& event : events) if (event.classification == LoweringClass::HostAssisted) return true;
-  return false;
+  return std::ranges::any_of(events, [](const LoweringEvent& event) {
+    return event.classification == LoweringClass::HostAssisted;
+  });
 }
 
 std::string LoweringReport::canonical_json() const {
@@ -40,17 +42,10 @@ std::string LoweringReport::canonical_json() const {
       {"supported", json::Value(static_cast<int64_t>(supported ? 1 : 0))}}));
 }
 
-bool ExecutionPlan::validate(std::string* error) const {
-  if (abi_version != kDeviceHalAbiVersion) { if (error) *error = "execution plan ABI version is unsupported"; return false; }
-  if (capabilities.abi_version != kDeviceHalAbiVersion) { if (error) *error = "capability snapshot ABI version is unsupported"; return false; }
-  const auto verification = ir::verify(module);
-  if (!verification.ok) { if (error) *error = verification.message; return false; }
-  if (!capabilities.supports(Capability::LinearAddress)) { if (error) *error = "linear address capability is unsupported"; return false; }
-  if (timeline_signal != 0 && timeline_signal <= timeline_wait) { if (error) *error = "timeline signal does not advance past wait"; return false; }
-  if (!published && !task_graph.tasks().empty()) { if (error) *error = "execution plan contains unpublished tasks"; return false; }
-  if (published && !task_graph.tasks().empty() && !task_graph.validate_execution(error)) { return false; }
-  for (size_t index = 0; index < representation_requests.size(); ++index) {
-    const auto& request = representation_requests[index];
+namespace {
+bool validate_representation_requests(const std::vector<RepresentationRequest>& requests, std::string* error) {
+  for (size_t index = 0; index < requests.size(); ++index) {
+    const auto& request = requests[index];
     const std::string label = "representation request " + std::to_string(index);
     std::string view_error;
     if (!request.view.valid(&view_error)) {
@@ -71,7 +66,7 @@ bool ExecutionPlan::validate(std::string* error) const {
       }
     }
     for (size_t earlier = 0; earlier < index; ++earlier) {
-      if (representation_requests[earlier].view.allocation != request.view.allocation) continue;
+      if (requests[earlier].view.allocation != request.view.allocation) continue;
       if (error)
         *error = label + " and representation request " + std::to_string(earlier) +
                  " both transform the representation of allocation " + std::to_string(request.view.allocation) +
@@ -79,31 +74,48 @@ bool ExecutionPlan::validate(std::string* error) const {
       return false;
     }
   }
+  return true;
+}
+
+bool validate_tier2_select(const ExecutionPlan& plan, std::string* error) {
+  if (!plan.request_tier2_select) return true;
+  if (plan.authorized_node_classes.size() < 2) {
+    if (error) *error = "tier2 select requires at least two authorized node classes";
+    return false;
+  }
+  if (plan.task_graph.tasks().empty()) {
+    if (error) *error = "tier2 select requires a published task graph";
+    return false;
+  }
+  for (size_t i = 0; i < plan.authorized_node_classes.size(); ++i) {
+    for (size_t j = i + 1; j < plan.authorized_node_classes.size(); ++j) {
+      if (plan.authorized_node_classes[i] == plan.authorized_node_classes[j]) {
+        if (error) *error = "tier2 authorized node classes must be unique";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+}  // namespace
+
+bool ExecutionPlan::validate(std::string* error) const {
+  if (abi_version != kDeviceHalAbiVersion) { if (error) *error = "execution plan ABI version is unsupported"; return false; }
+  if (capabilities.abi_version != kDeviceHalAbiVersion) { if (error) *error = "capability snapshot ABI version is unsupported"; return false; }
+  const auto verification = ir::verify(module);
+  if (!verification.ok) { if (error) *error = verification.message; return false; }
+  if (!capabilities.supports(Capability::LinearAddress)) { if (error) *error = "linear address capability is unsupported"; return false; }
+  if (timeline_signal != 0 && timeline_signal <= timeline_wait) { if (error) *error = "timeline signal does not advance past wait"; return false; }
+  if (!published && !task_graph.tasks().empty()) { if (error) *error = "execution plan contains unpublished tasks"; return false; }
+  if (published && !task_graph.tasks().empty() && !task_graph.validate_execution(error)) { return false; }
+  if (!validate_representation_requests(representation_requests, error)) return false;
   if (working_set_budget.has_value() && working_set_lease.has_value() &&
       working_set_budget->has_limit && working_set_lease->byte_limit > working_set_budget->byte_limit) {
     if (error) *error = "working-set lease exceeds the plan's working-set budget";
     return false;
   }
   if (pending_overflow.has_value() && !pending_overflow->valid(error)) return false;
-  if (request_tier2_select) {
-    if (authorized_node_classes.size() < 2) {
-      if (error) *error = "tier2 select requires at least two authorized node classes";
-      return false;
-    }
-    if (task_graph.tasks().empty()) {
-      if (error) *error = "tier2 select requires a published task graph";
-      return false;
-    }
-    for (size_t i = 0; i < authorized_node_classes.size(); ++i) {
-      for (size_t j = i + 1; j < authorized_node_classes.size(); ++j) {
-        if (authorized_node_classes[i] == authorized_node_classes[j]) {
-          if (error) *error = "tier2 authorized node classes must be unique";
-          return false;
-        }
-      }
-    }
-  }
-  return true;
+  return validate_tier2_select(*this, error);
 }
 
 bool ExecutionPlan::graph_epoch_matches(const core::Arena& arena, std::string* error) const {

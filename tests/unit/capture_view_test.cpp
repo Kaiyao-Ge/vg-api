@@ -28,7 +28,7 @@ bool has_gpu_address_pattern(const std::string& text) {
 }
 
 std::string field_string(const vg::json::Value& document, const char* key) {
-  auto value = document.find(key);
+  const auto* value = document.find(key);
   assert(value != nullptr && value->is_string());
   return value->string();
 }

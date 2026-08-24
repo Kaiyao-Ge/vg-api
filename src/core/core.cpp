@@ -246,7 +246,7 @@ Allocation& Arena::allocate(uint64_t size) {
 bool Arena::import_allocation(const RepresentationRef& ref, uint64_t size, ObjectState state,
                               const std::vector<uint8_t>& bytes, std::string* error) {
   if (ref.allocation == 0 || ref.allocation_generation == 0 || size == 0 || bytes.size() != size ||
-      allocations_.count(ref.allocation) != 0) {
+      allocations_.contains(ref.allocation)) {
     if (error) *error = "invalid or duplicate capture allocation";
     return false;
   }
@@ -580,13 +580,12 @@ bool FacetPool::generation_valid(FacetRef ref) const {
 }
 
 bool FacetPool::references(const RepresentationRef& ref) const {
-  for (const FacetSlot& slot : slots_) {
-    if (slot.view.allocation != ref.allocation || slot.view.allocation_generation != ref.allocation_generation)
-      continue;
-    if (slot.representation_epoch != ref.representation_epoch) continue;
-    if (slot.active || slot.in_flight > 0) return true;
-  }
-  return false;
+  return std::ranges::any_of(slots_, [&](const FacetSlot& slot) {
+    return slot.view.allocation == ref.allocation &&
+           slot.view.allocation_generation == ref.allocation_generation &&
+           slot.representation_epoch == ref.representation_epoch &&
+           (slot.active || slot.in_flight > 0);
+  });
 }
 
 void FacetPool::retire_slot(uint32_t index) {
@@ -633,8 +632,7 @@ bool TaskGraphBuilder::set_effects(uint32_t task, const std::vector<ir::Effect>&
   if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
   if (task >= effects_.size()) { if (error) *error = "effect task index is out of range"; return false; }
   effects_[task].clear();
-  for (const auto& effect : effects) if (!add_effect(task, effect, error)) return false;
-  return true;
+  return std::ranges::all_of(effects, [&](const ir::Effect& effect) { return add_effect(task, effect, error); });
 }
 
 bool TaskGraphBuilder::set_quota(uint32_t max_tasks, uint64_t max_payload_bytes, std::string* error) {
@@ -689,11 +687,11 @@ bool TaskGraph::publish(std::string* error) {
 bool TaskGraph::validate_execution(std::string* error) const {
   if (!sealed_) { if (error) *error = "task graph must be sealed before execution"; return false; }
   if (!published_) { if (error) *error = "task graph must be published before execution"; return false; }
-  for (const auto& task : tasks_) {
-    if (task.node_generation == 0 || task.root_generation == 0) {
-      if (error) *error = "task generation is stale";
-      return false;
-    }
+  if (!std::ranges::all_of(tasks_, [](const TaskRecord& task) {
+        return task.node_generation != 0 && task.root_generation != 0;
+      })) {
+    if (error) *error = "task generation is stale";
+    return false;
   }
   return true;
 }
@@ -748,7 +746,7 @@ bool EffectGraph::conflicts(const ir::Effect& before, const ir::Effect& after) {
   if (before.size == 0 || after.size == 0 || before.offset > UINT64_MAX - before.size || after.offset > UINT64_MAX - after.size) return false;
   const bool overlap = before.offset < after.offset + after.size && after.offset < before.offset + before.size;
   if (!overlap) return false;
-  return !(before.access == ir::Access::Read && after.access == ir::Access::Read);
+  return before.access != ir::Access::Read || after.access != ir::Access::Read;
 }
 
 bool EffectGraph::validate_happens_before(const std::vector<std::vector<ir::Effect>>& effects,
@@ -790,12 +788,11 @@ bool EffectGraph::valid() const {
     if (mark[node] == 1) return false;
     if (mark[node] == 2) return true;
     mark[node] = 1;
-    for (uint32_t next : adjacency[node]) if (!visit(next)) return false;
+    if (!std::ranges::all_of(adjacency[node], [&](uint32_t next) { return visit(next); })) return false;
     mark[node] = 2;
     return true;
   };
-  for (const auto& [node, _] : adjacency) if (!visit(node)) return false;
-  return true;
+  return std::ranges::all_of(adjacency, [&](const auto& pair) { return visit(pair.first); });
 }
 
 uint32_t EffectGraphBuilder::add_node(std::vector<ir::Effect> effects, std::string* error) {
@@ -973,8 +970,9 @@ WitnessDiff AccessWitness::diff(const Certificate& certificate) const {
 }
 
 bool validate_certificate(const Certificate& certificate, const std::vector<ir::Effect>& effects, std::string* error) {
-  for (const auto& effect : effects) {
-    if (!certificate.covers(effect)) { if (error) *error = "certificate does not cover inferred effect"; return false; }
+  if (!std::ranges::all_of(effects, [&](const ir::Effect& effect) { return certificate.covers(effect); })) {
+    if (error) *error = "certificate does not cover inferred effect";
+    return false;
   }
   return true;
 }
@@ -1147,8 +1145,7 @@ bool build_discovered_certificate(const Arena& arena, const DiscoveryResult& dis
 
 bool certificate_covers_discovery_witness(const AccessCertificate& certificate,
                                           const std::vector<PointerRef>& witness, std::string* error) {
-  for (const auto& ref : witness) {
-    if (certificate.epoch.contains(ref)) continue;
+  if (!std::ranges::all_of(witness, [&](const PointerRef& ref) { return certificate.epoch.contains(ref); })) {
     if (error) *error = "discovery witness is not covered by the certificate";
     return false;
   }
@@ -1228,9 +1225,9 @@ bool compose_access_certificates(const Arena& arena, const std::vector<AccessCer
   if (!builder.seal(&epoch, error)) return false;
   AccessCertificate composed;
   composed.epoch = epoch;
-  composed.mode = any_universe ? AccessCertificateMode::Universe
-                               : (any_discover ? AccessCertificateMode::DiscoverThenLease
-                                               : AccessCertificateMode::CertifiedPinned);
+  if (any_universe) composed.mode = AccessCertificateMode::Universe;
+  else if (any_discover) composed.mode = AccessCertificateMode::DiscoverThenLease;
+  else composed.mode = AccessCertificateMode::CertifiedPinned;
   uint64_t bytes = 0;
   for (const auto& ref : epoch.references()) {
     const Allocation* allocation = arena.lookup(ref);
@@ -1325,7 +1322,7 @@ uint64_t EnvelopeContinuationTable::mint(std::vector<uint32_t> leftover_order) {
 }
 
 bool EnvelopeContinuationTable::contains(uint64_t token) const {
-  return token != 0 && leftover_.find(token) != leftover_.end();
+  return token != 0 && leftover_.contains(token);
 }
 
 bool EnvelopeContinuationTable::lookup(uint64_t token, std::vector<uint32_t>* leftover,

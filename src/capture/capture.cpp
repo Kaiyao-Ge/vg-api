@@ -13,9 +13,23 @@ namespace vg::capture {
 namespace {
 using json::Value;
 
+const char* capture_access_name(ir::Access access) {
+  if (access == ir::Access::Read) return "read";
+  if (access == ir::Access::Write) return "write";
+  if (access == ir::Access::Atomic) return "atomic";
+  return "publish";
+}
+
+ir::Access capture_access_from_name(const std::string& access) {
+  if (access == "read") return ir::Access::Read;
+  if (access == "write") return ir::Access::Write;
+  if (access == "atomic") return ir::Access::Atomic;
+  if (access == "publish") return ir::Access::Publish;
+  throw std::runtime_error("capture invalid access");
+}
+
 Value effect_value(const ir::Effect& effect) {
-  const char* access = effect.access == ir::Access::Read ? "read" : effect.access == ir::Access::Write ? "write" : effect.access == ir::Access::Atomic ? "atomic" : "publish";
-  return Value(Value::Object{{"access", Value(std::string(access))}, {"allocation", Value(static_cast<int64_t>(effect.allocation))},
+  return Value(Value::Object{{"access", Value(std::string(capture_access_name(effect.access)))}, {"allocation", Value(static_cast<int64_t>(effect.allocation))},
       {"offset", Value(static_cast<int64_t>(effect.offset))}, {"representation_epoch", Value(static_cast<int64_t>(effect.representation_epoch))}, {"size", Value(static_cast<int64_t>(effect.size))}});
 }
 
@@ -23,7 +37,7 @@ ir::Effect effect_from_value(const Value& value) {
   const auto& object = value.object();
   auto required = [&](const char* key) -> const Value& { auto it = object.find(key); if (it == object.end()) throw std::runtime_error(std::string("capture effect missing ") + key); return it->second; };
   const auto access = required("access").string();
-  ir::Access kind = access == "read" ? ir::Access::Read : access == "write" ? ir::Access::Write : access == "atomic" ? ir::Access::Atomic : access == "publish" ? ir::Access::Publish : throw std::runtime_error("capture invalid access");
+  ir::Access kind = capture_access_from_name(access);
   return {static_cast<uint64_t>(required("allocation").integer()), static_cast<uint64_t>(required("offset").integer()), static_cast<uint64_t>(required("size").integer()), kind, static_cast<uint32_t>(required("representation_epoch").integer())};
 }
 
@@ -137,10 +151,9 @@ std::vector<core::PointerRef> parse_pointer_ref_array(const Value& value, const 
 }
 
 bool pointer_ref_in(const std::vector<core::PointerRef>& refs, const core::PointerRef& wanted) {
-  for (const auto& ref : refs) {
-    if (ref.allocation == wanted.allocation && ref.generation == wanted.generation) return true;
-  }
-  return false;
+  return std::ranges::any_of(refs, [&](const core::PointerRef& ref) {
+    return ref.allocation == wanted.allocation && ref.generation == wanted.generation;
+  });
 }
 
 void apply_optional_discovery(const Capture& capture, Value::Object* root) {
@@ -171,13 +184,11 @@ bool environment_has(const ReplayEnvironment& environment, const std::string& ca
 
 bool refuse_incompatible_capabilities(const Capture& capture, const ReplayEnvironment& environment,
                                       std::string* error) {
-  for (const auto& required : capture.view.required_capabilities) {
-    if (!environment_has(environment, required)) {
-      if (error) *error = "incompatible capabilities refused: " + required;
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::any_of(capture.view.required_capabilities, [&](const std::string& required) {
+    if (environment_has(environment, required)) return false;
+    if (error) *error = "incompatible capabilities refused: " + required;
+    return true;
+  });
 }
 }
 
@@ -234,24 +245,24 @@ bool deserialize(const std::string& text, Capture* capture, std::string* error) 
     if (capture == nullptr) throw std::runtime_error("capture output is required");
     auto document = json::parse(text); if (!document.is_object()) throw std::runtime_error("capture root must be an object");
     if (document.find("required") != nullptr) throw std::runtime_error("capture contains unknown required fields");
-    auto schema = document.find("schema"); if (schema == nullptr || schema->string() != "vg.capture/v1") throw std::runtime_error("unsupported capture schema");
+    const auto* schema = document.find("schema"); if (schema == nullptr || schema->string() != "vg.capture/v1") throw std::runtime_error("unsupported capture schema");
     capture->schema_hash = document.find("schema_hash") ? document.find("schema_hash")->string() : "sha256:vg.capture/v1";
-    if (auto content_hash = document.find("capture_hash"); content_hash != nullptr) { auto without = document.object(); without.erase("capture_hash"); if (ir::sha256_hex(json::canonical(Value(std::move(without)))) != content_hash->string()) throw std::runtime_error("capture content hash mismatch"); }
-    auto version = document.find("schema_version"); if (version != nullptr && version->integer() > 2) throw std::runtime_error("unsupported capture schema version");
-    auto ir_value = document.find("ir"); if (ir_value == nullptr) throw std::runtime_error("capture is missing IR"); capture->module = ir::parse_module(json::canonical(*ir_value));
-    auto hash = document.find("ir_hash"); if (hash == nullptr || hash->string() != capture->module.hash) throw std::runtime_error("capture IR hash mismatch");
-    capture->allocations.clear(); if (auto values = document.find("allocations"); values != nullptr) for (const auto& value : values->array()) capture->allocations.push_back(allocation_from_value(value));
-    capture->certificate.ranges.clear(); if (auto values = document.find("certificate"); values != nullptr) for (const auto& value : values->array()) capture->certificate.ranges.push_back(effect_from_value(value));
+    if (const auto* content_hash = document.find("capture_hash"); content_hash != nullptr) { auto without = document.object(); without.erase("capture_hash"); if (ir::sha256_hex(json::canonical(Value(std::move(without)))) != content_hash->string()) throw std::runtime_error("capture content hash mismatch"); }
+    const auto* version = document.find("schema_version"); if (version != nullptr && version->integer() > 2) throw std::runtime_error("unsupported capture schema version");
+    const auto* ir_value = document.find("ir"); if (ir_value == nullptr) throw std::runtime_error("capture is missing IR"); capture->module = ir::parse_module(json::canonical(*ir_value));
+    const auto* hash = document.find("ir_hash"); if (hash == nullptr || hash->string() != capture->module.hash) throw std::runtime_error("capture IR hash mismatch");
+    capture->allocations.clear(); if (const auto* values = document.find("allocations"); values != nullptr) for (const auto& value : values->array()) capture->allocations.push_back(allocation_from_value(value));
+    capture->certificate.ranges.clear(); if (const auto* values = document.find("certificate"); values != nullptr) for (const auto& value : values->array()) capture->certificate.ranges.push_back(effect_from_value(value));
     capture->graph_epoch = document.find("graph_epoch") ? static_cast<uint64_t>(document.find("graph_epoch")->integer()) : 0; capture->timeline_value = document.find("timeline_value") ? static_cast<uint64_t>(document.find("timeline_value")->integer()) : 0;
     capture->source_hash = document.find("source_hash") ? document.find("source_hash")->string() : ""; capture->compiler_hash = document.find("compiler_hash") ? document.find("compiler_hash")->string() : "";
-    capture->graph_references.clear(); if (auto values = document.find("graph_references"); values != nullptr) for (const auto& value : values->array()) capture->graph_references.push_back({static_cast<uint64_t>(value.object().at("allocation").integer()), static_cast<uint32_t>(value.object().at("generation").integer())});
-    capture->witness = core::AccessWitness{}; if (auto value = document.find("witness"); value != nullptr) parse_witness(*value, &capture->witness);
-    capture->has_execution = false; if (auto execution = document.find("execution"); execution != nullptr) { const auto& o = execution->object(); capture->has_execution = true; capture->execution.ok = o.at("ok").integer() != 0; capture->execution.poison = static_cast<core::PoisonState>(o.at("poison").integer()); capture->execution.outputs_valid = o.at("outputs_valid").integer() != 0; capture->execution.message = o.at("message").string(); capture->execution.fault.code = o.at("fault_code").string(); capture->execution.fault.message = o.at("fault_message").string(); capture->execution.fault.instruction_index = static_cast<uint32_t>(o.at("fault_instruction").integer()); capture->execution.fault.effect = effect_from_value(o.at("fault_effect")); }
+    capture->graph_references.clear(); if (const auto* values = document.find("graph_references"); values != nullptr) for (const auto& value : values->array()) capture->graph_references.push_back({static_cast<uint64_t>(value.object().at("allocation").integer()), static_cast<uint32_t>(value.object().at("generation").integer())});
+    capture->witness = core::AccessWitness{}; if (const auto* value = document.find("witness"); value != nullptr) parse_witness(*value, &capture->witness);
+    capture->has_execution = false; if (const auto* execution = document.find("execution"); execution != nullptr) { const auto& o = execution->object(); capture->has_execution = true; capture->execution.ok = o.at("ok").integer() != 0; capture->execution.poison = static_cast<core::PoisonState>(o.at("poison").integer()); capture->execution.outputs_valid = o.at("outputs_valid").integer() != 0; capture->execution.message = o.at("message").string(); capture->execution.fault.code = o.at("fault_code").string(); capture->execution.fault.message = o.at("fault_message").string(); capture->execution.fault.instruction_index = static_cast<uint32_t>(o.at("fault_instruction").integer()); capture->execution.fault.effect = effect_from_value(o.at("fault_effect")); }
     capture->has_discovery = false;
     capture->discovery_seeds.clear();
     capture->discovered_reachable.clear();
     capture->frozen_topology_epoch = 0;
-    if (auto discovery = document.find("discovery"); discovery != nullptr) {
+    if (const auto* discovery = document.find("discovery"); discovery != nullptr) {
       if (!discovery->is_object()) throw std::runtime_error("capture discovery must be an object");
       const auto& object = discovery->object();
       auto seeds = object.find("seeds");
@@ -267,15 +278,15 @@ bool deserialize(const std::string& text, Capture* capture, std::string* error) 
       capture->has_discovery = true;
     }
     capture->view = {};
-    if (auto value = document.find("source_backend"); value != nullptr) {
+    if (const auto* value = document.find("source_backend"); value != nullptr) {
       if (!value->is_string()) throw std::runtime_error("capture source_backend must be a string");
       capture->view.source_backend = value->string();
     }
-    if (auto value = document.find("required_capabilities"); value != nullptr)
+    if (const auto* value = document.find("required_capabilities"); value != nullptr)
       capture->view.required_capabilities = parse_string_array(*value, "required_capabilities");
-    if (auto value = document.find("executed_backends"); value != nullptr)
+    if (const auto* value = document.find("executed_backends"); value != nullptr)
       capture->view.executed_backends = parse_string_array(*value, "executed_backends");
-    if (auto value = document.find("semantic_correspondence"); value != nullptr) {
+    if (const auto* value = document.find("semantic_correspondence"); value != nullptr) {
       if (!value->is_object()) throw std::runtime_error("capture semantic_correspondence must be an object");
       const auto& object = value->object();
       if (auto only = object.find("only"); only != object.end())

@@ -55,20 +55,17 @@ std::vector<uint32_t> sorted(std::vector<uint32_t> values) {
 
 bool has_event(const vg::hal::LoweringReport& report, const char* operation,
                vg::hal::LoweringClass classification, uint64_t min_count) {
-  for (const auto& event : report.events) {
-    if (event.operation == operation && event.classification == classification &&
-        event.count >= min_count)
-      return true;
-  }
-  return false;
+  return std::ranges::any_of(report.events, [&](const vg::hal::LoweringEvent& event) {
+    return event.operation == operation && event.classification == classification &&
+           event.count >= min_count;
+  });
 }
 
 bool report_claims_device_pass_for_tier2(const vg::hal::LoweringReport& report) {
-  for (const auto& event : report.events) {
-    if (!event.operation.starts_with("tier2_")) continue;
-    if (event.classification == vg::hal::LoweringClass::DevicePass) return true;
-  }
-  return false;
+  return std::ranges::any_of(report.events, [](const vg::hal::LoweringEvent& event) {
+    return event.operation.starts_with("tier2_") &&
+           event.classification == vg::hal::LoweringClass::DevicePass;
+  });
 }
 
 bool run_select_case(vg::metal::DeviceHal& metal, const std::vector<uint32_t>& nodes,

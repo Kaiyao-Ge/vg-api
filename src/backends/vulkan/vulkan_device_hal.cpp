@@ -646,6 +646,8 @@ class FacetUseGuard {
   FacetUseGuard(vg::core::FacetPool& pool, vg::core::FacetRef ref) : pool_(pool), ref_(ref) {}
   FacetUseGuard(const FacetUseGuard&) = delete;
   FacetUseGuard& operator=(const FacetUseGuard&) = delete;
+  FacetUseGuard(FacetUseGuard&&) = delete;
+  FacetUseGuard& operator=(FacetUseGuard&&) = delete;
   ~FacetUseGuard() {
     if (held_) pool_.end_gpu_use(ref_);
   }
@@ -1617,7 +1619,9 @@ bool DeviceHal::ensure_raster_pipeline(vg::compiler::PipelineClassificationCache
   VkBool32 blend_enable = VK_FALSE;
   for (const auto& [name, value] : raster_state) {
     if (name == "cull_mode") {
-      cull_mode = value == 1 ? VK_CULL_MODE_FRONT_BIT : value == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+      if (value == 1) cull_mode = VK_CULL_MODE_FRONT_BIT;
+      else if (value == 2) cull_mode = VK_CULL_MODE_BACK_BIT;
+      else cull_mode = VK_CULL_MODE_NONE;
     } else if (name == "front_face") {
       front_face = value == 1 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     } else if (name == "polygon_mode") {
@@ -2481,10 +2485,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
 
   for (size_t index = 0; index < compiled.plan.module.instructions.size(); ++index) {
     const auto& instruction = compiled.plan.module.instructions[index];
-    const vg::ir::Access access = instruction.op == "load"        ? vg::ir::Access::Read
-                                  : instruction.op == "store"      ? vg::ir::Access::Write
-                                  : instruction.op == "atomic_add" ? vg::ir::Access::Atomic
-                                                                    : vg::ir::Access::Publish;
+    const vg::ir::Access access = vg::ir::access_from_op(instruction.op, vg::ir::Access::Publish);
     const vg::ir::Effect effect{instruction.allocation, instruction.offset, instruction.size, access,
                                 instruction.representation_epoch};
     submission->result.trace.push_back(effect);

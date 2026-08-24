@@ -25,9 +25,9 @@ bool check(bool condition, const std::string& backend_name, const std::string& w
 }
 
 bool has_event(const vg::hal::LoweringReport& report, const std::string& operation) {
-  for (const auto& event : report.events)
-    if (event.operation == operation) return true;
-  return false;
+  return std::ranges::any_of(report.events, [&](const vg::hal::LoweringEvent& event) {
+    return event.operation == operation;
+  });
 }
 
 // Parses the fixture and rebinds its fixture-local allocation ids onto real

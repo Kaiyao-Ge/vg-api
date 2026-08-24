@@ -260,6 +260,10 @@ struct PipelineClassificationRun {
 
 class DeviceHal final : public hal::DeviceHal {
  public:
+  DeviceHal(const DeviceHal&) = delete;
+  DeviceHal& operator=(const DeviceHal&) = delete;
+  DeviceHal(DeviceHal&&) = delete;
+  DeviceHal& operator=(DeviceHal&&) = delete;
   ~DeviceHal() override;
   [[nodiscard]] const hal::CapabilitySnapshot& capabilities() const override;
   bool compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
@@ -370,6 +374,8 @@ class DeviceHal final : public hal::DeviceHal {
 
  private:
   struct Impl;
+  struct CompileOps;
+  struct SubmitOps;
   explicit DeviceHal(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
   friend std::unique_ptr<DeviceHal> make_device_hal();

@@ -16,13 +16,20 @@ PointerEdge parse_pointer_edge(const json::Value& value) { const auto& o=value.o
 json::Value pointer_edge_json(const PointerEdge& edge) { return json::Value(json::Value::Object{{"field_offset",json::Value(static_cast<int64_t>(edge.field_offset))},{"from_allocation",json::Value(static_cast<int64_t>(edge.from_allocation))},{"to_allocation",json::Value(static_cast<int64_t>(edge.to_allocation))}}); }
 bool is_pointer_via(const std::string& op) { return op=="load_via"||op=="store_via"; }
 }
+Access access_from_op(const std::string& op, Access unknown) {
+  if (op == "load" || op == "load_ref" || op == "load_via") return Access::Read;
+  if (op == "store" || op == "store_via") return Access::Write;
+  if (op == "atomic_add") return Access::Atomic;
+  if (op == "publish") return Access::Publish;
+  return unknown;
+}
 Module parse_module(const std::string& text) {
   json::Value document=json::parse(text); if(!document.is_object()) throw std::runtime_error("IR root must be an object"); const auto& o=document.object();
   if(require(o,"schema").string()!="vg.ir/v1") throw std::runtime_error("unsupported IR schema");
   Module module; module.version=u32(require(o,"version"),"version"); module.root_schema=require(o,"root_schema").string();
-  for(const auto& value:require(o,"instructions").array()){const auto& item=value.object(); Instruction i; i.op=require(item,"op").string(); i.allocation=u64(require(item,"allocation"),"allocation"); i.offset=u64(require(item,"offset"),"offset"); i.size=u64(require(item,"size"),"size"); i.generation=u32(require(item,"generation"),"generation"); if(auto p=value.find("representation_epoch"))i.representation_epoch=u32(*p,"representation_epoch"); if(auto p=value.find("value")){if(!p->is_int()) throw std::runtime_error("IR instruction value must be an integer"); i.value=p->integer();} if(auto p=value.find("ref_operand"))i.ref_operand=u64(*p,"ref_operand"); if(auto p=value.find("source")){if(!p->is_string()) throw std::runtime_error("IR instruction source must be a string"); i.source=p->string();} module.instructions.push_back(std::move(i));}
-  if(auto effects=document.find("effects"))for(const auto& effect:effects->array())module.declared_effects.push_back(parse_effect(effect));
-  if(auto edges=document.find("pointer_edges"))for(const auto& edge:edges->array())module.declared_pointer_edges.push_back(parse_pointer_edge(edge));
+  for(const auto& value:require(o,"instructions").array()){const auto& item=value.object(); Instruction i; i.op=require(item,"op").string(); i.allocation=u64(require(item,"allocation"),"allocation"); i.offset=u64(require(item,"offset"),"offset"); i.size=u64(require(item,"size"),"size"); i.generation=u32(require(item,"generation"),"generation"); if(const auto* p=value.find("representation_epoch"))i.representation_epoch=u32(*p,"representation_epoch"); if(const auto* p=value.find("value")){if(!p->is_int()) throw std::runtime_error("IR instruction value must be an integer"); i.value=p->integer();} if(const auto* p=value.find("ref_operand"))i.ref_operand=u64(*p,"ref_operand"); if(const auto* p=value.find("source")){if(!p->is_string()) throw std::runtime_error("IR instruction source must be a string"); i.source=p->string();} module.instructions.push_back(std::move(i));}
+  if(const auto* effects=document.find("effects"))for(const auto& effect:effects->array())module.declared_effects.push_back(parse_effect(effect));
+  if(const auto* edges=document.find("pointer_edges"))for(const auto& edge:edges->array())module.declared_pointer_edges.push_back(parse_pointer_edge(edge));
   module.canonical_json=serialize_module(module); module.hash=sha256_hex(module.canonical_json); return module;
 }
 std::string serialize_module(const Module& module) {

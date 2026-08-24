@@ -4,6 +4,7 @@
 #include "compiler/compiler.h"
 #include "ir/ir.h"
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <set>
@@ -77,12 +78,10 @@ bool same_task(const vg::core::TaskRecord& a, const vg::core::TaskRecord& b) {
 }
 
 bool has_host_assisted(const vg::hal::Submission& submission) {
-  for (const auto& event : submission.report.events) {
-    if (event.operation == "envelope_continuation" &&
-        event.classification == vg::hal::LoweringClass::HostAssisted)
-      return true;
-  }
-  return false;
+  return std::ranges::any_of(submission.report.events, [](const vg::hal::LoweringEvent& event) {
+    return event.operation == "envelope_continuation" &&
+           event.classification == vg::hal::LoweringClass::HostAssisted;
+  });
 }
 
 bool mentions_ring_overflow(const std::string& text) {

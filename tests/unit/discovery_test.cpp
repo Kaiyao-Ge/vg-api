@@ -3,6 +3,7 @@
 // still scans every Active allocation and must keep doing so.
 #include "core/core.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <iostream>
@@ -29,10 +30,9 @@ size_t active_count(const vg::core::Arena& arena) {
 }
 
 bool contains_ref(const std::vector<vg::core::PointerRef>& refs, const vg::core::PointerRef& wanted) {
-  for (const auto& ref : refs) {
-    if (ref.allocation == wanted.allocation && ref.generation == wanted.generation) return true;
-  }
-  return false;
+  return std::ranges::any_of(refs, [&](const vg::core::PointerRef& ref) {
+    return ref.allocation == wanted.allocation && ref.generation == wanted.generation;
+  });
 }
 
 }  // namespace

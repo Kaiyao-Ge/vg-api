@@ -5,6 +5,50 @@
 #include <cstring>
 
 namespace vg::reference {
+namespace {
+bool interpret_instruction(const ir::Instruction& instruction, size_t index, core::Arena& arena,
+                           std::vector<core::PointerRef>& ref_values, bool* produced_output,
+                           core::ExecutionResult* result) {
+  const uint32_t generation = instruction.generation;
+  core::Allocation* allocation = arena.lookup(core::RepresentationRef{instruction.allocation, generation, instruction.representation_epoch});
+  if (allocation == nullptr || instruction.offset > allocation->size || instruction.size > allocation->size - instruction.offset) {
+    result->ok = false; result->outputs_valid = false; result->poison = *produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result->message = "stale generation, representation epoch, or out-of-bounds allocation reference"; result->fault = {static_cast<uint32_t>(index), {instruction.allocation, instruction.offset, instruction.size, ir::Access::Read, instruction.representation_epoch}, "STALE_OR_BOUNDS", result->message, 0}; return false;
+  }
+  ir::Access access = ir::access_from_op(instruction.op);
+  const ir::Effect effect{instruction.allocation, instruction.offset, instruction.size, access, instruction.representation_epoch};
+  result->trace.push_back(effect);
+  result->witness.record(effect, static_cast<uint32_t>(index));
+  if (instruction.op == "load") return true;
+  if (instruction.op == "load_ref") {
+    if (instruction.size != sizeof(core::PointerRef::allocation) + sizeof(core::PointerRef::generation)) { result->ok = false; result->outputs_valid = false; result->poison = *produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result->message = "reference load_ref requires 12-byte width"; result->fault = {static_cast<uint32_t>(index), effect, "POINTER_REF_WIDTH", result->message, 0}; return false; }
+    core::PointerRef ref{};
+    std::memcpy(&ref.allocation, allocation->bytes.data() + instruction.offset, sizeof(ref.allocation));
+    std::memcpy(&ref.generation, allocation->bytes.data() + instruction.offset + sizeof(ref.allocation), sizeof(ref.generation));
+    ref_values[index] = ref;
+    return true;
+  }
+  if (instruction.op == "load_via" || instruction.op == "store_via") {
+    const core::PointerRef& ref = ref_values[instruction.ref_operand - 1];
+    if (ref.allocation != instruction.allocation || ref.generation != instruction.generation) {
+      result->ok = false; result->outputs_valid = false; result->poison = *produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result->message = "dereferenced pointer ref does not match dereferencing instruction's target"; result->fault = {static_cast<uint32_t>(index), effect, "DANGLING_POINTER_REF", result->message, 0}; return false;
+    }
+    if (instruction.op == "load_via") return true;
+    for (uint64_t i = 0; i < instruction.size; ++i) allocation->bytes[static_cast<size_t>(instruction.offset + i)] = static_cast<uint8_t>(instruction.value);
+    *produced_output = true;
+    return true;
+  }
+  if (instruction.op == "store") {
+    for (uint64_t i = 0; i < instruction.size; ++i) allocation->bytes[static_cast<size_t>(instruction.offset + i)] = static_cast<uint8_t>(instruction.value);
+    *produced_output = true;
+  } else if (instruction.op == "atomic_add") {
+    if (instruction.size != sizeof(int64_t)) { result->ok = false; result->outputs_valid = false; result->poison = *produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result->message = "reference atomic_add requires 8-byte width"; result->fault = {static_cast<uint32_t>(index), effect, "ATOMIC_WIDTH", result->message, 0}; return false; }
+    int64_t value{}; std::memcpy(&value, allocation->bytes.data() + instruction.offset, sizeof(value)); value += instruction.value; std::memcpy(allocation->bytes.data() + instruction.offset, &value, sizeof(value));
+    *produced_output = true;
+  }
+  return true;
+}
+}  // namespace
+
 core::ExecutionResult execute(const ir::Module& module, core::Arena& arena, const core::Certificate* certificate,
                               core::Timeline* timeline, core::TimelineGate gate) {
   core::ExecutionResult result;
@@ -35,43 +79,8 @@ core::ExecutionResult execute(const ir::Module& module, core::Arena& arena, cons
   bool produced_output = false;
   std::vector<core::PointerRef> ref_values(module.instructions.size());
   for (size_t index = 0; index < module.instructions.size(); ++index) {
-    const auto& instruction = module.instructions[index];
-    const uint32_t generation = instruction.generation;
-    core::Allocation* allocation = arena.lookup(core::RepresentationRef{instruction.allocation, generation, instruction.representation_epoch});
-    if (allocation == nullptr || instruction.offset > allocation->size || instruction.size > allocation->size - instruction.offset) {
-      result.ok = false; result.outputs_valid = false; result.poison = produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result.message = "stale generation, representation epoch, or out-of-bounds allocation reference"; result.fault = {static_cast<uint32_t>(index), {instruction.allocation, instruction.offset, instruction.size, ir::Access::Read, instruction.representation_epoch}, "STALE_OR_BOUNDS", result.message, 0}; return result;
-    }
-    ir::Access access = instruction.op == "load" ? ir::Access::Read : instruction.op == "store" ? ir::Access::Write : instruction.op == "atomic_add" ? ir::Access::Atomic : instruction.op == "publish" ? ir::Access::Publish : instruction.op == "load_ref" ? ir::Access::Read : instruction.op == "load_via" ? ir::Access::Read : instruction.op == "store_via" ? ir::Access::Write : ir::Access::Read;
-    const ir::Effect effect{instruction.allocation, instruction.offset, instruction.size, access, instruction.representation_epoch};
-    result.trace.push_back(effect);
-    result.witness.record(effect, static_cast<uint32_t>(index));
-    if (instruction.op == "load") continue;
-    if (instruction.op == "load_ref") {
-      if (instruction.size != sizeof(core::PointerRef::allocation) + sizeof(core::PointerRef::generation)) { result.ok = false; result.outputs_valid = false; result.poison = produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result.message = "reference load_ref requires 12-byte width"; result.fault = {static_cast<uint32_t>(index), effect, "POINTER_REF_WIDTH", result.message, 0}; return result; }
-      core::PointerRef ref{};
-      std::memcpy(&ref.allocation, allocation->bytes.data() + instruction.offset, sizeof(ref.allocation));
-      std::memcpy(&ref.generation, allocation->bytes.data() + instruction.offset + sizeof(ref.allocation), sizeof(ref.generation));
-      ref_values[index] = ref;
-      continue;
-    }
-    if (instruction.op == "load_via" || instruction.op == "store_via") {
-      const core::PointerRef& ref = ref_values[instruction.ref_operand - 1];
-      if (ref.allocation != instruction.allocation || ref.generation != instruction.generation) {
-        result.ok = false; result.outputs_valid = false; result.poison = produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result.message = "dereferenced pointer ref does not match dereferencing instruction's target"; result.fault = {static_cast<uint32_t>(index), effect, "DANGLING_POINTER_REF", result.message, 0}; return result;
-      }
-      if (instruction.op == "load_via") continue;
-      for (uint64_t i = 0; i < instruction.size; ++i) allocation->bytes[static_cast<size_t>(instruction.offset + i)] = static_cast<uint8_t>(instruction.value);
-      produced_output = true;
-      continue;
-    }
-    if (instruction.op == "store") {
-      for (uint64_t i = 0; i < instruction.size; ++i) allocation->bytes[static_cast<size_t>(instruction.offset + i)] = static_cast<uint8_t>(instruction.value);
-      produced_output = true;
-    } else if (instruction.op == "atomic_add") {
-      if (instruction.size != sizeof(int64_t)) { result.ok = false; result.outputs_valid = false; result.poison = produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result.message = "reference atomic_add requires 8-byte width"; result.fault = {static_cast<uint32_t>(index), effect, "ATOMIC_WIDTH", result.message, 0}; return result; }
-      int64_t value{}; std::memcpy(&value, allocation->bytes.data() + instruction.offset, sizeof(value)); value += instruction.value; std::memcpy(allocation->bytes.data() + instruction.offset, &value, sizeof(value));
-      produced_output = true;
-    }
+    if (!interpret_instruction(module.instructions[index], index, arena, ref_values, &produced_output, &result))
+      return result;
   }
   if (timeline != nullptr && gate.signal != 0) {
     std::string signal_error;
