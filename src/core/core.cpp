@@ -1147,6 +1147,99 @@ bool certificate_covers_discovery_witness(const AccessCertificate& certificate,
   return true;
 }
 
+bool compose_certificates(const std::vector<Certificate>& parts, Certificate* out, std::string* error) {
+  if (out == nullptr) {
+    if (error) *error = "composed certificate output is required";
+    return false;
+  }
+  if (parts.empty()) {
+    if (error) *error = "certificate composition requires at least one child certificate";
+    return false;
+  }
+  Certificate composed;
+  for (const auto& part : parts) {
+    composed.ranges.insert(composed.ranges.end(), part.ranges.begin(), part.ranges.end());
+  }
+  for (const auto& part : parts) {
+    for (const auto& range : part.ranges) {
+      if (!composed.covers(range)) {
+        if (error) *error = "composed certificate does not cover a child range";
+        return false;
+      }
+    }
+  }
+  *out = std::move(composed);
+  return true;
+}
+
+namespace {
+uint64_t active_allocation_count(const Arena& arena) {
+  uint64_t count = 0;
+  for (const auto& [id, allocation] : arena.allocations()) {
+    (void)id;
+    if (allocation.state == ObjectState::Active) ++count;
+  }
+  return count;
+}
+}  // namespace
+
+bool compose_access_certificates(const Arena& arena, const std::vector<AccessCertificate>& parts,
+                                 AccessCertificate* out, bool* exploded, std::string* error) {
+  if (out == nullptr) {
+    if (error) *error = "composed access certificate output is required";
+    return false;
+  }
+  if (exploded != nullptr) *exploded = false;
+  if (parts.empty()) {
+    if (error) *error = "access certificate composition requires at least one child certificate";
+    return false;
+  }
+  const uint64_t epoch_value = parts.front().epoch.value();
+  GraphEpochBuilder builder(&arena);
+  bool any_universe = false;
+  bool any_discover = false;
+  bool any_strictly_smaller = false;
+  const uint64_t universe = active_allocation_count(arena);
+  for (const auto& part : parts) {
+    if (part.epoch.value() != epoch_value) {
+      if (error) *error = "cannot compose access certificates from different graph epochs";
+      return false;
+    }
+    if (part.mode == AccessCertificateMode::SoftwarePaged || part.mode == AccessCertificateMode::FaultManaged) {
+      if (error) *error = "cannot compose an unimplemented access certificate mode";
+      return false;
+    }
+    if (part.mode == AccessCertificateMode::Universe) any_universe = true;
+    if (part.mode == AccessCertificateMode::DiscoverThenLease) any_discover = true;
+    if (static_cast<uint64_t>(part.epoch.references().size()) < universe) any_strictly_smaller = true;
+    for (const auto& ref : part.epoch.references()) {
+      if (!builder.add_reference(arena, ref, error)) return false;
+    }
+  }
+  GraphEpoch epoch;
+  if (!builder.seal(&epoch, error)) return false;
+  AccessCertificate composed;
+  composed.epoch = epoch;
+  composed.mode = any_universe ? AccessCertificateMode::Universe
+                               : (any_discover ? AccessCertificateMode::DiscoverThenLease
+                                               : AccessCertificateMode::CertifiedPinned);
+  uint64_t bytes = 0;
+  for (const auto& ref : epoch.references()) {
+    const Allocation* allocation = arena.lookup(ref.allocation, ref.generation);
+    if (allocation != nullptr) bytes += allocation->size;
+  }
+  composed.scanned_bytes = bytes;
+  composed.result_bytes = bytes;
+  composed.working_set_bytes = bytes;
+  const bool became_universe = static_cast<uint64_t>(epoch.references().size()) == universe;
+  if (exploded != nullptr) *exploded = became_universe && any_strictly_smaller;
+  for (const auto& part : parts) {
+    if (!certificate_covers_discovery_witness(composed, part.epoch.references(), error)) return false;
+  }
+  *out = std::move(composed);
+  return true;
+}
+
 bool WorkingSetBudget::allows(uint64_t bytes, std::string* error) const {
   if (!has_limit) return true;
   if (bytes <= byte_limit) return true;

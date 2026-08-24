@@ -37,7 +37,7 @@ int main() {
 
   std::mt19937_64 random(0x5647504841534531ull);
   vg::core::Arena arena;
-  for (uint32_t iteration = 0; iteration < 1000; ++iteration) {
+  for (uint32_t iteration = 0; iteration < 100000; ++iteration) {
     auto& allocation = arena.allocate(8 + (random() % 64));
     const uint64_t id = allocation.id;
     const uint32_t generation = allocation.generation;

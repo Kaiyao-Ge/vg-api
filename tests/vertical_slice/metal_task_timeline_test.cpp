@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -505,6 +506,65 @@ bool run_cull_compact(const std::string& root) {
   }
 
   std::cout << "cull-compact: ok\n";
+  return true;
+}
+
+// Catalog E009 million-instance follow-on: correctness against the CPU
+// oracle as a sorted multiset, plus host wall-clock. Does not invent gpu_ns.
+bool run_cull_compact_1m(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "cull-compact-1m: no Metal device available on this host\n";
+    return false;
+  }
+
+  constexpr uint32_t kCount = 1000000;
+  std::vector<uint32_t> instance_visible(kCount);
+  std::vector<uint32_t> instance_ids(kCount);
+  for (uint32_t i = 0; i < kCount; ++i) {
+    instance_visible[i] = (i % 2u) == 0u ? 1u : 0u;
+    instance_ids[i] = 1000u + i;
+  }
+
+  auto oracle = vg::reference::cull_compact(instance_visible, instance_ids);
+  if (!oracle.ok) {
+    std::cerr << "cull-compact-1m: reference oracle failed: " << oracle.message << "\n";
+    return false;
+  }
+
+  vg::metal::CullCompactResult result;
+  std::string error;
+  const auto started = std::chrono::steady_clock::now();
+  if (!metal_device->run_cull_compact(instance_visible, instance_ids, &result, &error)) {
+    std::cerr << "cull-compact-1m: Metal run_cull_compact failed: " << error << "\n";
+    return false;
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  const uint64_t host_ms =
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+
+  if (result.visible_count != oracle.compact_ids.size()) {
+    std::cerr << "cull-compact-1m: visible_count mismatch: got " << result.visible_count << ", expected "
+              << oracle.compact_ids.size() << "\n";
+    return false;
+  }
+  if (result.compact_ids.size() != result.visible_count) {
+    std::cerr << "cull-compact-1m: compact_ids size does not match visible_count\n";
+    return false;
+  }
+
+  std::vector<uint32_t> got = result.compact_ids;
+  std::vector<uint32_t> want = oracle.compact_ids;
+  std::sort(got.begin(), got.end());
+  std::sort(want.begin(), want.end());
+  if (got != want) {
+    std::cerr << "cull-compact-1m: compacted id set mismatches reference oracle\n";
+    return false;
+  }
+
+  std::cout << "cull-compact-1m: ok count=" << kCount << " visible_count=" << result.visible_count
+            << " host_ms=" << host_ms << "\n";
   return true;
 }
 
@@ -2490,7 +2550,7 @@ bool run_representation_churn(const std::string& root) {
 int main(int argc, char** argv) {
   if (argc != 3) {
     std::cerr << "usage: vg_metal_task_timeline_test "
-                 "<task-tier0|timeline|access-certificate|tier1-indirect|cull-compact|effect-dag|pointer-graph|"
+                 "<task-tier0|timeline|access-certificate|tier1-indirect|cull-compact|cull-compact-1m|effect-dag|pointer-graph|"
                  "indexed-binding|representation-layer|sample-facet|checked-facet-generation|basic-raster|"
                  "pipeline-classification|consume-input|representation-churn> "
                  "<repo_root>\n";
@@ -2509,6 +2569,8 @@ int main(int argc, char** argv) {
     ok = run_tier1_indirect(root);
   } else if (mode == "cull-compact") {
     ok = run_cull_compact(root);
+  } else if (mode == "cull-compact-1m") {
+    ok = run_cull_compact_1m(root);
   } else if (mode == "effect-dag") {
     ok = run_effect_dag(root);
   } else if (mode == "pointer-graph") {

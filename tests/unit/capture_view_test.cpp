@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <vector>
 
 namespace {
 vg::core::ConsumeProof discharged_proof() { return {true, true, true, true}; }
@@ -66,6 +67,39 @@ vg::capture::Capture exact_compute_capture() {
   capture.view.source_backend = "cpu-reference";
   capture.view.executed_backends = {"cpu-reference"};
   capture.view.required_capabilities = {"CaptureReplay", "LinearAddress"};
+  return capture;
+}
+
+constexpr size_t kPointerRefWireBytes = sizeof(uint64_t) + sizeof(uint32_t);
+
+void write_ref(vg::core::Allocation& allocation, const vg::core::PointerRef& ref) {
+  assert(allocation.bytes.size() >= kPointerRefWireBytes);
+  std::memcpy(allocation.bytes.data(), &ref.allocation, sizeof(ref.allocation));
+  std::memcpy(allocation.bytes.data() + sizeof(ref.allocation), &ref.generation, sizeof(ref.generation));
+}
+
+vg::capture::Capture dynamic_graph_capture() {
+  auto compiled = vg::compiler::compile_c_like("@node @effects store(1,0,4,3)");
+  assert(compiled.ok);
+  vg::core::Arena arena;
+  auto& n0 = arena.allocate(12);
+  auto& n1 = arena.allocate(12);
+  auto& n2 = arena.allocate(12);
+  auto& n3 = arena.allocate(12);
+  write_ref(n0, {n1.id, n1.generation});
+  write_ref(n1, {n2.id, 0});
+  write_ref(n2, {n3.id, n3.generation});
+  auto capture = vg::capture::make_capture(compiled.module, arena);
+  capture.certificate.ranges = compiled.module.declared_effects;
+  capture.graph_epoch = arena.topology_epoch();
+  capture.source_hash = "e014-dynamic-graph";
+  capture.view.source_backend = "cpu-reference";
+  capture.view.executed_backends = {"cpu-reference"};
+  std::string error;
+  assert(vg::capture::attach_discovery(&capture, arena, {{n0.id, n0.generation}}, &error));
+  assert(capture.has_discovery);
+  assert(capture.discovered_reachable.size() == 2);
+  assert(capture.allocations.size() == 2);
   return capture;
 }
 }
@@ -240,6 +274,44 @@ int main(int argc, char** argv) {
     lying.view.executed_backends = {"metal", "vulkan"};
     assert(!vg::capture::write_view(lying, &mapped_view, &error));
     assert(error == "cannot claim Metal and Vulkan both executed");
+  }
+
+  {
+    auto dynamic = dynamic_graph_capture();
+    assert(dynamic.allocations.size() == 2);
+    const auto first_dynamic = vg::capture::serialize(dynamic);
+    const auto second_dynamic = vg::capture::serialize(dynamic);
+    assert(first_dynamic == second_dynamic);
+    vg::capture::Capture decoded_dynamic;
+    assert(vg::capture::deserialize(first_dynamic, &decoded_dynamic, &error));
+    assert(decoded_dynamic.has_discovery);
+    assert(decoded_dynamic.discovery_seeds.size() == 1);
+    assert(decoded_dynamic.discovered_reachable.size() == 2);
+    assert(decoded_dynamic.allocations.size() == 2);
+    bool saw_n2 = false;
+    bool saw_n3 = false;
+    for (const auto& snapshot : decoded_dynamic.allocations) {
+      if (snapshot.id == 3) saw_n2 = true;
+      if (snapshot.id == 4) saw_n3 = true;
+    }
+    assert(!saw_n2);
+    assert(!saw_n3);
+    vg::capture::ReplayResult dynamic_replay;
+    assert(vg::capture::replay(decoded_dynamic, &dynamic_replay, &error));
+    vg::capture::ViewReport dynamic_view;
+    assert(vg::capture::write_view(decoded_dynamic, &dynamic_view, &error));
+    assert(dynamic_view.markdown.find("status: recorded") != std::string::npos);
+    assert(dynamic_view.markdown.find("seed_count: 1") != std::string::npos);
+    assert(dynamic_view.markdown.find("reachable_count: 2") != std::string::npos);
+    assert(dynamic_view.json.find("\"status\":\"recorded\"") != std::string::npos ||
+           dynamic_view.json.find("recorded") != std::string::npos);
+    assert(!has_gpu_address_pattern(dynamic_view.markdown));
+    assert(!has_gpu_address_pattern(dynamic_view.json));
+    const auto round_trip = vg::capture::serialize(decoded_dynamic);
+    auto first_hash = vg::json::parse(first_dynamic);
+    auto round_hash = vg::json::parse(round_trip);
+    assert(field_string(first_hash, "capture_hash") == field_string(round_hash, "capture_hash"));
+    assert(field_string(first_hash, "ir_hash") == field_string(round_hash, "ir_hash"));
   }
 
 #if defined(VG_CAPTURE_VIEW)

@@ -37,6 +37,13 @@ struct Capture {
   core::AccessWitness witness;
   core::ExecutionResult execution;
   bool has_execution{};
+  // Optional discovered reachable subset (E014 dynamic-graph). Omitted from
+  // vg.capture/v1 when false so schema_version stays 2, like ViewMetadata.
+  // This is recorded discovery data, not invented from graph_references.
+  bool has_discovery{};
+  std::vector<core::PointerRef> discovery_seeds;
+  std::vector<core::PointerRef> discovered_reachable;
+  uint64_t frozen_topology_epoch{};
   std::string source_hash;
   std::string compiler_hash;
   std::string schema_hash;
@@ -59,6 +66,11 @@ struct ViewReport {
 };
 
 Capture make_capture(const ir::Module& module, const core::Arena& arena);
+// Runs discover_reachable from `seeds`, records the reachable subset on
+// `capture`, and drops allocations (and graph_references) that the walk
+// did not reach. Replay of that package must not invent the dropped nodes.
+bool attach_discovery(Capture* capture, const core::Arena& arena,
+                      const std::vector<core::PointerRef>& seeds, std::string* error = nullptr);
 std::string serialize(const Capture& capture);
 bool deserialize(const std::string& text, Capture* capture, std::string* error = nullptr);
 bool replay(const Capture& capture, ReplayResult* result, std::string* error = nullptr);

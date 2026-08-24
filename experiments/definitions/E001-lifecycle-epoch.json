@@ -6,8 +6,8 @@
   "backends": ["cpu-reference"],
   "variants": ["active", "retire", "representation-transform", "consume-input"],
   "metrics": ["fault_code", "generation_valid", "epoch_valid"],
-  "protocol": {"deterministic": true, "random_sequences": 1000},
+  "protocol": {"deterministic": true, "random_sequences": 100000},
   "correctness": {"oracle": "reference-lifecycle-model", "tolerance": "exact"},
   "requirements": ["generation", "representation_epoch", "graph_epoch"],
-  "judgement": "all stale references are rejected without accessing a reused allocation"
+  "judgement": "all stale references are rejected without accessing a reused allocation; random model is 100000 sequences",
 }

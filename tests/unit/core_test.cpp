@@ -1269,5 +1269,82 @@ int main() {
     assert(plan.validate());
   }
 
+  {
+    vg::core::Arena arena;
+    auto& left = arena.allocate(32);
+    auto& right = arena.allocate(32);
+    auto& unused = arena.allocate(32);
+    (void)unused;
+    vg::core::Certificate parent;
+    parent.ranges.push_back({left.id, 0, 16, vg::ir::Access::Read, 0});
+    vg::core::Certificate child;
+    child.ranges.push_back({left.id, 16, 16, vg::ir::Access::Write, 0});
+    vg::core::Certificate composed;
+    std::string compose_error;
+    assert(vg::core::compose_certificates({parent, child}, &composed, &compose_error));
+    assert(composed.covers(parent.ranges.front()));
+    assert(composed.covers(child.ranges.front()));
+    vg::ir::Effect forged{right.id, 0, 8, vg::ir::Access::Read, 0};
+    assert(!composed.covers(forged));
+    vg::core::Certificate empty_out;
+    assert(!vg::core::compose_certificates({}, &empty_out, &compose_error));
+    assert(compose_error == "certificate composition requires at least one child certificate");
+
+    vg::core::GraphEpochBuilder left_builder(&arena);
+    assert(left_builder.add_reference(arena, {left.id, left.generation}));
+    vg::core::GraphEpoch left_epoch;
+    assert(left_builder.seal(&left_epoch));
+    vg::core::AccessCertificate left_cert;
+    left_cert.mode = vg::core::AccessCertificateMode::DiscoverThenLease;
+    left_cert.epoch = left_epoch;
+
+    vg::core::GraphEpochBuilder right_builder(&arena);
+    assert(right_builder.add_reference(arena, {right.id, right.generation}));
+    vg::core::GraphEpoch right_epoch;
+    assert(right_builder.seal(&right_epoch));
+    vg::core::AccessCertificate right_cert;
+    right_cert.mode = vg::core::AccessCertificateMode::DiscoverThenLease;
+    right_cert.epoch = right_epoch;
+
+    vg::core::AccessCertificate union_cert;
+    bool exploded = false;
+    assert(vg::core::compose_access_certificates(arena, {left_cert, right_cert}, &union_cert, &exploded,
+                                                 &compose_error));
+    assert(union_cert.epoch.references().size() == 2);
+    assert(!exploded);
+    assert(vg::core::certificate_covers_discovery_witness(union_cert, left_cert.epoch.references()));
+    assert(vg::core::certificate_covers_discovery_witness(union_cert, right_cert.epoch.references()));
+    std::vector<vg::core::PointerRef> forged_witness{{unused.id, unused.generation}};
+    assert(!vg::core::certificate_covers_discovery_witness(union_cert, forged_witness, &compose_error));
+    assert(compose_error == "discovery witness is not covered by the certificate");
+
+    vg::core::GraphEpochBuilder unused_builder(&arena);
+    assert(unused_builder.add_reference(arena, {unused.id, unused.generation}));
+    vg::core::GraphEpoch unused_epoch;
+    assert(unused_builder.seal(&unused_epoch));
+    vg::core::AccessCertificate unused_cert;
+    unused_cert.mode = vg::core::AccessCertificateMode::DiscoverThenLease;
+    unused_cert.epoch = unused_epoch;
+
+    vg::core::AccessCertificate exploded_cert;
+    bool did_explode = false;
+    assert(vg::core::compose_access_certificates(arena, {left_cert, right_cert, unused_cert}, &exploded_cert,
+                                                 &did_explode, &compose_error));
+    assert(exploded_cert.epoch.references().size() == 3);
+    assert(did_explode);
+
+    auto& extra = arena.allocate(8);
+    vg::core::GraphEpochBuilder later_builder(&arena);
+    assert(later_builder.add_reference(arena, {extra.id, extra.generation}));
+    vg::core::GraphEpoch later_epoch;
+    assert(later_builder.seal(&later_epoch));
+    vg::core::AccessCertificate later_cert;
+    later_cert.mode = vg::core::AccessCertificateMode::DiscoverThenLease;
+    later_cert.epoch = later_epoch;
+    vg::core::AccessCertificate mixed;
+    assert(!vg::core::compose_access_certificates(arena, {left_cert, later_cert}, &mixed, nullptr, &compose_error));
+    assert(compose_error == "cannot compose access certificates from different graph epochs");
+  }
+
   return 0;
 }
