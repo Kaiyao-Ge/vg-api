@@ -1,3 +1,9 @@
+# CodeQL local analysis artifacts
+/codeql-db/
+/codeql-db-none/
+/results.sarif
+/results.csv
+
 # Build outputs
 /build/
 /out/
