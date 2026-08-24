@@ -1,42 +1,57 @@
-# Advanced CodeQL setup for vg-api.
-# GitHub's default/autobuild setup often fails here: this is a CMake C++20
-# project that must be compiled without Metal, Vulkan, or sanitizers.
+# CodeQL for vg-api.
+# GitHub's stock Advanced template uses build-mode: none (or a placeholder
+# manual step that exits 1). C++ here needs a real CMake build without Metal,
+# Vulkan, or sanitizers. Python can stay build-mode: none.
 #
-# Run from the Actions tab → CodeQL → Run workflow.
+# Manual run: Actions → CodeQL → Run workflow.
 
 name: CodeQL
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
-  security-events: write
-  actions: read
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   analyze:
-    name: Analyze C/C++
+    name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: python
+            build-mode: none
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Install build tools
+      - name: Install C++ build tools
+        if: matrix.build-mode == 'manual'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ninja-build
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
-          languages: cpp
-          build-mode: manual
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
 
       - name: Configure and build
+        if: matrix.build-mode == 'manual'
         run: |
           cmake -S . -B build/codeql -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -49,7 +64,6 @@ jobs:
           cmake --build build/codeql
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
-          category: "/language:cpp"
-          upload: true
+          category: "/language:${{ matrix.language }}"
