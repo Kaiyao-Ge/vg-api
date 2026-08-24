@@ -66,3 +66,10 @@ venv/
 *.log
 *.tmp
 *.temp
+
+# CodeQL generated files
+codeql-*/
+.codeql/
+.codeql-cache/
+.codeql-results/
+.codeql-cache/
