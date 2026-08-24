@@ -2,10 +2,12 @@
 #include "golden_format.h"
 #include "ir/ir.h"
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
 std::string read_file(const std::string& path) {
@@ -15,9 +17,9 @@ std::string read_file(const std::string& path) {
   buffer << input.rdbuf();
   return buffer.str();
 }
-void write_file(const std::string& path, const std::string& content) {
+void write_file(const std::filesystem::path& path, std::string_view content) {
   std::ofstream output(path);
-  if (!output) throw std::runtime_error("cannot write: " + path);
+  if (!output) throw std::runtime_error("cannot write: " + path.string());
   output << content;
 }
 }  // namespace

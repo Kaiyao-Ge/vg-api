@@ -14,7 +14,7 @@ void emit_text(std::ostringstream& out, const char* field, const std::string& va
 
 void emit_pairs(std::ostringstream& out, const char* field,
                 std::vector<std::pair<std::string, uint64_t>> pairs) {
-  std::sort(pairs.begin(), pairs.end());
+  std::ranges::sort(pairs);
   out << field << '=' << pairs.size() << '\n';
   for (const auto& pair : pairs)
     out << "  " << pair.first.size() << ':' << pair.first << '=' << pair.second << '\n';
@@ -82,7 +82,7 @@ PipelineClassification classify_pipeline_state(const PipelineKey& base,
   for (const auto& block : blocks) {
     switch (block.kind) {
       case StateBlockKind::PipelineKey: {
-        const auto existing = std::find_if(result.key.raster_state.begin(), result.key.raster_state.end(),
+        const auto existing = std::ranges::find_if(result.key.raster_state,
                                            [&](const std::pair<std::string, uint64_t>& entry) {
                                              return entry.first == block.name;
                                            });

@@ -31,7 +31,7 @@ TaskGraph make_graph(const std::vector<uint32_t>& node_classes) {
 }
 
 std::vector<uint32_t> sorted(std::vector<uint32_t> values) {
-  std::sort(values.begin(), values.end());
+  std::ranges::sort(values);
   return values;
 }
 

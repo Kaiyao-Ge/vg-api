@@ -6,7 +6,7 @@
 #include <vector>
 
 namespace vg::ir {
-enum class Access : uint64_t { Read = 1, Write = 2, Atomic = 4, Publish = 8 };
+enum class Access : uint64_t { None = 0, Read = 1, Write = 2, Atomic = 4, Publish = 8 };
 struct Effect { uint64_t allocation{}; uint64_t offset{}; uint64_t size{}; Access access{}; uint32_t representation_epoch{}; };
 // ref_operand is only meaningful for load_via/store_via (E002): a 1-based
 // index into Module::instructions naming the load_ref this instruction

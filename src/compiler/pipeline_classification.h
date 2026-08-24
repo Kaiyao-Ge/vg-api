@@ -61,11 +61,11 @@ struct PipelineKey {
   // Deterministic, sorted, stable text. Field-tagged and length-delimited so
   // two different keys cannot produce the same text by concatenation
   // accident, which would make the digest below silently alias them.
-  std::string canonical() const;
+  [[nodiscard]] std::string canonical() const;
   // First 8 bytes of sha256(canonical()), reused from ir/sha256.h rather than
   // an ad-hoc mixer so the digest is reproducible across runs, machines and
   // future readers of a recorded experiment artifact.
-  uint64_t hash() const;
+  [[nodiscard]] uint64_t hash() const;
 };
 
 // The audit trail of one classification: not just the key, but what was kept
@@ -148,10 +148,10 @@ class PipelineClassificationCache {
   bool acquire(const PipelineKey& key, const std::string& trigger_reason,
                const std::function<bool(uint64_t* binary_size, std::string* error)>& create,
                SpecializationReport* out, std::string* error = nullptr);
-  uint32_t pipeline_count() const;
-  uint32_t cache_hits() const;
-  uint32_t cache_misses() const;
-  const std::vector<SpecializationReport>& reports() const;
+  [[nodiscard]] uint32_t pipeline_count() const;
+  [[nodiscard]] uint32_t cache_hits() const;
+  [[nodiscard]] uint32_t cache_misses() const;
+  [[nodiscard]] const std::vector<SpecializationReport>& reports() const;
   void clear();
 
  private:

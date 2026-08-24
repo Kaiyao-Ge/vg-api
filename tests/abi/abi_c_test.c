@@ -22,7 +22,7 @@ _Static_assert(offsetof(VgRegionDesc, rank) == offsetof(VgRegionDesc, layout_cla
 _Static_assert(sizeof(VgRegionDesc) % 8 == 0, "VgRegionDesc must stay 8-byte aligned for capture ABI");
 
 static unsigned g_logs;
-static void VG_CALL log_callback(void* user, uint32_t severity, uint32_t category, const char* message) {
+static void VG_CALL log_callback(void* user, uint32_t severity, uint32_t category, const char* message) {  // NOLINT(bugprone-easily-swappable-parameters)
   (void)user; (void)severity; (void)category; (void)message; ++g_logs;
 }
 

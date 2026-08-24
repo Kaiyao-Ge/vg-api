@@ -12,14 +12,14 @@ int main() {
   auto& allocation = arena.allocate(16);
   assert(allocation.id == 1 && allocation.generation == 1);
   assert(arena.topology_epoch() == 1);
-  assert(arena.lookup(allocation.id, allocation.generation) != nullptr);
+  assert(arena.lookup(vg::core::PointerRef{allocation.id, allocation.generation}) != nullptr);
   assert(arena.acquire(allocation.id, allocation.generation));
   std::string transform_error;
   assert(!arena.transform(allocation.id, allocation.generation, nullptr, &transform_error));
   assert(arena.release(allocation.id, allocation.generation));
   uint32_t representation_epoch = 0;
   assert(arena.transform(allocation.id, allocation.generation, &representation_epoch) && representation_epoch == 1);
-  assert(arena.lookup(allocation.id, allocation.generation, representation_epoch) != nullptr);
+  assert(arena.lookup(vg::core::RepresentationRef{allocation.id, allocation.generation, representation_epoch}) != nullptr);
   assert(!arena.transform(allocation.id, allocation.generation, 0, nullptr, &transform_error));
   const vg::core::ConsumeProof discharged{true, true, true, true};
   assert(!arena.consume(allocation.id, allocation.generation, representation_epoch,
@@ -27,7 +27,7 @@ int main() {
          transform_error.rfind("ConsumeInput proof incomplete", 0) == 0);
   assert(arena.consume(allocation.id, allocation.generation, representation_epoch, discharged,
                        &transform_error));
-  assert(arena.lookup(allocation.id, 1) == nullptr);
+  assert(arena.lookup(vg::core::PointerRef{allocation.id, 1}) == nullptr);
   auto& second_allocation = arena.allocate(16);
 
 
@@ -540,12 +540,12 @@ int main() {
     assert(array_view.byte_size() == 344);
 
     // Offsets are slice-major, then ascending mip level, tightly packed.
-    assert(array_view.subresource_byte_offset(0, 0) == 0);
-    assert(array_view.subresource_byte_offset(0, 1) == 128);
-    assert(array_view.subresource_byte_offset(0, 2) == 160);
-    assert(array_view.subresource_byte_offset(0, 3) == 168);
-    assert(array_view.subresource_byte_offset(1, 0) == 172);
-    assert(array_view.subresource_byte_offset(1, 3) == 340);
+    assert(array_view.subresource_byte_offset({0, 0}) == 0);
+    assert(array_view.subresource_byte_offset({0, 1}) == 128);
+    assert(array_view.subresource_byte_offset({0, 2}) == 160);
+    assert(array_view.subresource_byte_offset({0, 3}) == 168);
+    assert(array_view.subresource_byte_offset({1, 0}) == 172);
+    assert(array_view.subresource_byte_offset({1, 3}) == 340);
   }
 
   // --- RepresentationEpoch/Builder (02 §4.1): a representation transform
@@ -654,7 +654,7 @@ int main() {
     const uint32_t consume_generation = consume_backing.generation;
     uint32_t consume_epoch = 0;
     assert(consume_arena.transform(consume_id, consume_generation, &consume_epoch) && consume_epoch == 1);
-    assert(consume_arena.lookup(consume_id, consume_generation)->live_representations == 2);
+    assert(consume_arena.lookup(vg::core::PointerRef{consume_id, consume_generation})->live_representations == 2);
 
     // An incomplete proof is refused before any state is touched, by both
     // destructive operations.
@@ -670,7 +670,7 @@ int main() {
                                   vg::core::ConsumeProof{true, true, true, false}, &consume_error));
     assert(consume_error ==
            "ConsumeInput proof incomplete: destructive-failure semantics were not accepted");
-    assert(consume_arena.lookup(consume_id, consume_generation, consume_epoch) != nullptr);
+    assert(consume_arena.lookup(vg::core::RepresentationRef{consume_id, consume_generation, consume_epoch}) != nullptr);
 
     // consume_representation() is the transform form (06 §11): the object
     // survives -- identity, generation and freshly published epoch all stay
@@ -680,7 +680,7 @@ int main() {
     assert(consume_arena.consume_representation(consume_id, consume_generation, consume_epoch, discharged,
                                                 &released, &consume_error));
     assert(released == 64);
-    const auto* survivor = consume_arena.lookup(consume_id, consume_generation, consume_epoch);
+    const auto* survivor = consume_arena.lookup(vg::core::RepresentationRef{consume_id, consume_generation, consume_epoch});
     assert(survivor != nullptr);
     assert(survivor->state == vg::core::ObjectState::Active);
     assert(survivor->generation == consume_generation);
@@ -705,10 +705,10 @@ int main() {
     assert(retired.generation == retire_generation + 1);
     assert(retired.live_representations == 0);
     assert(retired.bytes.empty());
-    assert(retire_arena.lookup(retire_id, retire_generation) == nullptr);
+    assert(retire_arena.lookup(vg::core::PointerRef{retire_id, retire_generation}) == nullptr);
     // 10 §5: a retired generation is never visible again, and the bumped one
     // was never handed out either.
-    assert(retire_arena.lookup(retire_id, retire_generation + 1) == nullptr);
+    assert(retire_arena.lookup(vg::core::PointerRef{retire_id, retire_generation + 1}) == nullptr);
     assert(!retire_arena.consume(retire_id, retire_generation, retire_epoch, discharged, &consume_error));
     assert(consume_error == "stale allocation or representation epoch for consume");
 
@@ -758,14 +758,15 @@ int main() {
     vg::core::FacetPool pool;
     vg::hal::Submission submission;
     std::string stage_error;
-    assert(!vg::hal::run_representation_stage(
+    const bool physical_fault_rejected = !vg::hal::run_representation_stage(
         {request}, stage_arena, pool,
         [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost*,
            std::string* physical_error) {
           if (physical_error) *physical_error = "injected physical transform fault";
           return false;
         },
-        &submission, &stage_error));
+        &submission, &stage_error);
+    assert(physical_fault_rejected);
     assert(stage_error.find("injected physical transform fault") != std::string::npos);
     assert(submission.consumed_allocation_count == 0);
     assert(submission.released_backing_bytes == 0);
@@ -773,8 +774,8 @@ int main() {
     assert(backing.generation == generation);
     assert(backing.state == vg::core::ObjectState::Active);
     assert(backing.representation_epoch == epoch_before + 1);
-    assert(stage_arena.lookup(backing.id, generation, epoch_before) == nullptr);
-    assert(stage_arena.lookup(backing.id, generation, backing.representation_epoch) != nullptr);
+    assert(stage_arena.lookup(vg::core::RepresentationRef{backing.id, generation, epoch_before}) == nullptr);
+    assert(stage_arena.lookup(vg::core::RepresentationRef{backing.id, generation, backing.representation_epoch}) != nullptr);
   }
 
   {
@@ -833,14 +834,14 @@ int main() {
     vg::core::FacetRef live{};
     std::string hold_error;
     assert(pool.acquire(hold_arena, view, vg::core::FacetKind::Sample, &live, &hold_error));
-    assert(pool.references(backing.id, backing.generation, epoch_before));
+    assert(pool.references(vg::core::RepresentationRef{backing.id, backing.generation, epoch_before}));
     vg::hal::RepresentationRequest request;
     request.view = view;
     request.target_kind = vg::core::FacetKind::Sample;
     request.consume_input = true;
     request.consume_proof = discharged;
     vg::hal::Submission submission;
-    assert(!vg::hal::run_representation_stage(
+    const bool live_facet_rejected = !vg::hal::run_representation_stage(
         {request}, hold_arena, pool,
         [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost* cost,
            std::string*) {
@@ -848,14 +849,15 @@ int main() {
           cost->new_backing_bytes = 16;
           return true;
         },
-        &submission, &hold_error));
+        &submission, &hold_error);
+    assert(live_facet_rejected);
     assert(hold_error.find("a facet token still names the old representation") != std::string::npos);
     assert(backing.bytes == original);
     assert(backing.representation_epoch == epoch_before);
     assert(pool.lookup(hold_arena, live) != nullptr);
     assert(pool.retire(live, &hold_error));
-    assert(!pool.references(backing.id, backing.generation, epoch_before));
-    assert(vg::hal::run_representation_stage(
+    assert(!pool.references(vg::core::RepresentationRef{backing.id, backing.generation, epoch_before}));
+    const bool consume_after_retire = vg::hal::run_representation_stage(
         {request}, hold_arena, pool,
         [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost* cost,
            std::string*) {
@@ -863,7 +865,8 @@ int main() {
           cost->new_backing_bytes = 16;
           return true;
         },
-        &submission, &hold_error));
+        &submission, &hold_error);
+    assert(consume_after_retire);
     assert(submission.consumed_allocation_count == 1);
     assert(backing.bytes.empty());
   }
@@ -887,23 +890,23 @@ int main() {
     // first transform is refused predictably rather than blocking.
     assert(!budget_arena.transform(budget_id, budget_generation, nullptr, &budget_error));
     assert(budget_error == "in-flight representation budget exceeded");
-    assert(budget_arena.lookup(budget_id, budget_generation)->representation_epoch == 0);
+    assert(budget_arena.lookup(vg::core::PointerRef{budget_id, budget_generation})->representation_epoch == 0);
 
     budget_arena.set_max_in_flight_representations(2);
     uint32_t budget_epoch = 0;
     assert(budget_arena.transform(budget_id, budget_generation, &budget_epoch) && budget_epoch == 1);
-    assert(budget_arena.lookup(budget_id, budget_generation)->live_representations == 2);
+    assert(budget_arena.lookup(vg::core::PointerRef{budget_id, budget_generation})->live_representations == 2);
     // A second transform is refused until a version is released.
     assert(!budget_arena.transform(budget_id, budget_generation, nullptr, &budget_error));
     assert(budget_error == "in-flight representation budget exceeded");
     assert(budget_arena.release_representation(budget_id, budget_generation, &budget_error));
-    assert(budget_arena.lookup(budget_id, budget_generation)->live_representations == 1);
+    assert(budget_arena.lookup(vg::core::PointerRef{budget_id, budget_generation})->live_representations == 1);
     assert(budget_arena.transform(budget_id, budget_generation, &budget_epoch) && budget_epoch == 2);
 
     // release_representation() never drops the last version: an Active
     // allocation always retains its current representation.
     assert(budget_arena.release_representation(budget_id, budget_generation, &budget_error));
-    assert(budget_arena.lookup(budget_id, budget_generation)->live_representations == 1);
+    assert(budget_arena.lookup(vg::core::PointerRef{budget_id, budget_generation})->live_representations == 1);
     assert(!budget_arena.release_representation(budget_id, budget_generation, &budget_error));
     assert(budget_error == "an active allocation always retains its current representation");
     // A stale token cannot release a version either.
@@ -915,7 +918,7 @@ int main() {
     budget_arena.set_max_in_flight_representations(0);
     assert(budget_arena.transform(budget_id, budget_generation, &budget_epoch) && budget_epoch == 3);
     assert(budget_arena.transform(budget_id, budget_generation, &budget_epoch) && budget_epoch == 4);
-    assert(budget_arena.lookup(budget_id, budget_generation)->live_representations == 3);
+    assert(budget_arena.lookup(vg::core::PointerRef{budget_id, budget_generation})->live_representations == 3);
   }
 
   // --- FacetPool::snapshot_generations()/generation_valid() (06 §6.4): a
@@ -1058,7 +1061,7 @@ int main() {
     assert(stage_slot != nullptr);
     assert(stage_slot->kind == vg::core::FacetKind::Sample);
     assert(stage_slot->representation_epoch == 1);
-    assert(stage_arena.lookup(stage_id, stage_generation)->representation_epoch == 1);
+    assert(stage_arena.lookup(vg::core::PointerRef{stage_id, stage_generation})->representation_epoch == 1);
     // 06 §11's peak-memory report: the superseded backing is counted whether
     // or not it is released, and nothing was released here.
     assert(stage_submission.old_backing_bytes == 256);
@@ -1170,7 +1173,7 @@ int main() {
     // being pretended away.
     assert(stale_submission.representation_epoch.sealed());
     assert(stale_submission.representation_facets.size() == 1);
-    assert(stale_arena.lookup(stale_backing.id, stale_backing.generation)->representation_epoch == 1);
+    assert(stale_arena.lookup(vg::core::PointerRef{stale_backing.id, stale_backing.generation})->representation_epoch == 1);
   }
 
   // --- TASK-D1 / ADR-035: lease, budget, overflow are independent types.

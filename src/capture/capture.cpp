@@ -165,7 +165,7 @@ void apply_optional_view(const Capture& capture, Value::Object* root) {
 }
 
 bool environment_has(const ReplayEnvironment& environment, const std::string& capability) {
-  return std::find(environment.capabilities.begin(), environment.capabilities.end(), capability) !=
+  return std::ranges::find(environment.capabilities, capability) !=
          environment.capabilities.end();
 }
 
@@ -219,7 +219,7 @@ std::string serialize(const Capture& capture) {
   Value::Array certificate; for (const auto& effect : capture.certificate.ranges) certificate.push_back(effect_value(effect));
   Value::Array references; for (const auto& reference : capture.graph_references) references.emplace_back(Value(Value::Object{{"allocation", Value(static_cast<int64_t>(reference.allocation))}, {"generation", Value(static_cast<int64_t>(reference.generation))}}));
   Value::Object root{{"allocations", Value(std::move(allocations))}, {"certificate", Value(std::move(certificate))}, {"compiler_hash", Value(capture.compiler_hash)}, {"graph_epoch", Value(static_cast<int64_t>(capture.graph_epoch))}, {"graph_references", Value(std::move(references))}, {"ir", json::parse(capture.module.canonical_json)}, {"ir_hash", Value(capture.module.hash)}, {"schema", Value(std::string("vg.capture/v1"))}, {"schema_hash", Value(capture.schema_hash.empty() ? "sha256:vg.capture/v1" : capture.schema_hash)}, {"schema_version", Value(int64_t{2})}, {"source_hash", Value(capture.source_hash)}, {"timeline_value", Value(static_cast<int64_t>(capture.timeline_value))}, {"witness", witness_value(capture.witness)}};
-  if (capture.has_execution) root.emplace("execution", Value(Value::Object{{"fault_code", Value(capture.execution.fault.code)}, {"fault_effect", effect_value(capture.execution.fault.effect)}, {"fault_instruction", Value(static_cast<int64_t>(capture.execution.fault.instruction_index))}, {"fault_message", Value(capture.execution.fault.message)}, {"message", Value(capture.execution.message)}, {"ok", Value(int64_t(capture.execution.ok ? 1 : 0))}, {"outputs_valid", Value(int64_t(capture.execution.outputs_valid ? 1 : 0))}, {"poison", Value(static_cast<int64_t>(capture.execution.poison))}}));
+  if (capture.has_execution) root.emplace("execution", Value(Value::Object{{"fault_code", Value(capture.execution.fault.code)}, {"fault_effect", effect_value(capture.execution.fault.effect)}, {"fault_instruction", Value(static_cast<int64_t>(capture.execution.fault.instruction_index))}, {"fault_message", Value(capture.execution.fault.message)}, {"message", Value(capture.execution.message)}, {"ok", Value(static_cast<int64_t>(capture.execution.ok ? 1 : 0))}, {"outputs_valid", Value(static_cast<int64_t>(capture.execution.outputs_valid ? 1 : 0))}, {"poison", Value(static_cast<int64_t>(capture.execution.poison))}}));
   apply_optional_view(capture, &root);
   apply_optional_discovery(capture, &root);
   const auto content = json::canonical(Value(root));
@@ -309,7 +309,7 @@ bool replay(const Capture& capture, const ReplayEnvironment& environment, Replay
       }
     }
     if (refuse_incompatible_capabilities(capture, environment, error)) return false;
-    for (const auto& snapshot : capture.allocations) { if (!arena.import_allocation(snapshot.id, snapshot.generation, snapshot.size, snapshot.representation_epoch, snapshot.state, snapshot.bytes, error)) return false; result->relocation[snapshot.id] = snapshot.id; }
+    for (const auto& snapshot : capture.allocations) { if (!arena.import_allocation(core::RepresentationRef{snapshot.id, snapshot.generation, snapshot.representation_epoch}, snapshot.size, snapshot.state, snapshot.bytes, error)) return false; result->relocation[snapshot.id] = snapshot.id; }
     if (!capture.graph_references.empty()) {
       core::GraphEpochBuilder graph_builder(&arena, capture.graph_epoch == 0 ? 1 : capture.graph_epoch);
       for (const auto& reference : capture.graph_references) { auto it = result->relocation.find(reference.allocation); if (it == result->relocation.end()) throw std::runtime_error("capture graph relocation missing allocation"); if (!graph_builder.add_reference(arena, {it->second, reference.generation}, error)) return false; }

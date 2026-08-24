@@ -6,6 +6,7 @@
 #include "ir/ir.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -44,7 +45,7 @@ vg::ir::Module load_and_bind(const std::string& path, vg::core::Arena& arena) {
 
   std::vector<uint64_t> original_ids;
   for (const auto& instruction : module.instructions)
-    if (std::find(original_ids.begin(), original_ids.end(), instruction.allocation) == original_ids.end())
+    if (std::ranges::find(original_ids, instruction.allocation) == original_ids.end())
       original_ids.push_back(instruction.allocation);
 
   std::map<uint64_t, uint64_t> remap;
@@ -114,13 +115,13 @@ bool run_contract_checks(vg::hal::DeviceHal& device, const std::string& backend_
 }
 
 bool run_golden_fixture_invariant(vg::hal::DeviceHal& device, const std::string& backend_name,
-                                  const std::string& repo_root) {
+                                  const std::filesystem::path& repo_root) {
   bool all_ok = true;
   auto reference_device = vg::reference::make_device_hal();
   for (const char* name : vg::golden::kFixtureNames) {
     vg::core::Arena device_arena;
     vg::core::Arena reference_arena;
-    const std::string path = repo_root + "/tests/fixtures/ir/" + std::string(name) + ".vgir.json";
+    const std::string path = (repo_root / "tests/fixtures/ir" / (std::string(name) + ".vgir.json")).string();
     const auto device_module = load_and_bind(path, device_arena);
     const auto reference_module = load_and_bind(path, reference_arena);
 
@@ -166,7 +167,7 @@ bool run_golden_fixture_invariant(vg::hal::DeviceHal& device, const std::string&
 
     bool bytes_match = true;
     for (const auto& [id, allocation] : reference_arena.allocations()) {
-      const auto* device_allocation = device_arena.lookup(id, allocation.generation, allocation.representation_epoch);
+      const auto* device_allocation = device_arena.lookup(vg::core::RepresentationRef{id, allocation.generation, allocation.representation_epoch});
       if (device_allocation == nullptr || device_allocation->bytes != allocation.bytes) bytes_match = false;
     }
     check(bytes_match, backend_name, std::string(name) + ": byte-exact match against reference oracle", &all_ok);

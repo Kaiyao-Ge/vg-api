@@ -9,7 +9,7 @@
 namespace vg::core {
 
 bool GraphEpoch::contains(PointerRef reference) const {
-  return std::any_of(references_.begin(), references_.end(), [&](PointerRef candidate) {
+  return std::ranges::any_of(references_, [&](PointerRef candidate) {
     return candidate.allocation == reference.allocation && candidate.generation == reference.generation;
   });
 }
@@ -17,7 +17,7 @@ bool GraphEpoch::contains(PointerRef reference) const {
 bool GraphEpochBuilder::add_reference(PointerRef reference, std::string* error) {
   if (sealed_) { if (error) *error = "graph epoch is sealed"; return false; }
   if (reference.generation == 0) { if (error) *error = "graph reference generation must be non-zero"; return false; }
-  if (std::any_of(references_.begin(), references_.end(), [&](PointerRef candidate) {
+  if (std::ranges::any_of(references_, [&](PointerRef candidate) {
         return candidate.allocation == reference.allocation && candidate.generation == reference.generation;
       })) return true;
   references_.push_back(reference);
@@ -25,7 +25,7 @@ bool GraphEpochBuilder::add_reference(PointerRef reference, std::string* error) 
 }
 
 bool GraphEpochBuilder::add_reference(const Arena& arena, PointerRef reference, std::string* error) {
-  if (arena.lookup(reference.allocation, reference.generation) == nullptr) {
+  if (arena.lookup(reference) == nullptr) {
     if (error) *error = "graph reference is not active in arena";
     return false;
   }
@@ -52,7 +52,7 @@ const char* ConsumeProof::first_unmet() const {
 }
 
 bool RepresentationEpoch::contains(RepresentationRef reference) const {
-  return std::any_of(representations_.begin(), representations_.end(), [&](RepresentationRef candidate) {
+  return std::ranges::any_of(representations_, [&](RepresentationRef candidate) {
     return candidate.allocation == reference.allocation &&
            candidate.allocation_generation == reference.allocation_generation &&
            candidate.representation_epoch == reference.representation_epoch;
@@ -60,15 +60,14 @@ bool RepresentationEpoch::contains(RepresentationRef reference) const {
 }
 
 bool RepresentationEpoch::contains(FacetRef ref) const {
-  return std::any_of(facets_.begin(), facets_.end(), [&](FacetRef candidate) {
+  return std::ranges::any_of(facets_, [&](FacetRef candidate) {
     return candidate.index == ref.index && candidate.generation == ref.generation;
   });
 }
 
 bool RepresentationEpoch::stale(const Arena& arena) const {
-  return std::any_of(representations_.begin(), representations_.end(), [&](RepresentationRef reference) {
-    return arena.lookup(reference.allocation, reference.allocation_generation,
-                        reference.representation_epoch) == nullptr;
+  return std::ranges::any_of(representations_, [&](RepresentationRef reference) {
+    return arena.lookup(reference) == nullptr;
   });
 }
 
@@ -78,7 +77,7 @@ bool RepresentationEpochBuilder::add_representation(RepresentationRef reference,
     if (error) *error = "representation reference generation must be non-zero";
     return false;
   }
-  if (std::any_of(representations_.begin(), representations_.end(), [&](RepresentationRef candidate) {
+  if (std::ranges::any_of(representations_, [&](RepresentationRef candidate) {
         return candidate.allocation == reference.allocation &&
                candidate.allocation_generation == reference.allocation_generation &&
                candidate.representation_epoch == reference.representation_epoch;
@@ -89,7 +88,7 @@ bool RepresentationEpochBuilder::add_representation(RepresentationRef reference,
 
 bool RepresentationEpochBuilder::add_representation(const Arena& arena, uint64_t allocation,
                                                     uint32_t generation, std::string* error) {
-  const auto* record = arena.lookup(allocation, generation);
+  const auto* record = arena.lookup(PointerRef{allocation, generation});
   if (record == nullptr) {
     if (error) *error = "representation reference is not active in arena";
     return false;
@@ -104,7 +103,7 @@ bool RepresentationEpochBuilder::add_facet(const Arena& arena, const FacetPool& 
   const FacetSlot* slot = pool.lookup(arena, ref, &status);
   if (slot == nullptr) { if (error) *error = to_string(status); return false; }
   if (!add_representation(arena, slot->view.allocation, slot->view.allocation_generation, error)) return false;
-  if (!std::any_of(facets_.begin(), facets_.end(), [&](FacetRef candidate) {
+  if (!std::ranges::any_of(facets_, [&](FacetRef candidate) {
         return candidate.index == ref.index && candidate.generation == ref.generation;
       })) facets_.push_back(ref);
   return true;
@@ -126,21 +125,21 @@ bool pointer_ref_equal(PointerRef a, PointerRef b) { return a.allocation == b.al
 }
 
 bool PointerGraph::reachable(PointerRef from, uint64_t field_offset, PointerRef to) const {
-  return std::any_of(edges_.begin(), edges_.end(), [&](const Edge& edge) {
+  return std::ranges::any_of(edges_, [&](const Edge& edge) {
     return pointer_ref_equal(edge.from, from) && edge.field_offset == field_offset && pointer_ref_equal(edge.to, to);
   });
 }
 
-bool PointerGraph::reachable(PointerRef from, PointerRef to) const {
-  std::vector<PointerRef> worklist{from};
-  std::vector<PointerRef> seen{from};
+bool PointerGraph::reachable(ReachQuery query) const {
+  std::vector<PointerRef> worklist{query.from};
+  std::vector<PointerRef> seen{query.from};
   while (!worklist.empty()) {
     PointerRef current = worklist.back();
     worklist.pop_back();
     for (const auto& edge : edges_) {
       if (!pointer_ref_equal(edge.from, current)) continue;
-      if (pointer_ref_equal(edge.to, to)) return true;
-      if (std::any_of(seen.begin(), seen.end(), [&](PointerRef candidate) { return pointer_ref_equal(candidate, edge.to); })) continue;
+      if (pointer_ref_equal(edge.to, query.to)) return true;
+      if (std::ranges::any_of(seen, [&](PointerRef candidate) { return pointer_ref_equal(candidate, edge.to); })) continue;
       seen.push_back(edge.to);
       worklist.push_back(edge.to);
     }
@@ -226,7 +225,7 @@ bool PublicationRing::abort(uint32_t slot, std::string* error) {
 bool PublicationRing::publish_task(const TaskRecord& task, uint32_t* slot, std::string* error) {
   const int32_t reserved = reserve();
   if (reserved < 0) { if (error) *error = "publication ring quota overflow"; return false; }
-  const uint32_t index = static_cast<uint32_t>(reserved);
+  const auto index = static_cast<uint32_t>(reserved);
   if (!write(index, task, error)) { abort(index); return false; }
   if (!publish(index, error)) { abort(index); return false; }
   if (slot != nullptr) *slot = index;
@@ -244,73 +243,81 @@ Allocation& Arena::allocate(uint64_t size) {
   return it->second;
 }
 
-bool Arena::import_allocation(uint64_t id, uint32_t generation, uint64_t size,
-                              uint32_t representation_epoch, ObjectState state,
+bool Arena::import_allocation(const RepresentationRef& ref, uint64_t size, ObjectState state,
                               const std::vector<uint8_t>& bytes, std::string* error) {
-  if (id == 0 || generation == 0 || size == 0 || bytes.size() != size || allocations_.count(id) != 0) {
+  if (ref.allocation == 0 || ref.allocation_generation == 0 || size == 0 || bytes.size() != size ||
+      allocations_.count(ref.allocation) != 0) {
     if (error) *error = "invalid or duplicate capture allocation";
     return false;
   }
   Allocation allocation;
-  allocation.id = id;
-  allocation.generation = generation;
+  allocation.id = ref.allocation;
+  allocation.generation = ref.allocation_generation;
   allocation.size = size;
-  allocation.representation_epoch = representation_epoch;
+  allocation.representation_epoch = ref.representation_epoch;
   allocation.state = state;
   allocation.bytes = bytes;
-  allocations_.emplace(id, std::move(allocation));
-  next_id_ = std::max(next_id_, id + 1);
+  allocations_.emplace(ref.allocation, std::move(allocation));
+  next_id_ = std::max(next_id_, ref.allocation + 1);
   ++topology_epoch_;
   return true;
 }
 
-bool Arena::retire(uint64_t id, uint32_t generation) {
-  auto it = allocations_.find(id);
-  if (it == allocations_.end() || it->second.generation != generation || it->second.state != ObjectState::Active || it->second.in_flight != 0) return false;
+bool Arena::retire(const PointerRef& ref) {
+  auto it = allocations_.find(ref.allocation);
+  if (it == allocations_.end() || it->second.generation != ref.generation ||
+      it->second.state != ObjectState::Active || it->second.in_flight != 0)
+    return false;
   it->second.state = ObjectState::Retired;
   ++it->second.generation;
   ++topology_epoch_;
   return true;
 }
 
-Allocation* Arena::lookup(uint64_t id, uint32_t generation) {
-  auto it = allocations_.find(id);
-  if (it == allocations_.end() || it->second.state != ObjectState::Active || it->second.generation != generation) return nullptr;
+Allocation* Arena::lookup(const PointerRef& ref) {
+  auto it = allocations_.find(ref.allocation);
+  if (it == allocations_.end() || it->second.state != ObjectState::Active ||
+      it->second.generation != ref.generation)
+    return nullptr;
   return &it->second;
 }
 
-const Allocation* Arena::lookup(uint64_t id, uint32_t generation) const {
-  auto it = allocations_.find(id);
-  if (it == allocations_.end() || it->second.state != ObjectState::Active || it->second.generation != generation) return nullptr;
+const Allocation* Arena::lookup(const PointerRef& ref) const {
+  auto it = allocations_.find(ref.allocation);
+  if (it == allocations_.end() || it->second.state != ObjectState::Active ||
+      it->second.generation != ref.generation)
+    return nullptr;
   return &it->second;
 }
 
-Allocation* Arena::lookup(uint64_t id, uint32_t generation, uint32_t representation_epoch) {
-  auto* allocation = lookup(id, generation);
-  return allocation != nullptr && allocation->representation_epoch == representation_epoch ? allocation : nullptr;
+Allocation* Arena::lookup(const RepresentationRef& ref) {
+  auto* allocation = lookup(PointerRef{ref.allocation, ref.allocation_generation});
+  return allocation != nullptr && allocation->representation_epoch == ref.representation_epoch ? allocation
+                                                                                              : nullptr;
 }
 
-const Allocation* Arena::lookup(uint64_t id, uint32_t generation, uint32_t representation_epoch) const {
-  const auto* allocation = lookup(id, generation);
-  return allocation != nullptr && allocation->representation_epoch == representation_epoch ? allocation : nullptr;
+const Allocation* Arena::lookup(const RepresentationRef& ref) const {
+  const auto* allocation = lookup(PointerRef{ref.allocation, ref.allocation_generation});
+  return allocation != nullptr && allocation->representation_epoch == ref.representation_epoch ? allocation
+                                                                                              : nullptr;
 }
 
 bool Arena::acquire(uint64_t id, uint32_t generation) {
-  auto* allocation = lookup(id, generation);
+  auto* allocation = lookup(PointerRef{id, generation});
   if (allocation == nullptr) return false;
   ++allocation->in_flight;
   return true;
 }
 
 bool Arena::release(uint64_t id, uint32_t generation) {
-  auto* allocation = lookup(id, generation);
+  auto* allocation = lookup(PointerRef{id, generation});
   if (allocation == nullptr || allocation->in_flight == 0) return false;
   --allocation->in_flight;
   return true;
 }
 
 bool Arena::transform(uint64_t id, uint32_t generation, uint32_t* new_epoch, std::string* error) {
-  auto* allocation = lookup(id, generation);
+  auto* allocation = lookup(PointerRef{id, generation});
   if (allocation == nullptr) { if (error) *error = "stale allocation for representation transform"; return false; }
   if (allocation->in_flight != 0) { if (error) *error = "representation epoch is referenced in flight"; return false; }
   if (max_in_flight_representations_ != 0 &&
@@ -326,12 +333,12 @@ bool Arena::transform(uint64_t id, uint32_t generation, uint32_t* new_epoch, std
 }
 
 bool Arena::transform(uint64_t id, uint32_t generation, uint32_t expected_epoch, uint32_t* new_epoch, std::string* error) {
-  if (lookup(id, generation, expected_epoch) == nullptr) { if (error) *error = "representation epoch is stale"; return false; }
+  if (lookup(RepresentationRef{id, generation, expected_epoch}) == nullptr) { if (error) *error = "representation epoch is stale"; return false; }
   return transform(id, generation, new_epoch, error);
 }
 
 bool Arena::release_representation(uint64_t id, uint32_t generation, std::string* error) {
-  auto* allocation = lookup(id, generation);
+  auto* allocation = lookup(PointerRef{id, generation});
   if (allocation == nullptr) { if (error) *error = "stale allocation for representation release"; return false; }
   if (allocation->live_representations <= 1) {
     if (error) *error = "an active allocation always retains its current representation";
@@ -349,7 +356,7 @@ bool Arena::consume_representation(uint64_t id, uint32_t generation, uint32_t ex
     if (error) *error = std::string("ConsumeInput proof incomplete: ") + unmet;
     return false;
   }
-  auto* allocation = lookup(id, generation, expected_epoch);
+  auto* allocation = lookup(RepresentationRef{id, generation, expected_epoch});
   if (allocation == nullptr) {
     if (error) *error = "stale allocation or representation epoch for consume";
     return false;
@@ -370,7 +377,7 @@ bool Arena::consume(uint64_t id, uint32_t generation, uint32_t expected_epoch, c
     if (error) *error = std::string("ConsumeInput proof incomplete: ") + unmet;
     return false;
   }
-  auto* allocation = lookup(id, generation, expected_epoch);
+  auto* allocation = lookup(RepresentationRef{id, generation, expected_epoch});
   if (allocation == nullptr) { if (error) *error = "stale allocation or representation epoch for consume"; return false; }
   if (allocation->in_flight != 0) { if (error) *error = "consume requires exclusive ownership"; return false; }
   allocation->state = ObjectState::Retired;
@@ -410,20 +417,20 @@ uint64_t CanonicalView::subresource_byte_size(uint32_t level) const {
   return bytes_per_row(level) * mip_height(level);
 }
 
-uint64_t CanonicalView::subresource_byte_offset(uint32_t layer, uint32_t level) const {
+uint64_t CanonicalView::subresource_byte_offset(SubresourceIndex index) const {
   uint64_t layer_bytes = 0;
   for (uint32_t candidate = 0; candidate < mip_levels; ++candidate) {
     layer_bytes += subresource_byte_size(candidate);
   }
-  uint64_t offset = layer_bytes * layer;
-  for (uint32_t candidate = 0; candidate < level; ++candidate) {
+  uint64_t offset = layer_bytes * index.array_layer;
+  for (uint32_t candidate = 0; candidate < index.mip_level; ++candidate) {
     offset += subresource_byte_size(candidate);
   }
   return offset;
 }
 
 uint64_t CanonicalView::byte_size() const {
-  return subresource_byte_offset(array_layers, 0);
+  return subresource_byte_offset({array_layers, 0});
 }
 
 bool CanonicalView::valid(std::string* error) const {
@@ -462,7 +469,7 @@ bool FacetPool::acquire(const Arena& arena, const CanonicalView& view, FacetKind
                         std::string* error) {
   if (out == nullptr) { if (error) *error = "facet ref output is required"; return false; }
   if (!view.valid(error)) return false;
-  const auto* allocation = arena.lookup(view.allocation, view.allocation_generation);
+  const auto* allocation = arena.lookup(PointerRef{view.allocation, view.allocation_generation});
   if (allocation == nullptr) { if (error) *error = "canonical view allocation is not active in arena"; return false; }
   if (allocation->size < view.byte_size()) {
     if (error) *error = "canonical view describes more texels than its allocation backs";
@@ -495,7 +502,7 @@ const FacetSlot* FacetPool::lookup(const Arena& arena, FacetRef ref, FacetStatus
   const FacetSlot& slot = slots_[ref.index];
   if (!slot.active) return fail(FacetStatus::Retired);
   if (slot.generation != ref.generation) return fail(FacetStatus::GenerationMismatch);
-  const auto* allocation = arena.lookup(slot.view.allocation, slot.view.allocation_generation);
+  const auto* allocation = arena.lookup(PointerRef{slot.view.allocation, slot.view.allocation_generation});
   if (allocation == nullptr) return fail(FacetStatus::AllocationLost);
   if (allocation->representation_epoch != slot.representation_epoch) return fail(FacetStatus::EpochStale);
   if (status) *status = FacetStatus::Ok;
@@ -516,7 +523,7 @@ size_t FacetPool::retire_stale(const Arena& arena) {
   for (uint32_t index = 0; index < slots_.size(); ++index) {
     FacetSlot& slot = slots_[index];
     if (!slot.active) continue;
-    const auto* allocation = arena.lookup(slot.view.allocation, slot.view.allocation_generation);
+    const auto* allocation = arena.lookup(PointerRef{slot.view.allocation, slot.view.allocation_generation});
     if (allocation != nullptr && allocation->representation_epoch == slot.representation_epoch) continue;
     retire_slot(index);
     ++retired;
@@ -572,10 +579,11 @@ bool FacetPool::generation_valid(FacetRef ref) const {
   return slot.active && slot.generation == ref.generation;
 }
 
-bool FacetPool::references(uint64_t allocation, uint32_t generation, uint32_t epoch) const {
+bool FacetPool::references(const RepresentationRef& ref) const {
   for (const FacetSlot& slot : slots_) {
-    if (slot.view.allocation != allocation || slot.view.allocation_generation != generation) continue;
-    if (slot.representation_epoch != epoch) continue;
+    if (slot.view.allocation != ref.allocation || slot.view.allocation_generation != ref.allocation_generation)
+      continue;
+    if (slot.representation_epoch != ref.representation_epoch) continue;
     if (slot.active || slot.in_flight > 0) return true;
   }
   return false;
@@ -621,7 +629,7 @@ bool TaskGraphBuilder::add_effect(uint32_t task, const ir::Effect& effect, std::
   return true;
 }
 
-bool TaskGraphBuilder::set_effects(uint32_t task, std::vector<ir::Effect> effects, std::string* error) {
+bool TaskGraphBuilder::set_effects(uint32_t task, const std::vector<ir::Effect>& effects, std::string* error) {
   if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
   if (task >= effects_.size()) { if (error) *error = "effect task index is out of range"; return false; }
   effects_[task].clear();
@@ -692,7 +700,7 @@ bool TaskGraph::validate_execution(std::string* error) const {
 
 bool TaskGraph::deterministic_order(std::vector<uint32_t>* out, std::string* error) const {
   if (out == nullptr) { if (error) *error = "deterministic order output is required"; return false; }
-  const uint32_t count = static_cast<uint32_t>(tasks_.size());
+  const auto count = static_cast<uint32_t>(tasks_.size());
   std::vector<std::vector<uint32_t>> adjacency(count);
   std::vector<uint32_t> in_degree(count, 0);
   for (const auto& dependency : dependencies_) {
@@ -704,7 +712,7 @@ bool TaskGraph::deterministic_order(std::vector<uint32_t>* out, std::string* err
   out->clear();
   out->reserve(count);
   while (!ready.empty()) {
-    std::sort(ready.begin(), ready.end());
+    std::ranges::sort(ready);
     const uint32_t node = ready.front();
     ready.erase(ready.begin());
     out->push_back(node);
@@ -745,7 +753,7 @@ bool EffectGraph::conflicts(const ir::Effect& before, const ir::Effect& after) {
 
 bool EffectGraph::validate_happens_before(const std::vector<std::vector<ir::Effect>>& effects,
                                           std::string* error) const {
-  const uint32_t count = static_cast<uint32_t>(effects.size());
+  const auto count = static_cast<uint32_t>(effects.size());
   std::vector<std::vector<uint32_t>> adjacency(count);
   for (const auto& edge : edges_) {
     if (edge.before >= count || edge.after >= count) {
@@ -902,7 +910,7 @@ bool effect_graph_deterministic_order(const EffectGraph& graph, uint32_t node_co
   out->clear();
   out->reserve(node_count);
   while (!ready.empty()) {
-    std::sort(ready.begin(), ready.end());
+    std::ranges::sort(ready);
     const uint32_t node = ready.front();
     ready.erase(ready.begin());
     out->push_back(node);
@@ -945,7 +953,7 @@ bool Timeline::validate_wait(uint64_t value, std::string* error) const {
 }
 
 bool Certificate::covers(const ir::Effect& effect) const {
-  return std::any_of(ranges.begin(), ranges.end(), [&](const ir::Effect& range) { return ir::effect_covers(range, effect); });
+  return std::ranges::any_of(ranges, [&](const ir::Effect& range) { return ir::effect_covers(range, effect); });
 }
 
 void AccessWitness::record(ir::Effect effect, uint32_t instruction_index) {
@@ -956,7 +964,7 @@ WitnessDiff AccessWitness::diff(const Certificate& certificate) const {
   WitnessDiff result;
   for (const auto& entry : entries_) if (!certificate.covers(entry.effect)) result.missing.push_back(entry.effect);
   for (const auto& range : certificate.ranges) {
-    const bool observed = std::any_of(entries_.begin(), entries_.end(), [&](const WitnessEntry& entry) {
+    const bool observed = std::ranges::any_of(entries_, [&](const WitnessEntry& entry) {
       return ir::effect_covers(range, entry.effect);
     });
     if (!observed) result.unused.push_back(range);
@@ -985,7 +993,7 @@ bool build_access_certificate(const Arena& arena, AccessCertificateMode mode,
   uint64_t scanned_bytes = 0;
   if (mode == AccessCertificateMode::CertifiedPinned) {
     for (const auto& reference : touched) {
-      const Allocation* allocation = arena.lookup(reference.allocation, reference.generation);
+      const Allocation* allocation = arena.lookup(reference);
       if (allocation == nullptr) { if (error) *error = "touched allocation is not active in arena"; return false; }
       if (!builder.add_reference(reference, error)) return false;
       scanned_bytes += allocation->size;
@@ -1031,7 +1039,7 @@ bool decode_pointer_ref(const std::vector<uint8_t>& bytes, size_t offset, Pointe
 }
 
 bool discovery_ref_seen(const std::vector<PointerRef>& seen, PointerRef ref) {
-  return std::any_of(seen.begin(), seen.end(), [&](PointerRef candidate) {
+  return std::ranges::any_of(seen, [&](PointerRef candidate) {
     return candidate.allocation == ref.allocation && candidate.generation == ref.generation;
   });
 }
@@ -1054,7 +1062,7 @@ bool discover_reachable(const Arena& arena, const std::vector<PointerRef>& seeds
       if (error) *error = "discovery seed is not a well-formed pointer ref";
       return false;
     }
-    if (arena.lookup(seed.allocation, seed.generation) == nullptr) {
+    if (arena.lookup(seed) == nullptr) {
       if (error) *error = "discovery seed is not an active allocation";
       return false;
     }
@@ -1074,7 +1082,7 @@ bool discover_reachable(const Arena& arena, const std::vector<PointerRef>& seeds
     }
     const PointerRef current = worklist.back();
     worklist.pop_back();
-    const Allocation* allocation = arena.lookup(current.allocation, current.generation);
+    const Allocation* allocation = arena.lookup(current);
     if (allocation == nullptr) {
       if (error) *error = "discovered allocation is no longer active";
       return false;
@@ -1094,7 +1102,7 @@ bool discover_reachable(const Arena& arena, const std::vector<PointerRef>& seeds
       // chase (02 §7.2: discovery Node has no side effects and does not
       // invent edges).
       if (child.allocation == 0 || child.generation == 0) continue;
-      if (arena.lookup(child.allocation, child.generation) == nullptr) continue;
+      if (arena.lookup(child) == nullptr) continue;
       if (discovery_ref_seen(out->reachable, child)) continue;
       out->reachable.push_back(child);
       worklist.push_back(child);
@@ -1102,7 +1110,7 @@ bool discover_reachable(const Arena& arena, const std::vector<PointerRef>& seeds
   }
 
   for (const auto& ref : out->reachable) {
-    const Allocation* allocation = arena.lookup(ref.allocation, ref.generation);
+    const Allocation* allocation = arena.lookup(ref);
     if (allocation != nullptr) out->result_bytes += allocation->size;
   }
   const auto elapsed = std::chrono::steady_clock::now() - started;
@@ -1225,7 +1233,7 @@ bool compose_access_certificates(const Arena& arena, const std::vector<AccessCer
                                                : AccessCertificateMode::CertifiedPinned);
   uint64_t bytes = 0;
   for (const auto& ref : epoch.references()) {
-    const Allocation* allocation = arena.lookup(ref.allocation, ref.generation);
+    const Allocation* allocation = arena.lookup(ref);
     if (allocation != nullptr) bytes += allocation->size;
   }
   composed.scanned_bytes = bytes;
@@ -1248,13 +1256,13 @@ bool WorkingSetBudget::allows(uint64_t bytes, std::string* error) const {
 }
 
 bool WorkingSetLease::covers(PointerRef ref) const {
-  return std::any_of(allocations.begin(), allocations.end(), [&](PointerRef candidate) {
+  return std::ranges::any_of(allocations, [&](PointerRef candidate) {
     return candidate.allocation == ref.allocation && candidate.generation == ref.generation;
   });
 }
 
 bool WorkingSetLease::add(PointerRef ref, const std::vector<PointerRef>& proven, std::string* error) {
-  const bool proven_hold = std::any_of(proven.begin(), proven.end(), [&](PointerRef candidate) {
+  const bool proven_hold = std::ranges::any_of(proven, [&](PointerRef candidate) {
     return candidate.allocation == ref.allocation && candidate.generation == ref.generation;
   });
   if (!proven_hold) {
@@ -1268,7 +1276,7 @@ bool WorkingSetLease::add(PointerRef ref, const std::vector<PointerRef>& proven,
 
 bool WorkingSetLease::valid(const std::vector<PointerRef>& proven, std::string* error) const {
   for (const PointerRef& ref : allocations) {
-    const bool proven_hold = std::any_of(proven.begin(), proven.end(), [&](PointerRef candidate) {
+    const bool proven_hold = std::ranges::any_of(proven, [&](PointerRef candidate) {
       return candidate.allocation == ref.allocation && candidate.generation == ref.generation;
     });
     if (proven_hold) continue;

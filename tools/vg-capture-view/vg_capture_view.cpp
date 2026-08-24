@@ -3,7 +3,9 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace {
 void usage() { std::cerr << "usage: vg-capture-view [--format markdown|json] [--output PATH] capture.json\n"; }
@@ -17,7 +19,7 @@ bool read_file(const std::string& path, std::string* text) {
   return true;
 }
 
-bool write_file(const std::string& path, const std::string& text) {
+bool write_file(const std::filesystem::path& path, std::string_view text) {
   std::ofstream output(path);
   if (!output) return false;
   output << text;

@@ -1206,7 +1206,7 @@ bool DeviceHal::ensure_facet_image(const vg::core::Arena& arena, const vg::core:
   VkBuffer source = upload_source;
   VkDeviceSize source_offset = upload_source_offset;
   if (source == VK_NULL_HANDLE) {
-    const vg::core::Allocation* allocation = arena.lookup(view.allocation, view.allocation_generation);
+    const vg::core::Allocation* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
     if (allocation == nullptr) {
       destroy_partial();
       if (error) *error = "facet backing allocation is not active in this Arena";
@@ -1243,7 +1243,7 @@ bool DeviceHal::ensure_facet_image(const vg::core::Arena& arena, const vg::core:
   for (uint32_t layer = 0; layer < view.array_layers; ++layer) {
     for (uint32_t level = 0; level < view.mip_levels; ++level) {
       VkBufferImageCopy region{};
-      region.bufferOffset = source_offset + view.subresource_byte_offset(layer, level);
+      region.bufferOffset = source_offset + view.subresource_byte_offset({layer, level});
       region.bufferRowLength = view.mip_width(level);
       region.bufferImageHeight = view.mip_height(level);
       region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1771,7 +1771,7 @@ bool DeviceHal::transform_representation(const vg::core::Arena& arena,
       const vg::core::Allocation* allocation =
           transfer_slot == nullptr
               ? nullptr
-              : arena.lookup(transfer_slot->view.allocation, transfer_slot->view.allocation_generation);
+              : arena.lookup(core::PointerRef{transfer_slot->view.allocation, transfer_slot->view.allocation_generation});
       if (transfer_slot != nullptr && allocation == nullptr && error != nullptr)
         *error = "the transform's source allocation is not active in this Arena";
       if (allocation != nullptr) {
@@ -2392,7 +2392,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
       for (const auto& request : compiled.plan.representation_requests) {
         if (!request.consume_input) continue;
         const vg::core::Allocation* allocation =
-            arena.lookup(request.view.allocation, request.view.allocation_generation);
+            arena.lookup(core::PointerRef{request.view.allocation, request.view.allocation_generation});
         if (allocation == nullptr || !allocation->bytes.empty()) continue;
         const auto it = allocation_map_.find(request.view.allocation);
         if (it == allocation_map_.end() || it->second.byte_size == 0) continue;
@@ -2420,7 +2420,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
     auto it = generation_by_allocation.find(binding.allocation);
     vg::core::Allocation* allocation = it == generation_by_allocation.end()
         ? nullptr
-        : arena.lookup(binding.allocation, it->second.first, it->second.second);
+        : arena.lookup(core::RepresentationRef{binding.allocation, it->second.first, it->second.second});
     if (allocation == nullptr) {
       submission->result.ok = false;
       submission->result.poison = vg::core::PoisonState::Poisoned;
@@ -2956,7 +2956,7 @@ bool DeviceHal::run_storage_facet(const vg::core::Arena& arena, vg::core::FacetP
       return reject("Unsupported: a non-identity swizzle applies to a SampleFacet only; a linear-buffer "
                     "store writes the allocation's bytes directly and would ignore the channel mapping "
                     "this facet's contract asked for");
-    const vg::core::Allocation* allocation = arena.lookup(view.allocation, view.allocation_generation);
+    const vg::core::Allocation* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
     if (allocation == nullptr)
       return reject("the storage facet's backing allocation is not active in this Arena");
     const uint64_t texel_bytes = vg::core::bytes_per_texel(view.format);

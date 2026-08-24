@@ -81,7 +81,7 @@ int main() {
   vg::ir::Module stale = compiled.module;
   stale.instructions[0].allocation = retired.id;
   stale.declared_effects[0].allocation = retired.id;
-  assert(arena.retire(retired.id, retired.generation));
+  assert(arena.retire(vg::core::PointerRef{retired.id, retired.generation}));
   auto stale_result = vg::reference::execute(stale, arena);
   assert(!stale_result.ok && stale_result.poison == vg::core::PoisonState::Poisoned);
   assert(stale_result.fault.code == "STALE_OR_BOUNDS");
