@@ -112,6 +112,45 @@ bool contains_gpu_address_pattern(const std::string& text) {
   return false;
 }
 
+Value pointer_ref_value(const core::PointerRef& reference) {
+  return Value(Value::Object{{"allocation", Value(static_cast<int64_t>(reference.allocation))},
+                             {"generation", Value(static_cast<int64_t>(reference.generation))}});
+}
+
+core::PointerRef pointer_ref_from_value(const Value& value) {
+  const auto& object = value.object();
+  return {static_cast<uint64_t>(object.at("allocation").integer()),
+          static_cast<uint32_t>(object.at("generation").integer())};
+}
+
+Value pointer_ref_array(const std::vector<core::PointerRef>& references) {
+  Value::Array array;
+  for (const auto& reference : references) array.emplace_back(pointer_ref_value(reference));
+  return Value(std::move(array));
+}
+
+std::vector<core::PointerRef> parse_pointer_ref_array(const Value& value, const char* field) {
+  if (!value.is_array()) throw std::runtime_error(std::string("capture ") + field + " must be an array");
+  std::vector<core::PointerRef> result;
+  for (const auto& item : value.array()) result.push_back(pointer_ref_from_value(item));
+  return result;
+}
+
+bool pointer_ref_in(const std::vector<core::PointerRef>& refs, const core::PointerRef& wanted) {
+  for (const auto& ref : refs) {
+    if (ref.allocation == wanted.allocation && ref.generation == wanted.generation) return true;
+  }
+  return false;
+}
+
+void apply_optional_discovery(const Capture& capture, Value::Object* root) {
+  if (!capture.has_discovery) return;
+  root->emplace("discovery",
+                Value(Value::Object{{"frozen_topology_epoch", Value(static_cast<int64_t>(capture.frozen_topology_epoch))},
+                                    {"reachable", pointer_ref_array(capture.discovered_reachable)},
+                                    {"seeds", pointer_ref_array(capture.discovery_seeds)}}));
+}
+
 void apply_optional_view(const Capture& capture, Value::Object* root) {
   if (!capture.view.source_backend.empty()) root->emplace("source_backend", Value(capture.view.source_backend));
   if (!capture.view.required_capabilities.empty())
@@ -150,6 +189,31 @@ Capture make_capture(const ir::Module& module, const core::Arena& arena) {
   return capture;
 }
 
+bool attach_discovery(Capture* capture, const core::Arena& arena, const std::vector<core::PointerRef>& seeds,
+                      std::string* error) {
+  if (capture == nullptr) {
+    if (error) *error = "capture output is required";
+    return false;
+  }
+  core::DiscoveryResult discovery;
+  if (!core::discover_reachable(arena, seeds, &discovery, error)) return false;
+  capture->has_discovery = true;
+  capture->discovery_seeds = seeds;
+  capture->discovered_reachable = discovery.reachable;
+  capture->frozen_topology_epoch = discovery.frozen_topology_epoch;
+  std::vector<AllocationSnapshot> kept;
+  for (const auto& snapshot : capture->allocations) {
+    if (pointer_ref_in(discovery.reachable, {snapshot.id, snapshot.generation})) kept.push_back(snapshot);
+  }
+  capture->allocations = std::move(kept);
+  std::vector<core::PointerRef> kept_refs;
+  for (const auto& reference : capture->graph_references) {
+    if (pointer_ref_in(discovery.reachable, reference)) kept_refs.push_back(reference);
+  }
+  capture->graph_references = std::move(kept_refs);
+  return true;
+}
+
 std::string serialize(const Capture& capture) {
   Value::Array allocations; for (const auto& allocation : capture.allocations) allocations.push_back(allocation_value(allocation));
   Value::Array certificate; for (const auto& effect : capture.certificate.ranges) certificate.push_back(effect_value(effect));
@@ -157,6 +221,7 @@ std::string serialize(const Capture& capture) {
   Value::Object root{{"allocations", Value(std::move(allocations))}, {"certificate", Value(std::move(certificate))}, {"compiler_hash", Value(capture.compiler_hash)}, {"graph_epoch", Value(static_cast<int64_t>(capture.graph_epoch))}, {"graph_references", Value(std::move(references))}, {"ir", json::parse(capture.module.canonical_json)}, {"ir_hash", Value(capture.module.hash)}, {"schema", Value(std::string("vg.capture/v1"))}, {"schema_hash", Value(capture.schema_hash.empty() ? "sha256:vg.capture/v1" : capture.schema_hash)}, {"schema_version", Value(int64_t{2})}, {"source_hash", Value(capture.source_hash)}, {"timeline_value", Value(static_cast<int64_t>(capture.timeline_value))}, {"witness", witness_value(capture.witness)}};
   if (capture.has_execution) root.emplace("execution", Value(Value::Object{{"fault_code", Value(capture.execution.fault.code)}, {"fault_effect", effect_value(capture.execution.fault.effect)}, {"fault_instruction", Value(static_cast<int64_t>(capture.execution.fault.instruction_index))}, {"fault_message", Value(capture.execution.fault.message)}, {"message", Value(capture.execution.message)}, {"ok", Value(int64_t(capture.execution.ok ? 1 : 0))}, {"outputs_valid", Value(int64_t(capture.execution.outputs_valid ? 1 : 0))}, {"poison", Value(static_cast<int64_t>(capture.execution.poison))}}));
   apply_optional_view(capture, &root);
+  apply_optional_discovery(capture, &root);
   const auto content = json::canonical(Value(root));
   root.emplace("capture_hash", Value(ir::sha256_hex(content)));
   return json::canonical(Value(std::move(root)));
@@ -182,6 +247,25 @@ bool deserialize(const std::string& text, Capture* capture, std::string* error) 
     capture->graph_references.clear(); if (auto values = document.find("graph_references"); values != nullptr) for (const auto& value : values->array()) capture->graph_references.push_back({static_cast<uint64_t>(value.object().at("allocation").integer()), static_cast<uint32_t>(value.object().at("generation").integer())});
     capture->witness = core::AccessWitness{}; if (auto value = document.find("witness"); value != nullptr) parse_witness(*value, &capture->witness);
     capture->has_execution = false; if (auto execution = document.find("execution"); execution != nullptr) { const auto& o = execution->object(); capture->has_execution = true; capture->execution.ok = o.at("ok").integer() != 0; capture->execution.poison = static_cast<core::PoisonState>(o.at("poison").integer()); capture->execution.outputs_valid = o.at("outputs_valid").integer() != 0; capture->execution.message = o.at("message").string(); capture->execution.fault.code = o.at("fault_code").string(); capture->execution.fault.message = o.at("fault_message").string(); capture->execution.fault.instruction_index = static_cast<uint32_t>(o.at("fault_instruction").integer()); capture->execution.fault.effect = effect_from_value(o.at("fault_effect")); }
+    capture->has_discovery = false;
+    capture->discovery_seeds.clear();
+    capture->discovered_reachable.clear();
+    capture->frozen_topology_epoch = 0;
+    if (auto discovery = document.find("discovery"); discovery != nullptr) {
+      if (!discovery->is_object()) throw std::runtime_error("capture discovery must be an object");
+      const auto& object = discovery->object();
+      auto seeds = object.find("seeds");
+      auto reachable = object.find("reachable");
+      if (seeds == object.end() || reachable == object.end()) throw std::runtime_error("capture discovery is missing seeds or reachable");
+      capture->discovery_seeds = parse_pointer_ref_array(seeds->second, "discovery.seeds");
+      capture->discovered_reachable = parse_pointer_ref_array(reachable->second, "discovery.reachable");
+      if (auto frozen = object.find("frozen_topology_epoch"); frozen != object.end()) {
+        if (!frozen->second.is_int() || frozen->second.integer() < 0)
+          throw std::runtime_error("capture discovery frozen_topology_epoch is invalid");
+        capture->frozen_topology_epoch = static_cast<uint64_t>(frozen->second.integer());
+      }
+      capture->has_discovery = true;
+    }
     capture->view = {};
     if (auto value = document.find("source_backend"); value != nullptr) {
       if (!value->is_string()) throw std::runtime_error("capture source_backend must be a string");
@@ -230,6 +314,29 @@ bool replay(const Capture& capture, const ReplayEnvironment& environment, Replay
       core::GraphEpochBuilder graph_builder(&arena, capture.graph_epoch == 0 ? 1 : capture.graph_epoch);
       for (const auto& reference : capture.graph_references) { auto it = result->relocation.find(reference.allocation); if (it == result->relocation.end()) throw std::runtime_error("capture graph relocation missing allocation"); if (!graph_builder.add_reference(arena, {it->second, reference.generation}, error)) return false; }
       core::GraphEpoch graph_epoch; if (!graph_builder.seal(&graph_epoch, error)) return false;
+    }
+    if (capture.has_discovery) {
+      std::vector<core::PointerRef> relocated_seeds;
+      for (const auto& seed : capture.discovery_seeds) {
+        auto it = result->relocation.find(seed.allocation);
+        if (it == result->relocation.end()) throw std::runtime_error("capture discovery seed relocation missing allocation");
+        relocated_seeds.push_back({it->second, seed.generation});
+      }
+      core::DiscoveryResult rediscovered;
+      if (!core::discover_reachable(arena, relocated_seeds, &rediscovered, error)) return false;
+      if (rediscovered.reachable.size() != capture.discovered_reachable.size()) {
+        if (error) *error = "replay discovery reachable set does not match capture";
+        return false;
+      }
+      for (const auto& recorded : capture.discovered_reachable) {
+        auto it = result->relocation.find(recorded.allocation);
+        if (it == result->relocation.end()) throw std::runtime_error("capture discovery reachable relocation missing allocation");
+        const core::PointerRef want{it->second, recorded.generation};
+        if (!pointer_ref_in(rediscovered.reachable, want)) {
+          if (error) *error = "replay discovery reachable set does not match capture";
+          return false;
+        }
+      }
     }
     auto module = capture.module; for (auto& instruction : module.instructions) { auto it = result->relocation.find(instruction.allocation); if (it == result->relocation.end()) throw std::runtime_error("capture relocation missing allocation"); instruction.allocation = it->second; }
     result->execution = reference::execute(module, arena, capture.certificate.ranges.empty() ? nullptr : &capture.certificate); return true;
@@ -310,8 +417,24 @@ bool write_view(const Capture& capture, ViewReport* report, std::string* error) 
     }
 
     markdown << "\n## Dynamic graph\n\n";
-    markdown << "- status: blocked\n";
-    markdown << "- reason: no discovery API; graph snapshot not invented\n";
+    Value::Object dynamic_graph;
+    if (capture.has_discovery) {
+      markdown << "- status: recorded\n";
+      markdown << "- seed_count: " << capture.discovery_seeds.size() << "\n";
+      markdown << "- reachable_count: " << capture.discovered_reachable.size() << "\n";
+      markdown << "- frozen_topology_epoch: " << capture.frozen_topology_epoch << "\n";
+      dynamic_graph = Value::Object{
+          {"frozen_topology_epoch", Value(static_cast<int64_t>(capture.frozen_topology_epoch))},
+          {"reachable_count", Value(static_cast<int64_t>(capture.discovered_reachable.size()))},
+          {"seed_count", Value(static_cast<int64_t>(capture.discovery_seeds.size()))},
+          {"status", Value(std::string("recorded"))},
+      };
+    } else {
+      markdown << "- status: blocked\n";
+      markdown << "- reason: no discovery API; graph snapshot not invented\n";
+      dynamic_graph = Value::Object{{"reason", Value(std::string("no discovery API; graph snapshot not invented"))},
+                                   {"status", Value(std::string("blocked"))}};
+    }
 
     markdown << "\n## Cross-backend\n\n";
     markdown << "- mapping: semantic only\n";
@@ -328,9 +451,7 @@ bool write_view(const Capture& capture, ViewReport* report, std::string* error) 
                              {"semantic_counterpart", Value(capture.view.semantic_counterpart)},
                              {"semantic_fields", string_array({"fault_taxonomy", "ir_hash", "representation_epoch",
                                                                "stable_allocation_ids"})}})},
-        {"dynamic_graph",
-         Value(Value::Object{{"reason", Value(std::string("no discovery API; graph snapshot not invented"))},
-                             {"status", Value(std::string("blocked"))}})},
+        {"dynamic_graph", Value(std::move(dynamic_graph))},
         {"execution", Value(std::move(execution))},
         {"ir_hash", Value(ir_hash)},
         {"schema", Value(std::string("vg.capture/v1"))},

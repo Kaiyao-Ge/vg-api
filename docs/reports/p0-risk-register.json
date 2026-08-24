@@ -11,15 +11,16 @@
         "vertical-slice.metal.access-certificate",
         "core.discovery",
         "vertical-slice.metal.discovery",
-        "conformance.phase-a"
+        "conformance.phase-a",
+        "core.unit"
       ],
-      "scope_limit": "no-certificate-composition-across-indirect-calls"
+      "scope_limit": "conservative-union-composition; exploded-to-universe-is-reported"
     },
     "epoch_recycle_race": {
       "owner": "Core",
       "status": "mitigated-with-scope-limit",
       "tests": ["model.phase-a", "vertical-slice.metal.checked-facet-generation", "core.unit"],
-      "scope_limit": "model-sequence-1000-not-100k; no-recycle-pressure-harness"
+      "scope_limit": "model-sequence-100k; no-recycle-pressure-harness"
     },
     "task_publication_weak_memory": {
       "owner": "Core/Backend",

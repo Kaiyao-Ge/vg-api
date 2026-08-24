@@ -6,8 +6,8 @@
 
 | 风险 | Owner | 已有缓解 / 测试 | 状态 |
 |---|---|---|---|
-| AccessCertificate 不 sound | Core/Compiler | E004 B+D（`vertical-slice.metal.access-certificate`, `core.discovery`, `vertical-slice.metal.discovery`）；E006 witness（`conformance.phase-a`）；伪造租约拒绝 | **缓解已记录**。发现路径仍是 HostAssisted；sound 上界在 reference/Metal 夹具上可拒绝漏项。无跨间接调用合成（12 §8 未决 3），标范围限制。 |
-| Epoch 回收竞态 | Core | `model.phase-a`；FacetPool generation（`vertical-slice.metal.checked-facet-generation`）；`core.unit` | **缓解已记录**。模型序列是 1000 次，不是 catalog 的 100k。范围限制：无独立回收竞态压力 harness。 |
+| AccessCertificate 不 sound | Core/Compiler | E004 B+D（`vertical-slice.metal.access-certificate`, `core.discovery`, `vertical-slice.metal.discovery`）；E006 witness（`conformance.phase-a`）；伪造租约拒绝；`compose_certificates` / `compose_access_certificates`（`core.unit`） | **缓解已记录**。发现路径仍是 HostAssisted；sound 上界在 reference/Metal 夹具上可拒绝漏项。合成是保守并集：能覆盖每个 child，不保证紧；并集变成 Universe 时会标 `exploded`，不假装合成很紧。 |
+| Epoch 回收竞态 | Core | `model.phase-a`（100k 随机序列）；FacetPool generation（`vertical-slice.metal.checked-facet-generation`）；`core.unit` | **缓解已记录**。模型序列已升到 catalog 的 100k。范围限制：仍无独立回收竞态压力 harness。 |
 | Task publication 弱内存错误 | Core/Backend | `model.phase-a` / TASK-003 host bounded model（release/acquire、overflow、quota） | **范围限制，未关闭**。没有 GPU litmus，没有 Metal/Vulkan 弱内存原语实验。不得把 host 模型写成设备内存模型证明。 |
 | Facet 在途偷换 | Core/Backend | RepresentationEpoch + slot generation；`vertical-slice.metal.representation-layer`, `checked-facet-generation`, `representation-churn` | **缓解已记录**。峰值字节 unmeasured；Phase C 未整体关门。 |
 | Adapter 弱化同步 | Backend | E012 `vertical-slice.metal.effect-dag`（3/4 形状 DevicePass） | **缓解已记录，范围限制**。cross-queue / representation-transition / external-present 为 Deferred。无跨后端 differential gate。 |

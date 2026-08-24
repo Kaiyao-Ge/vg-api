@@ -2765,8 +2765,14 @@ bool DeviceHal::run_cull_compact(const std::vector<uint32_t>& instance_visible,
   [encoder setBuffer:ids_buffer offset:0 atIndex:1];
   [encoder setBuffer:count_buffer offset:0 atIndex:2];
   [encoder setBuffer:compact_buffer offset:0 atIndex:3];
-  [encoder dispatchThreadgroups:MTLSizeMake(std::max<uint32_t>(count, 1), 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  [encoder setBytes:&count length:sizeof(count) atIndex:4];
+  NSUInteger max_tpg = [impl_->cull_compact_pipeline maxTotalThreadsPerThreadgroup];
+  uint32_t tpg = 256;
+  if (max_tpg > 0 && max_tpg < tpg) tpg = static_cast<uint32_t>(max_tpg);
+  if (tpg == 0) tpg = 1;
+  const uint32_t groups = count == 0 ? 1u : (count + tpg - 1u) / tpg;
+  [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
   [encoder endEncoding];
   [command_buffer commit];
   [command_buffer waitUntilCompleted];

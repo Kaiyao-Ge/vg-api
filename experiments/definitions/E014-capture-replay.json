@@ -42,15 +42,10 @@
       "id": "driver-update",
       "status": "skipped",
       "reason": "No second driver or OS upgrade laboratory is available on this host; the catalog marks the variant conditional."
-    },
-    {
-      "id": "dynamic-graph",
-      "status": "blocked",
-      "reason": "D2 later landed discovery_seeds / run_discovery_stage, but E014 still has no capture of a discovered reachable subset. graph_references remain sealed GraphEpoch pointers, not invented discovery data."
     }
   ],
   "phase_d_classification": "same-environment-reference; cross-backend-semantic-only",
   "break_even_curve": "unmeasured",
-  "judgement": "A compute-exact capture round-trips on cpu-reference with stable capture_hash and ir_hash; fault poison is preserved; a consumed package is refused with the Phase C wording; incompatible capabilities are refused by name; vg-capture-view lists stable IDs without GPU addresses. Metal↔Vulkan is recorded as semantic correspondence, not dual execution. Dynamic-graph and driver-update rows are blocked/skipped rather than fabricated. No performance curve is claimed.",
+  "judgement": "A compute-exact capture round-trips on cpu-reference with stable capture_hash and ir_hash; fault poison is preserved; a consumed package is refused with the Phase C wording; incompatible capabilities are refused by name; vg-capture-view lists stable IDs without GPU addresses. Metal↔Vulkan is recorded as semantic correspondence, not dual execution. Dynamic-graph records discover_reachable seeds and the reachable subset (schema_version stays 2; empty packages still report blocked rather than inventing a graph from graph_references). driver-update remains skipped: no second-driver lab. No performance curve is claimed.",
   "vulkan_status": "compile-review-only (ADR-024/035/040/041); Metal↔Vulkan is semantic mapping of stable IDs / IR hash / epoch / fault taxonomy and is never reported as both backends having executed"
 }

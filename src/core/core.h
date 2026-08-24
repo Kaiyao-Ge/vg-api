@@ -689,6 +689,23 @@ bool certificate_covers_discovery_witness(const AccessCertificate& certificate,
                                           const std::vector<PointerRef>& witness,
                                           std::string* error = nullptr);
 
+// Conservative composition of effect certificates (12 §8 open question 3 /
+// Task children and indirect calls). Union of ranges is a sound
+// over-approximation: the result covers every input range. It does not try
+// to stay tight; overlapping ranges are kept rather than merged into a
+// smaller cover. Empty `parts` is refused -- there is no implicit Universe.
+bool compose_certificates(const std::vector<Certificate>& parts, Certificate* out,
+                          std::string* error = nullptr);
+
+// Conservative composition of AccessCertificates: union of GraphEpoch
+// references on one Arena. Mixed topology epochs are refused. If the union
+// names every Active allocation while some input did not, `exploded` is
+// true -- that is the honest "composition can become Universe" outcome,
+// not a silent success. `exploded` may be null.
+bool compose_access_certificates(const Arena& arena, const std::vector<AccessCertificate>& parts,
+                                 AccessCertificate* out, bool* exploded = nullptr,
+                                 std::string* error = nullptr);
+
 // Phase D shared contracts (ADR-035). Independent of AccessCertificate
 // (sound over-approximation) and of Allocation eviction: this is the
 // residency hold and overflow bookkeeping D2/D3/D5 fill in. Default
