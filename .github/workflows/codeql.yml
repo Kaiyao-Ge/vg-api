@@ -49,6 +49,9 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
+          # CodeQL 2.26.3's C++ pre-finalize aborts if trapCaches/cpp/tarballs
+          # is missing (exit 134). Skip TRAP caching until that path is created.
+          trap-caching: false
 
       - name: Configure and build
         if: matrix.build-mode == 'manual'
