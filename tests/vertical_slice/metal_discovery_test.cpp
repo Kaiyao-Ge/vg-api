@@ -121,9 +121,7 @@ int main() {
     return 1;
   }
 
-  // Metal: real compile/submit of the probe. submit() must call
-  // run_discovery_stage (one-line hook in metal_device_hal.mm). If that
-  // hook is missing, this path will not attach a discovered certificate.
+  // Metal: real compile/submit of the probe; submit() runs discovery.
   {
     vg::core::Arena arena;
     vg::ir::Module module;

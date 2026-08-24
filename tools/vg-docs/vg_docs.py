@@ -17,11 +17,12 @@ def main() -> int:
     failures: list[str] = []
     warnings: list[str] = []
     for path in sorted(root.rglob("*.json")):
-        if "build" not in path.parts:
-            try:
-                json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                failures.append(f"invalid JSON: {path.relative_to(root)}: {error}")
+        if "build" in path.parts:
+            continue
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            failures.append(f"invalid JSON: {path.relative_to(root)}: {error}")
     for path in sorted([*root.rglob("*.md"), *root.rglob("*.MD")]):
         if "build" in path.parts:
             continue

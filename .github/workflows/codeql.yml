@@ -1,9 +1,5 @@
-# CodeQL for vg-api.
-# GitHub's stock Advanced template uses build-mode: none (or a placeholder
-# manual step that exits 1). C++ here needs a real CMake build without Metal,
-# Vulkan, or sanitizers. Python can stay build-mode: none.
-#
-# Manual run: Actions → CodeQL → Run workflow.
+# C++ needs a real CMake build (no Metal, Vulkan, or sanitizers). GitHub's
+# stock Advanced template uses build-mode: none. Python stays build-mode: none.
 
 name: CodeQL
 

@@ -1085,14 +1085,6 @@ bool discover_reachable(const Arena& arena, const std::vector<PointerRef>& seeds
       if (error) *error = "topology epoch changed during discovery";
       return false;
     }
-    // Re-lookup after the hook: a mid-walk topology bump already refused
-    // above; this only guards a hook that retired `current` without a
-    // topology tick (should not happen -- retire() ticks topology_epoch).
-    allocation = arena.lookup(current.allocation, current.generation);
-    if (allocation == nullptr) {
-      if (error) *error = "discovered allocation is no longer active";
-      return false;
-    }
     for (size_t offset = 0; offset + kPointerRefWireBytes <= allocation->bytes.size();
          offset += kPointerRefWireBytes) {
       PointerRef child{};

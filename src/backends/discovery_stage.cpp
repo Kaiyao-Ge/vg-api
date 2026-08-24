@@ -9,11 +9,6 @@ namespace vg::hal {
 // reachable set comes back to the host before any later submit. A
 // GPU-compact-and-continue path is out of scope. The result is a semantic
 // reachable set / proxy, not an OS page-migration claim (06 §10).
-//
-// Metal submit hook the parent must add (one line) in
-// metal_device_hal.mm DeviceHal::submit, after graph_epoch_matches and
-// `submission->report = compiled.report`, before Stage 5 / dispatch:
-//   if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
 
 bool run_discovery_stage(const ExecutionPlan& plan, core::Arena& arena, Submission* submission,
                          std::string* error) {
