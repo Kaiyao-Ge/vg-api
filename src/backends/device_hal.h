@@ -408,11 +408,6 @@ bool run_representation_stage(const std::vector<RepresentationRequest>& requests
 // this helper has no OS residency counter. Sparse residency is reported
 // as Unsupported (Metal sparse heap/texture is not implemented; Vulkan
 // sparse binding is explicit map/unmap, not automatic page fault).
-//
-// Metal submit hook (one line; parent must add in metal_device_hal.mm
-// after graph_epoch_matches and `submission->report = compiled.report`,
-// after run_discovery_stage if that hook is present, before Stage 5):
-//   if (!hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
 bool apply_working_set_budget(const ExecutionPlan& plan, core::Arena& arena,
                               Submission* submission, std::string* error = nullptr);
 
@@ -426,12 +421,6 @@ bool apply_working_set_budget(const ExecutionPlan& plan, core::Arena& arena,
 // HostAssisted -- never DevicePass: this is a host walk / host
 // round-trip, a semantic reachable set / proxy, not OS page migration.
 // SoftwarePaged / FaultManaged stay Unsupported.
-//
-// Metal submit hook (one line; parent must add in metal_device_hal.mm
-// after graph_epoch_matches and the submission->report = compiled.report
-// copy, before Stage 5 / dispatch -- same place as
-// apply_working_set_budget):
-//   if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
 bool run_discovery_stage(const ExecutionPlan& plan, core::Arena& arena,
                          Submission* submission, std::string* error = nullptr);
 

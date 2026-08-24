@@ -273,9 +273,7 @@ void bump_counters(uint64_t encoders, uint64_t* encoder_count, uint64_t* command
 enum class IcbAttempt { Ok, Unauthorized, Unavailable };
 
 IcbAttempt icb_unavailable(std::string* error, const char* message) {
-  if (error != nullptr && (error->empty() || message != nullptr)) {
-    if (message != nullptr) *error = message;
-  }
+  if (error != nullptr && message != nullptr) *error = message;
   return IcbAttempt::Unavailable;
 }
 

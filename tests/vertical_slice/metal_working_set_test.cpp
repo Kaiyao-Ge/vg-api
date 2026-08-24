@@ -69,8 +69,7 @@ int main() {
     return 1;
   }
 
-  // Hand-picked lease 16 bytes, budget 64: pass. apply_working_set_budget is
-  // the Metal path (parent hooks it at submit after graph_epoch_matches).
+  // Hand-picked lease 16 bytes, budget 64: pass.
   {
     vg::core::Arena arena;
     const auto& first = arena.allocate(16);

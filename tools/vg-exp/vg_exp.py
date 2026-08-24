@@ -11,7 +11,6 @@ import json
 import os
 import platform
 import secrets
-import shutil
 import subprocess
 import sys
 import time

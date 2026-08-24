@@ -996,10 +996,8 @@ struct DeviceHal::Impl {
 
   // TASK-B16 (E007): lazily probes whether MTLBuffer.gpuAddress is actually
   // available on this OS/device combination, rather than trusting the
-  // capability snapshot's own gpu_addresses bit (hardcoded false in
-  // make_hal_snapshot above, never wired to a real probe) -- cached after
-  // the first call since this answer cannot change within a process
-  // lifetime.
+  // capability snapshot's own gpu_addresses bit -- cached after the first
+  // call since this answer cannot change within a process lifetime.
   bool gpu_addresses_probed = false;
   bool gpu_addresses_supported_value = false;
   bool probe_gpu_addresses() {
@@ -1706,7 +1704,6 @@ struct DeviceHal::Impl {
 
     core::FacetRef transfer_ref{};
     if (!pool.acquire(arena, view, core::FacetKind::Transfer, &transfer_ref, error)) return false;
-    bool blit_ok = false;
     {
       FacetUseGuard use(pool, transfer_ref);
       if (!use.begin(arena, error)) return false;
@@ -1741,12 +1738,11 @@ struct DeviceHal::Impl {
                                                 : "representation transform blit failed";
         return false;
       }
-      blit_ok = true;
     }
     // The TransferFacet existed only to give the blit a pool-resolved source;
     // its purpose is spent, so its slot goes back rather than being left to
     // linger until some later epoch happens to stale it.
-    if (blit_ok) pool.retire(transfer_ref);
+    pool.retire(transfer_ref);
 
     if (install_facet_record(target_facet, view, target_kind, allocation->representation_epoch,
                              private_texture, error) == nil)
@@ -1960,10 +1956,10 @@ bool DeviceHal::compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compi
   compiled->report.backend = hal::BackendKind::Metal;
   if (indexed_binding) {
     // gpuAddress is queried lazily here rather than trusted from the
-    // capability snapshot's own (currently unwired) gpu_addresses bit --
-    // this milestone's honest-degradation result depends on a real,
-    // just-in-time check of what this OS/device combination actually
-    // supports, not a stale capability bit.
+    // capability snapshot's own gpu_addresses bit -- this milestone's
+    // honest-degradation result depends on a real, just-in-time check of
+    // what this OS/device combination actually supports, not a stale
+    // capability bit.
     if (!impl_->probe_gpu_addresses()) {
       compiled->report.supported = false;
       compiled->report.diagnostic = "indexed binding requires MTLBuffer.gpuAddress, unavailable on this OS/device";
