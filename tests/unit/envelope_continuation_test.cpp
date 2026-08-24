@@ -12,12 +12,17 @@
 
 namespace {
 
-vg::core::TaskGraph make_chain(uint32_t task_count, uint64_t root) {
+struct TaskChain {
+  uint32_t task_count{};
+  uint64_t root_allocation{};
+};
+
+vg::core::TaskGraph make_chain(TaskChain chain) {
   vg::core::TaskGraphBuilder builder;
-  for (uint32_t i = 0; i < task_count; ++i) {
+  for (uint32_t i = 0; i < chain.task_count; ++i) {
     vg::core::TaskRecord task{};
     task.node_index = i;
-    task.root_allocation = root;
+    task.root_allocation = chain.root_allocation;
     assert(builder.append(task));
     if (i > 0) assert(builder.add_dependency(i - 1, i));
   }
@@ -48,7 +53,7 @@ struct Fixture {
     assert(device != nullptr);
     const auto module = make_module(arena);
     const uint64_t root = module.instructions[0].allocation;
-    oracle_graph = make_chain(task_count, root);
+    oracle_graph = make_chain({.task_count = task_count, .root_allocation = root});
     vg::hal::ExecutionPlan plan;
     plan.capabilities = device->capabilities();
     plan.module = module;

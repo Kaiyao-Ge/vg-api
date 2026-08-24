@@ -498,8 +498,8 @@ bool run_cull_compact(const std::string& root) {
 
   std::vector<uint32_t> got = result.compact_ids;
   std::vector<uint32_t> want = oracle.compact_ids;
-  std::sort(got.begin(), got.end());
-  std::sort(want.begin(), want.end());
+  std::ranges::sort(got);
+  std::ranges::sort(want);
   if (got != want) {
     std::cerr << "cull-compact: compacted id set mismatches reference oracle\n";
     return false;
@@ -556,8 +556,8 @@ bool run_cull_compact_1m(const std::string& root) {
 
   std::vector<uint32_t> got = result.compact_ids;
   std::vector<uint32_t> want = oracle.compact_ids;
-  std::sort(got.begin(), got.end());
-  std::sort(want.begin(), want.end());
+  std::ranges::sort(got);
+  std::ranges::sort(want);
   if (got != want) {
     std::cerr << "cull-compact-1m: compacted id set mismatches reference oracle\n";
     return false;
@@ -879,15 +879,20 @@ bool run_representation_layer(const std::string& root) {
   return true;
 }
 
-vg::ir::Instruction make_store_instruction(const vg::core::Allocation& allocation, uint64_t offset, int64_t value) {
+struct StoreWord {
+  uint64_t offset{};
+  int64_t value{};
+};
+
+vg::ir::Instruction make_store_instruction(const vg::core::Allocation& allocation, StoreWord word) {
   vg::ir::Instruction instruction;
   instruction.op = "store";
   instruction.allocation = allocation.id;
   instruction.generation = allocation.generation;
   instruction.representation_epoch = allocation.representation_epoch;
-  instruction.offset = offset;
+  instruction.offset = word.offset;
   instruction.size = 4;
-  instruction.value = value;
+  instruction.value = word.value;
   return instruction;
 }
 
@@ -895,7 +900,7 @@ vg::ir::Module make_store_pass(const vg::core::Allocation& allocation, uint64_t 
   vg::ir::Module module;
   module.version = 1;
   module.root_schema = "vg.test/v1";
-  module.instructions.push_back(make_store_instruction(allocation, offset, value));
+  module.instructions.push_back(make_store_instruction(allocation, {.offset = offset, .value = value}));
   module.declared_effects.push_back(
       {allocation.id, offset, 4, vg::ir::Access::Write, allocation.representation_epoch});
   return module;
@@ -906,15 +911,20 @@ vg::ir::Module make_store_pass(const vg::core::Allocation& allocation, uint64_t 
 // little-endian encoding of `value`. Mirrors compute_package.cpp's private
 // store_word_pattern() so this test can check GPU-written bytes directly.
 uint32_t store_word_pattern(int64_t value) {
-  const uint32_t low_byte = static_cast<uint32_t>(static_cast<uint8_t>(value));
+  const auto low_byte = static_cast<uint32_t>(static_cast<uint8_t>(value));
   return low_byte * 0x01010101u;
 }
 
-bool bytes_match_pattern(const std::vector<uint8_t>& bytes, uint64_t offset, uint32_t pattern) {
-  if (offset + 4 > bytes.size()) return false;
+struct WordAt {
+  uint64_t offset{};
+  uint32_t pattern{};
+};
+
+bool bytes_match_pattern(const std::vector<uint8_t>& bytes, WordAt word) {
+  if (word.offset + 4 > bytes.size()) return false;
   uint32_t got = 0;
-  std::memcpy(&got, bytes.data() + offset, 4);
-  return got == pattern;
+  std::memcpy(&got, bytes.data() + word.offset, 4);
+  return got == word.pattern;
 }
 
 // TASK-B14 (E012): exercises all 3 in-scope Effect DAG shapes
@@ -981,12 +991,12 @@ bool run_effect_dag(const std::string& root) {
       return false;
     }
     for (const auto& expectation : expect_final_bytes) {
-      const auto* allocation = arena.lookup(expectation.first, 1);
+      const auto* allocation = arena.lookup(vg::core::PointerRef{expectation.first, 1});
       if (allocation == nullptr) {
         std::cerr << "effect-dag: " << label << " missing allocation " << expectation.first << " after submit\n";
         return false;
       }
-      if (!bytes_match_pattern(allocation->bytes, 0, store_word_pattern(expectation.second))) {
+      if (!bytes_match_pattern(allocation->bytes, {.offset = 0, .pattern = store_word_pattern(expectation.second)})) {
         std::cerr << "effect-dag: " << label << " allocation " << expectation.first
                   << " does not hold the expected final value\n";
         return false;
@@ -1061,7 +1071,7 @@ bool run_effect_dag(const std::string& root) {
       middle1.instructions.push_back(load);
       middle1.declared_effects.push_back({a.id, 0, 4, vg::ir::Access::Read, a.representation_epoch});
     }
-    middle1.instructions.push_back(make_store_instruction(b, 0, 41));
+    middle1.instructions.push_back(make_store_instruction(b, {.offset = 0, .value = 41}));
     middle1.declared_effects.push_back({b.id, 0, 4, vg::ir::Access::Write, b.representation_epoch});
     vg::ir::Module middle2;
     middle2.version = 1;
@@ -1077,7 +1087,7 @@ bool run_effect_dag(const std::string& root) {
       middle2.instructions.push_back(load);
       middle2.declared_effects.push_back({a.id, 0, 4, vg::ir::Access::Read, a.representation_epoch});
     }
-    middle2.instructions.push_back(make_store_instruction(c, 0, 42));
+    middle2.instructions.push_back(make_store_instruction(c, {.offset = 0, .value = 42}));
     middle2.declared_effects.push_back({c.id, 0, 4, vg::ir::Access::Write, c.representation_epoch});
     vg::ir::Module join;
     join.version = 1;
@@ -1352,7 +1362,7 @@ bool channels_close(const std::array<float, 4>& got, const std::array<float, 4>&
 
 void fill_subresource(vg::core::Allocation& allocation, const vg::core::CanonicalView& view,
                       uint32_t layer, uint32_t level, const std::array<uint8_t, 4>& rgba) {
-  const uint64_t offset = view.subresource_byte_offset(layer, level);
+  const uint64_t offset = view.subresource_byte_offset({layer, level});
   const uint32_t width = view.mip_width(level);
   const uint32_t height = view.mip_height(level);
   const uint64_t row = view.bytes_per_row(level);
@@ -1409,15 +1419,19 @@ vg::core::ConsumeProof complete_consume_proof() {
   return proof;
 }
 
-vg::core::CanonicalView make_rgba8_view(const vg::core::Allocation& allocation, uint32_t width,
-                                        uint32_t height) {
+struct Extent2 {
+  uint32_t width{};
+  uint32_t height{};
+};
+
+vg::core::CanonicalView make_rgba8_view(const vg::core::Allocation& allocation, Extent2 extent) {
   vg::core::CanonicalView view;
   view.allocation = allocation.id;
   view.allocation_generation = allocation.generation;
   view.format = vg::core::PixelFormat::RGBA8Unorm;
   view.dimension = vg::core::ViewDimension::Texture2D;
-  view.width = width;
-  view.height = height;
+  view.width = extent.width;
+  view.height = extent.height;
   return view;
 }
 
@@ -1584,11 +1598,11 @@ bool run_checked_facet_generation(const std::string& root) {
   constexpr uint32_t kW = 2;
   constexpr uint32_t kH = 2;
   vg::core::Arena arena;
-  auto& allocation = arena.allocate(kW * kH * 4);
+  auto& allocation = arena.allocate(static_cast<uint64_t>(kW) * kH * 4);
   allocation.bytes = {
       255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
   };
-  const vg::core::CanonicalView view = make_rgba8_view(allocation, kW, kH);
+  const vg::core::CanonicalView view = make_rgba8_view(allocation, {.width = kW, .height = kH});
 
   vg::core::FacetPool pool;
   vg::core::FacetRef live_ref;
@@ -1723,8 +1737,8 @@ bool run_basic_raster(const std::string& root) {
     }
   }
 
-  const vg::core::CanonicalView source_view = make_rgba8_view(source_alloc, kExtent, kExtent);
-  const vg::core::CanonicalView target_view = make_rgba8_view(target_alloc, kExtent, kExtent);
+  const vg::core::CanonicalView source_view = make_rgba8_view(source_alloc, {.width = kExtent, .height = kExtent});
+  const vg::core::CanonicalView target_view = make_rgba8_view(target_alloc, {.width = kExtent, .height = kExtent});
 
   vg::core::FacetPool pool;
   vg::core::FacetRef source_ref;
@@ -1746,12 +1760,12 @@ bool run_basic_raster(const std::string& root) {
 
   const auto quad = metal_fullscreen_quad();
   vg::metal::RasterResult metal_result;
-  if (!metal_device->run_raster_triangles(arena, pool, source_ref, target_ref, desc, quad,
+  if (!metal_device->run_raster_triangles(arena, pool, {.source = source_ref, .target = target_ref}, desc, quad,
                                           &metal_result, &error)) {
     std::cerr << "basic-raster: Metal raster failed: " << error << "\n";
     return false;
   }
-  auto oracle = vg::reference::raster_triangles(arena, pool, source_ref, target_ref,
+  auto oracle = vg::reference::raster_triangles(arena, pool, {.source = source_ref, .target = target_ref},
                                                 to_reference_desc(desc), to_reference_vertices(quad));
   if (!oracle.ok) {
     std::cerr << "basic-raster: reference oracle failed: " << oracle.message << "\n";
@@ -1779,19 +1793,19 @@ bool run_basic_raster(const std::string& root) {
     return false;
   }
   vg::metal::RasterResult unused;
-  if (metal_device->run_raster_triangles(arena, pool, wrong_source, target_ref, desc, quad, &unused,
+  if (metal_device->run_raster_triangles(arena, pool, {.source = wrong_source, .target = target_ref}, desc, quad, &unused,
                                          &error)) {
     std::cerr << "basic-raster: Attachment source must be rejected\n";
     return false;
   }
-  if (metal_device->run_raster_triangles(arena, pool, source_ref, wrong_target, desc, quad, &unused,
+  if (metal_device->run_raster_triangles(arena, pool, {.source = source_ref, .target = wrong_target}, desc, quad, &unused,
                                          &error)) {
     std::cerr << "basic-raster: Sample target must be rejected\n";
     return false;
   }
 
   const std::vector<vg::metal::RasterVertex> dangling{quad[0], quad[1], quad[2], quad[3]};
-  if (metal_device->run_raster_triangles(arena, pool, source_ref, target_ref, desc, dangling, &unused,
+  if (metal_device->run_raster_triangles(arena, pool, {.source = source_ref, .target = target_ref}, desc, dangling, &unused,
                                          &error)) {
     std::cerr << "basic-raster: vertex count not a multiple of 3 must be rejected\n";
     return false;
@@ -1800,14 +1814,14 @@ bool run_basic_raster(const std::string& root) {
   vg::metal::RasterDesc msaa = desc;
   msaa.attachment.sample_count = 4;
   msaa.attachment.store = vg::metal::AttachmentStoreAction::Store;
-  if (metal_device->run_raster_triangles(arena, pool, source_ref, target_ref, msaa, quad, &unused,
+  if (metal_device->run_raster_triangles(arena, pool, {.source = source_ref, .target = target_ref}, msaa, quad, &unused,
                                          &error)) {
     std::cerr << "basic-raster: sample_count>1 without MultisampleResolve must be rejected\n";
     return false;
   }
   msaa.attachment.store = vg::metal::AttachmentStoreAction::MultisampleResolve;
   vg::metal::RasterResult resolved;
-  if (!metal_device->run_raster_triangles(arena, pool, source_ref, target_ref, msaa, quad, &resolved,
+  if (!metal_device->run_raster_triangles(arena, pool, {.source = source_ref, .target = target_ref}, msaa, quad, &resolved,
                                           &error)) {
     std::cerr << "basic-raster: sample_count=4 with MultisampleResolve failed: " << error << "\n";
     return false;
@@ -1922,11 +1936,11 @@ bool run_consume_input(const std::string& root) {
   auto prepare_image = [](vg::core::Arena& arena, vg::core::CanonicalView* view) -> vg::core::Allocation& {
     constexpr uint32_t kW = 2;
     constexpr uint32_t kH = 2;
-    auto& allocation = arena.allocate(kW * kH * 4);
+    auto& allocation = arena.allocate(static_cast<uint64_t>(kW) * kH * 4);
     allocation.bytes = {
         255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
     };
-    *view = make_rgba8_view(allocation, kW, kH);
+    *view = make_rgba8_view(allocation, {.width = kW, .height = kH});
     return allocation;
   };
 
@@ -2012,7 +2026,7 @@ bool run_consume_input(const std::string& root) {
                 << ") must equal old_backing_bytes (" << submission.old_backing_bytes << ")\n";
       return false;
     }
-    const auto* after = arena.lookup(image_id, generation_before);
+    const auto* after = arena.lookup(vg::core::PointerRef{image_id, generation_before});
     if (after == nullptr || after->state != vg::core::ObjectState::Active ||
         after->generation != generation_before) {
       std::cerr << "consume-input: allocation must stay Active at the same generation\n";
@@ -2194,8 +2208,8 @@ bool run_consume_input(const std::string& root) {
                 << image.representation_epoch << ")\n";
       return false;
     }
-    if (arena.lookup(image.id, generation, epoch_before) != nullptr ||
-        arena.lookup(image.id, generation, image.representation_epoch) == nullptr) {
+    if (arena.lookup(vg::core::RepresentationRef{image.id, generation, epoch_before}) != nullptr ||
+        arena.lookup(vg::core::RepresentationRef{image.id, generation, image.representation_epoch}) == nullptr) {
       std::cerr << "consume-input: fault-during must leave the new epoch visible and the old one stale\n";
       return false;
     }
@@ -2391,11 +2405,11 @@ bool run_representation_churn(const std::string& root) {
   constexpr uint32_t kAttempts = 8;
   const auto seed = [](vg::core::Arena& arena, vg::core::CanonicalView* view,
                        std::vector<uint8_t>* bytes) -> vg::core::Allocation& {
-    auto& allocation = arena.allocate(kW * kH * 4);
+    auto& allocation = arena.allocate(static_cast<uint64_t>(kW) * kH * 4);
     allocation.bytes = {
         255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
     };
-    *view = make_rgba8_view(allocation, kW, kH);
+    *view = make_rgba8_view(allocation, {.width = kW, .height = kH});
     if (bytes != nullptr) *bytes = allocation.bytes;
     return allocation;
   };

@@ -261,13 +261,13 @@ struct PipelineClassificationRun {
 class DeviceHal final : public hal::DeviceHal {
  public:
   ~DeviceHal() override;
-  const hal::CapabilitySnapshot& capabilities() const override;
+  [[nodiscard]] const hal::CapabilitySnapshot& capabilities() const override;
   bool compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
                std::string* error = nullptr) override;
   bool submit(const hal::CompiledPlan& compiled, core::Arena& arena,
               hal::Submission* submission, std::string* error = nullptr) override;
 
-  const DeviceSnapshot& snapshot() const;
+  [[nodiscard]] const DeviceSnapshot& snapshot() const;
   bool probe_buffer(size_t length, bool private_storage, BufferSnapshot* result,
                     std::string* error = nullptr) const;
 
@@ -334,8 +334,8 @@ class DeviceHal final : public hal::DeviceHal {
   // Deliberately out of scope, matching the reference oracle so the two are
   // comparable: depth/stencil test, blending, face culling and perspective
   // divide. Later triangles simply overwrite earlier ones.
-  bool run_raster_triangles(const core::Arena& arena, core::FacetPool& pool, core::FacetRef source_ref,
-                           core::FacetRef target_ref, const RasterDesc& desc,
+  bool run_raster_triangles(const core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
+                           const RasterDesc& desc,
                            const std::vector<RasterVertex>& vertices, RasterResult* result,
                            std::string* error = nullptr) const;
 
@@ -366,7 +366,7 @@ class DeviceHal final : public hal::DeviceHal {
   bool run_pipeline_classification(PipelineClassificationRun* result,
                                   std::string* error = nullptr) const;
 
-  const std::vector<std::array<uint32_t, 3>>& last_tier1_indirect_dims() const;
+  [[nodiscard]] const std::vector<std::array<uint32_t, 3>>& last_tier1_indirect_dims() const;
 
  private:
   struct Impl;

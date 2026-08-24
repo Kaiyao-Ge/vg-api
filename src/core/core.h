@@ -51,24 +51,32 @@ struct ConsumeProof {
   bool no_replay_required{};
   bool failure_semantics_accepted{};
 
-  bool complete() const {
+  [[nodiscard]] bool complete() const {
     return envelope_complete && no_external_references && no_replay_required &&
            failure_semantics_accepted;
   }
   // Names the first unmet obligation so a rejection says which proof failed
   // rather than only that one did; nullptr when complete().
-  const char* first_unmet() const;
+  [[nodiscard]] const char* first_unmet() const;
 };
+
+// Identity of a live allocation version (id + generation). Defined here so
+// Arena lookup/retire can take it by name; GraphEpoch is the type that
+// *produces* these refs.
+struct PointerRef;
+// Allocation + generation + representation epoch. Same idea for the
+// representation-aware lookup overloads.
+struct RepresentationRef;
 
 class Arena {
  public:
   explicit Arena(uint64_t id = 1) : id_(id) {}
   Allocation& allocate(uint64_t size);
-  bool retire(uint64_t id, uint32_t generation);
-  Allocation* lookup(uint64_t id, uint32_t generation);
-  const Allocation* lookup(uint64_t id, uint32_t generation) const;
-  Allocation* lookup(uint64_t id, uint32_t generation, uint32_t representation_epoch);
-  const Allocation* lookup(uint64_t id, uint32_t generation, uint32_t representation_epoch) const;
+  bool retire(const PointerRef& ref);
+  Allocation* lookup(const PointerRef& ref);
+  [[nodiscard]] const Allocation* lookup(const PointerRef& ref) const;
+  Allocation* lookup(const RepresentationRef& ref);
+  [[nodiscard]] const Allocation* lookup(const RepresentationRef& ref) const;
   bool acquire(uint64_t id, uint32_t generation);
   bool release(uint64_t id, uint32_t generation);
   bool transform(uint64_t id, uint32_t generation, uint32_t* new_epoch, std::string* error = nullptr);
@@ -100,23 +108,23 @@ class Arena {
   // allocation already has that many live representations, instead of letting
   // versions accumulate until the process thrashes.
   void set_max_in_flight_representations(uint32_t budget) { max_in_flight_representations_ = budget; }
-  uint32_t max_in_flight_representations() const { return max_in_flight_representations_; }
+  [[nodiscard]] uint32_t max_in_flight_representations() const { return max_in_flight_representations_; }
   // Drops one live representation version of `id` without retiring the
   // allocation, i.e. the producer observed that an older version's readers are
   // done. Never drops the last one: an Active allocation always has at least
   // its current representation.
   bool release_representation(uint64_t id, uint32_t generation, std::string* error = nullptr);
-  const std::unordered_map<uint64_t, Allocation>& allocations() const { return allocations_; }
-  bool import_allocation(uint64_t id, uint32_t generation, uint64_t size, uint32_t representation_epoch,
-                         ObjectState state, const std::vector<uint8_t>& bytes, std::string* error = nullptr);
-  uint64_t id() const { return id_; }
-  uint64_t topology_epoch() const { return topology_epoch_; }
+  [[nodiscard]] const std::unordered_map<uint64_t, Allocation>& allocations() const { return allocations_; }
+  bool import_allocation(const RepresentationRef& ref, uint64_t size, ObjectState state,
+                         const std::vector<uint8_t>& bytes, std::string* error = nullptr);
+  [[nodiscard]] uint64_t id() const { return id_; }
+  [[nodiscard]] uint64_t topology_epoch() const { return topology_epoch_; }
   // Arena-wide monotone counter of representation transitions, sibling to
   // topology_epoch(): that one ticks when the pointer-bearing topology changes,
   // this one ticks when any allocation's backing/facet interpretation does
   // (02 Sec.4.1). RepresentationEpochBuilder::seal() stamps it, the same way
   // GraphEpochBuilder::seal() stamps topology_epoch().
-  uint64_t representation_clock() const { return representation_clock_; }
+  [[nodiscard]] uint64_t representation_clock() const { return representation_clock_; }
 
  private:
   uint64_t id_;
@@ -162,7 +170,7 @@ struct SwizzleChannels {
   Swizzle blue{Swizzle::Blue};
   Swizzle alpha{Swizzle::Alpha};
 
-  bool identity() const {
+  [[nodiscard]] bool identity() const {
     return red == Swizzle::Red && green == Swizzle::Green && blue == Swizzle::Blue &&
            alpha == Swizzle::Alpha;
   }
@@ -180,19 +188,23 @@ struct CanonicalView {
   SwizzleChannels swizzle;
 
   // Half-and-clamp, the sizing rule every graphics API's mip chain uses.
-  uint32_t mip_width(uint32_t level) const;
-  uint32_t mip_height(uint32_t level) const;
-  uint32_t subresource_count() const { return array_layers * mip_levels; }
+  [[nodiscard]] uint32_t mip_width(uint32_t level) const;
+  [[nodiscard]] uint32_t mip_height(uint32_t level) const;
+  [[nodiscard]] uint32_t subresource_count() const { return array_layers * mip_levels; }
   // Byte layout of the linear allocation this view names: slice-major, then
   // ascending mip level, each level tightly packed at
   // mip_width(level) * bytes_per_texel rows. This is the single contract the
   // Metal upload path and the reference sampling oracle both encode against --
   // if they disagreed on it, an image-correctness comparison between them
   // would be meaningless.
-  uint64_t bytes_per_row(uint32_t level) const;
-  uint64_t subresource_byte_size(uint32_t level) const;
-  uint64_t subresource_byte_offset(uint32_t layer, uint32_t level) const;
-  uint64_t byte_size() const;
+  struct SubresourceIndex {
+    uint32_t array_layer{};
+    uint32_t mip_level{};
+  };
+  [[nodiscard]] uint64_t bytes_per_row(uint32_t level) const;
+  [[nodiscard]] uint64_t subresource_byte_size(uint32_t level) const;
+  [[nodiscard]] uint64_t subresource_byte_offset(SubresourceIndex index) const;
+  [[nodiscard]] uint64_t byte_size() const;
   // Rejects a view whose extents/counts cannot describe a real image (zero
   // extent, zero layers/levels, a mip chain longer than the extent supports,
   // or array_layers > 1 without the array dimension). Shape validity is a
@@ -205,6 +217,13 @@ struct CanonicalView {
 struct FacetRef {
   uint32_t index{};
   uint32_t generation{};
+};
+
+// Sample source + attachment target for one raster pass. Adjacent FacetRef
+// parameters are otherwise interchangeable at every draw call site.
+struct RasterFacetPair {
+  FacetRef source{};
+  FacetRef target{};
 };
 
 struct FacetSlot {
@@ -272,8 +291,8 @@ class FacetPool {
   // resource is not handed to an unrelated facet underneath the GPU.
   bool begin_gpu_use(const Arena& arena, FacetRef ref, std::string* error = nullptr);
   bool end_gpu_use(FacetRef ref, std::string* error = nullptr);
-  uint32_t in_flight(FacetRef ref) const;
-  uint32_t slot_count() const { return static_cast<uint32_t>(slots_.size()); }
+  [[nodiscard]] uint32_t in_flight(FacetRef ref) const;
+  [[nodiscard]] uint32_t slot_count() const { return static_cast<uint32_t>(slots_.size()); }
   // 06 Sec.6.4 asks the checked profile to verify facet generation *in the
   // shader*. A shader cannot call lookup(), so the checked profile uploads this
   // table instead: entry[index] is the generation that index currently
@@ -286,12 +305,12 @@ class FacetPool {
   // a test can state the expected in-shader verdict without a GPU. Deliberately
   // weaker than lookup(): it sees only what the uploaded table encodes, and so
   // cannot observe an epoch that went stale after the snapshot.
-  bool generation_valid(FacetRef ref) const;
+  [[nodiscard]] bool generation_valid(FacetRef ref) const;
   // 02 §4.2 / 06 §11: a live token or an outstanding GPU use of this
   // allocation at `epoch` is an external reference ConsumeInput must see.
   // Retired slots still count while in_flight > 0, because the command buffer
   // that called begin_gpu_use() may still dereference the old backing.
-  bool references(uint64_t allocation, uint32_t generation, uint32_t epoch) const;
+  [[nodiscard]] bool references(const RepresentationRef& ref) const;
 
  private:
   void retire_slot(uint32_t index);
@@ -314,16 +333,16 @@ struct RepresentationRef {
 
 class RepresentationEpoch {
  public:
-  uint64_t value() const { return value_; }
-  bool sealed() const { return sealed_; }
-  const std::vector<RepresentationRef>& representations() const { return representations_; }
-  const std::vector<FacetRef>& facets() const { return facets_; }
-  bool contains(RepresentationRef reference) const;
-  bool contains(FacetRef ref) const;
+  [[nodiscard]] uint64_t value() const { return value_; }
+  [[nodiscard]] bool sealed() const { return sealed_; }
+  [[nodiscard]] const std::vector<RepresentationRef>& representations() const { return representations_; }
+  [[nodiscard]] const std::vector<FacetRef>& facets() const { return facets_; }
+  [[nodiscard]] bool contains(RepresentationRef reference) const;
+  [[nodiscard]] bool contains(FacetRef ref) const;
   // 02 Sec.10's "facet generation vs epoch = stale token" at epoch granularity:
   // true once any frozen representation no longer matches `arena`, meaning
   // every facet this epoch authorized has to be rebuilt rather than reused.
-  bool stale(const Arena& arena) const;
+  [[nodiscard]] bool stale(const Arena& arena) const;
 
  private:
   friend class RepresentationEpochBuilder;
@@ -351,7 +370,7 @@ class RepresentationEpochBuilder {
   // authorize a token that is dead on arrival.
   bool add_facet(const Arena& arena, const FacetPool& pool, FacetRef ref, std::string* error = nullptr);
   bool seal(RepresentationEpoch* out, std::string* error = nullptr);
-  bool sealed() const { return sealed_; }
+  [[nodiscard]] bool sealed() const { return sealed_; }
 
  private:
   uint64_t next_epoch_;
@@ -380,10 +399,10 @@ struct PointerRef {
 
 class GraphEpoch {
  public:
-  uint64_t value() const { return value_; }
-  bool sealed() const { return sealed_; }
-  const std::vector<PointerRef>& references() const { return references_; }
-  bool contains(PointerRef reference) const;
+  [[nodiscard]] uint64_t value() const { return value_; }
+  [[nodiscard]] bool sealed() const { return sealed_; }
+  [[nodiscard]] const std::vector<PointerRef>& references() const { return references_; }
+  [[nodiscard]] bool contains(PointerRef reference) const;
 
  private:
   friend class GraphEpochBuilder;
@@ -399,7 +418,7 @@ class GraphEpochBuilder {
   bool add_reference(PointerRef reference, std::string* error = nullptr);
   bool add_reference(const Arena& arena, PointerRef reference, std::string* error = nullptr);
   bool seal(GraphEpoch* out, std::string* error = nullptr);
-  bool sealed() const { return sealed_; }
+  [[nodiscard]] bool sealed() const { return sealed_; }
 
  private:
   uint64_t next_epoch_;
@@ -421,12 +440,16 @@ struct Edge {
 
 class PointerGraph {
  public:
-  const std::vector<Edge>& edges() const { return edges_; }
-  bool reachable(PointerRef from, uint64_t field_offset, PointerRef to) const;
+  [[nodiscard]] const std::vector<Edge>& edges() const { return edges_; }
+  [[nodiscard]] bool reachable(PointerRef from, uint64_t field_offset, PointerRef to) const;
   // Cycle-safe multi-hop reachability over any field offset. Cycles are not
   // rejected -- they are valid graph shapes here, so this only guards
   // against infinite loops, unlike EffectGraph::valid()'s cycle rejection.
-  bool reachable(PointerRef from, PointerRef to) const;
+  struct ReachQuery {
+    PointerRef from{};
+    PointerRef to{};
+  };
+  [[nodiscard]] bool reachable(ReachQuery query) const;
 
  private:
   friend class PointerGraphBuilder;
@@ -437,7 +460,7 @@ class PointerGraphBuilder {
  public:
   bool add_edge(PointerRef from, uint64_t field_offset, PointerRef to, std::string* error = nullptr);
   bool build(PointerGraph* out, std::string* error = nullptr);
-  bool built() const { return built_; }
+  [[nodiscard]] bool built() const { return built_; }
 
  private:
   std::vector<Edge> edges_;
@@ -464,8 +487,8 @@ class EffectGraph {
   static bool conflicts(const ir::Effect& before, const ir::Effect& after);
   bool validate_happens_before(const std::vector<std::vector<ir::Effect>>& effects,
                                std::string* error = nullptr) const;
-  bool valid() const;
-  const std::vector<EffectEdge>& edges() const { return edges_; }
+  [[nodiscard]] bool valid() const;
+  [[nodiscard]] const std::vector<EffectEdge>& edges() const { return edges_; }
  private:
   std::vector<EffectEdge> edges_;
 };
@@ -489,7 +512,7 @@ class EffectGraphBuilder {
   uint32_t add_node(std::vector<ir::Effect> effects, std::string* error = nullptr);
   bool add_dependency(uint32_t before, uint32_t after, std::string* error = nullptr);
   bool seal(EffectGraph* out, uint32_t* node_count, std::string* error = nullptr);
-  bool sealed() const { return sealed_; }
+  [[nodiscard]] bool sealed() const { return sealed_; }
 
  private:
   std::vector<std::vector<ir::Effect>> effects_;
@@ -541,11 +564,11 @@ class PublicationRing {
 
 class TaskGraph {
  public:
-  const std::vector<TaskRecord>& tasks() const { return tasks_; }
-  const std::vector<std::pair<uint32_t, uint32_t>>& dependencies() const { return dependencies_; }
-  const class EffectGraph& effect_graph() const { return effect_graph_; }
-  bool sealed() const { return sealed_; }
-  bool published() const { return published_; }
+  [[nodiscard]] const std::vector<TaskRecord>& tasks() const { return tasks_; }
+  [[nodiscard]] const std::vector<std::pair<uint32_t, uint32_t>>& dependencies() const { return dependencies_; }
+  [[nodiscard]] const class EffectGraph& effect_graph() const { return effect_graph_; }
+  [[nodiscard]] bool sealed() const { return sealed_; }
+  [[nodiscard]] bool published() const { return published_; }
   bool publish(std::string* error = nullptr);
   bool validate_execution(std::string* error = nullptr) const;
   // Deterministic topological order over Explicit+InferredConflict edges
@@ -568,11 +591,11 @@ class TaskGraphBuilder {
   bool append(const TaskRecord& task, std::string* error = nullptr);
   bool add_dependency(uint32_t before, uint32_t after, std::string* error = nullptr);
   bool add_effect(uint32_t task, const ir::Effect& effect, std::string* error = nullptr);
-  bool set_effects(uint32_t task, std::vector<ir::Effect> effects, std::string* error = nullptr);
+  bool set_effects(uint32_t task, const std::vector<ir::Effect>& effects, std::string* error = nullptr);
   bool set_quota(uint32_t max_tasks, uint64_t max_payload_bytes, std::string* error = nullptr);
   bool append_published(PublicationRing& ring, uint32_t slot, std::string* error = nullptr);
   bool seal(TaskGraph* out, std::string* error = nullptr);
-  bool sealed() const { return sealed_; }
+  [[nodiscard]] bool sealed() const { return sealed_; }
 
  private:
   std::vector<TaskRecord> tasks_;
@@ -584,13 +607,20 @@ class TaskGraphBuilder {
   bool sealed_{};
 };
 
+// Wait-then-signal pair for one submission. Adjacent uint64_t wait/signal
+// parameters are otherwise interchangeable at every dispatch call site.
+struct TimelineGate {
+  uint64_t wait{};
+  uint64_t signal{};
+};
+
 class Timeline {
  public:
   explicit Timeline(uint64_t value = 0) : value_(value) {}
   bool signal(uint64_t value, std::string* error = nullptr);
-  bool wait(uint64_t value) const { return value <= value_; }
+  [[nodiscard]] bool wait(uint64_t value) const { return value <= value_; }
   bool validate_wait(uint64_t value, std::string* error = nullptr) const;
-  uint64_t value() const { return value_; }
+  [[nodiscard]] uint64_t value() const { return value_; }
 
  private:
   uint64_t value_{};
@@ -598,7 +628,7 @@ class Timeline {
 
 struct Certificate {
   std::vector<ir::Effect> ranges;
-  bool covers(const ir::Effect& effect) const;
+  [[nodiscard]] bool covers(const ir::Effect& effect) const;
 };
 
 struct WitnessEntry {
@@ -614,8 +644,8 @@ struct WitnessDiff {
 class AccessWitness {
  public:
   void record(ir::Effect effect, uint32_t instruction_index);
-  const std::vector<WitnessEntry>& entries() const { return entries_; }
-  WitnessDiff diff(const Certificate& certificate) const;
+  [[nodiscard]] const std::vector<WitnessEntry>& entries() const { return entries_; }
+  [[nodiscard]] WitnessDiff diff(const Certificate& certificate) const;
 
  private:
   std::vector<WitnessEntry> entries_;
@@ -736,7 +766,7 @@ struct WorkingSetLease {
   uint64_t byte_limit{};
   bool complete{};
 
-  bool covers(PointerRef ref) const;
+  [[nodiscard]] bool covers(PointerRef ref) const;
   bool add(PointerRef ref, const std::vector<PointerRef>& proven, std::string* error = nullptr);
   bool valid(const std::vector<PointerRef>& proven, std::string* error = nullptr) const;
 };
@@ -755,7 +785,7 @@ struct EnvelopeOverflow {
   bool valid(std::string* error = nullptr) const;
   // True only for a valid Deferred leftover. A Rejected record never
   // answers true, even if a caller stuffed a token in.
-  bool continued() const;
+  [[nodiscard]] bool continued() const;
 };
 
 // Per-device leftover buffer for E017 / ADR-039. Tokens are minted here
@@ -767,7 +797,7 @@ class EnvelopeContinuationTable {
   // token. Empty leftover is not a Deferred record -- mint returns 0 and
   // stores nothing.
   uint64_t mint(std::vector<uint32_t> leftover_order);
-  bool contains(uint64_t token) const;
+  [[nodiscard]] bool contains(uint64_t token) const;
   bool lookup(uint64_t token, std::vector<uint32_t>* leftover, std::string* error = nullptr) const;
   // Removes the leftover so a later submit cannot drain it twice.
   bool take(uint64_t token, std::vector<uint32_t>* leftover, std::string* error = nullptr);

@@ -165,7 +165,7 @@ bool run_representation_stage(const std::vector<RepresentationRequest>& requests
     const RepresentationRequest& request = requests[index];
     const std::string label = "representation request " + std::to_string(index);
     const core::Allocation* allocation =
-        arena.lookup(request.view.allocation, request.view.allocation_generation);
+        arena.lookup(core::PointerRef{request.view.allocation, request.view.allocation_generation});
     if (allocation == nullptr)
       return fail(label + " names allocation " + std::to_string(request.view.allocation) +
                   " at generation " + std::to_string(request.view.allocation_generation) +
@@ -176,8 +176,7 @@ bool run_representation_stage(const std::vector<RepresentationRequest>& requests
     // retire_stale() after transform() would erase a token-only hold before
     // consume_representation() could see it. Check the live epoch first.
     if (request.consume_input &&
-        pool.references(request.view.allocation, request.view.allocation_generation,
-                        allocation->representation_epoch)) {
+        pool.references(core::RepresentationRef{request.view.allocation, request.view.allocation_generation, allocation->representation_epoch})) {
       return fail(label + " asked for ConsumeInput, but a facet token still names the old representation");
     }
 

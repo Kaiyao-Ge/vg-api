@@ -33,12 +33,17 @@ vg::ir::Module make_probe_module(vg::core::Arena& arena) {
   return module;
 }
 
-TaskGraph make_chain(uint32_t task_count, uint64_t root) {
+struct TaskChain {
+  uint32_t task_count{};
+  uint64_t root_allocation{};
+};
+
+TaskGraph make_chain(TaskChain chain) {
   TaskGraphBuilder builder;
-  for (uint32_t i = 0; i < task_count; ++i) {
+  for (uint32_t i = 0; i < chain.task_count; ++i) {
     TaskRecord task{};
     task.node_index = i;
-    task.root_allocation = root;
+    task.root_allocation = chain.root_allocation;
     if (!builder.append(task)) return {};
     if (i > 0 && !builder.add_dependency(i - 1, i)) return {};
   }
@@ -62,7 +67,7 @@ bool run_reference_continuation() {
   }
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
-  auto graph = make_chain(3, module.instructions[0].allocation);
+  auto graph = make_chain({.task_count = 3, .root_allocation = module.instructions[0].allocation});
   if (graph.tasks().size() != 3) {
     std::cerr << "envelope-continuation: failed to build task graph\n";
     return false;
@@ -145,7 +150,7 @@ bool run_metal_large_quota() {
   }
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
-  auto graph = make_chain(3, 42);
+  auto graph = make_chain({.task_count = 3, .root_allocation = 42});
   if (graph.tasks().size() != 3) {
     std::cerr << "envelope-continuation: failed to build Metal task graph\n";
     return false;
@@ -198,7 +203,7 @@ bool run_metal_continuation() {
   }
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
-  auto graph = make_chain(3, module.instructions[0].allocation);
+  auto graph = make_chain({.task_count = 3, .root_allocation = module.instructions[0].allocation});
   if (graph.tasks().size() != 3) {
     std::cerr << "envelope-continuation: failed to build Metal continuation graph\n";
     return false;

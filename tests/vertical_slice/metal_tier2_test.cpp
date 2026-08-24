@@ -49,7 +49,7 @@ TaskGraph make_graph(const std::vector<uint32_t>& node_classes) {
 }
 
 std::vector<uint32_t> sorted(std::vector<uint32_t> values) {
-  std::sort(values.begin(), values.end());
+  std::ranges::sort(values);
   return values;
 }
 
@@ -65,7 +65,7 @@ bool has_event(const vg::hal::LoweringReport& report, const char* operation,
 
 bool report_claims_device_pass_for_tier2(const vg::hal::LoweringReport& report) {
   for (const auto& event : report.events) {
-    if (event.operation.rfind("tier2_", 0) != 0) continue;
+    if (!event.operation.starts_with("tier2_")) continue;
     if (event.classification == vg::hal::LoweringClass::DevicePass) return true;
   }
   return false;

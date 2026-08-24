@@ -28,7 +28,7 @@ vg::ir::Module load_and_bind(const std::string& path, vg::core::Arena& arena) {
 
   std::vector<uint64_t> original_ids;
   for (const auto& instruction : module.instructions)
-    if (std::find(original_ids.begin(), original_ids.end(), instruction.allocation) == original_ids.end())
+    if (std::ranges::find(original_ids, instruction.allocation) == original_ids.end())
       original_ids.push_back(instruction.allocation);
 
   std::map<uint64_t, uint64_t> remap;
@@ -102,7 +102,7 @@ bool run_fixture(const std::string& name, const std::string& root) {
 
   bool bytes_match = true;
   for (const auto& [id, allocation] : reference_arena.allocations()) {
-    const auto* metal_allocation = metal_arena.lookup(id, allocation.generation, allocation.representation_epoch);
+    const auto* metal_allocation = metal_arena.lookup(vg::core::RepresentationRef{id, allocation.generation, allocation.representation_epoch});
     if (metal_allocation == nullptr || metal_allocation->bytes != allocation.bytes) {
       std::cerr << name << ": byte mismatch for allocation " << id << "\n";
       bytes_match = false;
@@ -111,7 +111,7 @@ bool run_fixture(const std::string& name, const std::string& root) {
   if (!bytes_match) return false;
 
   const bool host_assisted =
-      std::any_of(metal_submission.report.events.begin(), metal_submission.report.events.end(),
+      std::ranges::any_of(metal_submission.report.events,
                  [](const vg::hal::LoweringEvent& event) {
                    return event.operation == "metal_pipeline" &&
                           event.classification == vg::hal::LoweringClass::HostAssisted;

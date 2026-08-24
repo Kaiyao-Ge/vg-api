@@ -8,8 +8,8 @@ namespace {
 const json::Value& require(const json::Value::Object& object, const std::string& key) { auto it=object.find(key); if(it==object.end()) throw std::runtime_error("IR missing field: "+key); return it->second; }
 uint64_t u64(const json::Value& value, const char* field) { if(!value.is_int()||value.integer()<0) throw std::runtime_error(std::string("IR invalid unsigned field: ")+field); return static_cast<uint64_t>(value.integer()); }
 uint32_t u32(const json::Value& value, const char* field) { const uint64_t result=u64(value,field); if(result>UINT32_MAX) throw std::runtime_error(std::string("IR field exceeds u32: ")+field); return static_cast<uint32_t>(result); }
-Access parse_access(const std::string& value) { if(value=="read")return Access::Read; if(value=="write")return Access::Write; if(value=="atomic")return Access::Atomic; if(value=="publish")return Access::Publish; throw std::runtime_error("IR invalid access: "+value); }
-std::string access_name(Access access) { switch(access){case Access::Read:return "read";case Access::Write:return "write";case Access::Atomic:return "atomic";case Access::Publish:return "publish";} return "unknown"; }
+Access parse_access(const std::string& value) { if(value=="none")return Access::None; if(value=="read")return Access::Read; if(value=="write")return Access::Write; if(value=="atomic")return Access::Atomic; if(value=="publish")return Access::Publish; throw std::runtime_error("IR invalid access: "+value); }
+std::string access_name(Access access) { switch(access){case Access::None:return "none";case Access::Read:return "read";case Access::Write:return "write";case Access::Atomic:return "atomic";case Access::Publish:return "publish";} return "unknown"; }
 Effect parse_effect(const json::Value& value) { const auto& o=value.object(); return {u64(require(o,"allocation"),"allocation"),u64(require(o,"offset"),"offset"),u64(require(o,"size"),"size"),parse_access(require(o,"access").string()),u32(require(o,"representation_epoch"),"representation_epoch")}; }
 json::Value effect_json(const Effect& effect) { return json::Value(json::Value::Object{{"access",json::Value(access_name(effect.access))},{"allocation",json::Value(static_cast<int64_t>(effect.allocation))},{"offset",json::Value(static_cast<int64_t>(effect.offset))},{"representation_epoch",json::Value(static_cast<int64_t>(effect.representation_epoch))},{"size",json::Value(static_cast<int64_t>(effect.size))}}); }
 PointerEdge parse_pointer_edge(const json::Value& value) { const auto& o=value.object(); return {u64(require(o,"from_allocation"),"from_allocation"),u64(require(o,"field_offset"),"field_offset"),u64(require(o,"to_allocation"),"to_allocation")}; }
@@ -34,7 +34,7 @@ std::string serialize_module(const Module& module) {
 bool effect_covers(const Effect& declared,const Effect& actual){ if(declared.allocation!=actual.allocation||declared.representation_epoch!=actual.representation_epoch)return false; if((static_cast<uint64_t>(declared.access)&static_cast<uint64_t>(actual.access))!=static_cast<uint64_t>(actual.access))return false; if(actual.size==0||declared.size==0||declared.offset>actual.offset)return false; const uint64_t relative=actual.offset-declared.offset; return relative<=declared.size && actual.size<=declared.size-relative; }
 namespace {
 bool pointer_edge_covers(const Module& module,const Instruction& root,const Instruction& via){
-  return std::any_of(module.declared_pointer_edges.begin(),module.declared_pointer_edges.end(),[&](const PointerEdge& edge){ return edge.from_allocation==root.allocation && edge.field_offset==root.offset && edge.to_allocation==via.allocation; });
+  return std::ranges::any_of(module.declared_pointer_edges,[&](const PointerEdge& edge){ return edge.from_allocation==root.allocation && edge.field_offset==root.offset && edge.to_allocation==via.allocation; });
 }
 }
 VerifyResult verify(const Module& module) {
@@ -51,7 +51,7 @@ VerifyResult verify(const Module& module) {
     }
     result.inferred_effects.push_back({i.allocation,i.offset,i.size,access,i.representation_epoch});
   }
-  for(const auto& actual:result.inferred_effects){bool covered=std::any_of(module.declared_effects.begin(),module.declared_effects.end(),[&](const Effect& declared){return effect_covers(declared,actual);});if(!covered){result.ok=false;result.message="declared effects do not cover inferred access";return result;}}
+  for(const auto& actual:result.inferred_effects){bool covered=std::ranges::any_of(module.declared_effects,[&](const Effect& declared){return effect_covers(declared,actual);});if(!covered){result.ok=false;result.message="declared effects do not cover inferred access";return result;}}
   return result;
 }
 }

@@ -21,11 +21,20 @@ namespace vg::metal::tier2 {
 // Metal objects are passed as opaque pointers so this header stays C++
 // (no public texture or pipeline object). Callers in .mm files pass
 // `id<MTLDevice>` / `id<MTLCommandQueue>` / `id<MTLBuffer>`.
-bool apply_select(void* mtl_device, void* mtl_command_queue, void* mtl_fields_buffer,
-                  uint32_t task_count, const hal::ExecutionPlan& plan,
-                  hal::Submission* submission, uint64_t* encoder_count,
-                  uint64_t* command_buffer_count, uint64_t* queue_wait_count,
-                  std::string* error);
+struct DispatchCounters {
+  uint64_t* encoder_count{};
+  uint64_t* command_buffer_count{};
+  uint64_t* queue_wait_count{};
+};
+
+struct MetalSelectContext {
+  void* device{};
+  void* command_queue{};
+  void* fields_buffer{};
+};
+
+bool apply_select(const MetalSelectContext& metal, uint32_t task_count, const hal::ExecutionPlan& plan,
+                  hal::Submission* submission, DispatchCounters counters, std::string* error);
 
 // Debug/test-only readback of the GPU-authored selected class per task
 // (task-vector index order). Compare as a sorted multiset against

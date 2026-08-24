@@ -361,7 +361,7 @@ hal::LoweringReport make_facet_report() {
 
 std::array<float, 4> decode_texel(const void* bytes, MTLPixelFormat format) {
   if (format == MTLPixelFormatRGBA8Unorm) {
-    const uint8_t* rgba = static_cast<const uint8_t*>(bytes);
+    const auto* rgba = static_cast<const uint8_t*>(bytes);
     return {rgba[0] / 255.0f, rgba[1] / 255.0f, rgba[2] / 255.0f, rgba[3] / 255.0f};
   }
   float value{};
@@ -459,7 +459,7 @@ struct DeviceHal::Impl {
   uint64_t release_empty_linear_buffers(const core::Arena& arena) {
     uint64_t released = 0;
     for (auto it = allocation_map.begin(); it != allocation_map.end();) {
-      const core::Allocation* allocation = arena.lookup(it->first, it->second.generation);
+      const core::Allocation* allocation = arena.lookup(core::PointerRef{it->first, it->second.generation});
       if (allocation != nullptr && !allocation->bytes.empty()) {
         ++it;
         continue;
@@ -542,14 +542,38 @@ struct DeviceHal::Impl {
     return true;
   }
 
+  struct MslModule {
+    const std::string& ir_hash;
+    const std::string& source;
+  };
+  struct ShaderEntry {
+    const std::string& source;
+    const std::string& entry;
+  };
+  struct LibraryText {
+    const std::string& source;
+    const std::string& hash;
+  };
+  struct LodClamp {
+    float min;
+    float max;
+  };
+  struct TaskRingBuffers {
+    id<MTLBuffer> state{};
+    id<MTLBuffer> fields{};
+    id<MTLBuffer> inputs{};
+  };
+
   // Attempts to (re)compile the B4 MSL source into a pipeline, caching by IR
   // hash. Failure here is the sole source of truth for whether this GPU/OS
   // combination can run the module natively -- in particular, a module using
   // the 8-byte atomic_add path fails here if the device/driver lacks native
   // 64-bit atomics, and the caller treats that as a HostAssisted signal
   // rather than guessing at GPU family enums ahead of time.
-  bool ensure_pipeline(const std::string& ir_hash, const std::string& msl_source, std::string* error,
+  bool ensure_pipeline(const MslModule& compiled_msl, std::string* error,
                       const std::string& function_name = "vg_linear_compute") {
+    const std::string& ir_hash = compiled_msl.ir_hash;
+    const std::string& msl_source = compiled_msl.source;
     if (pipeline != nil && cached_ir_hash == ir_hash) return true;
     pipeline = nil;
     library = nil;
@@ -592,8 +616,10 @@ struct DeviceHal::Impl {
   // second, independent cache rather than a generalization of ensure_pipeline.
   std::unordered_map<std::string, std::pair<id<MTLLibrary>, id<MTLComputePipelineState>>> effect_dag_pipelines;
 
-  bool ensure_effect_dag_pipeline(const std::string& ir_hash, const std::string& msl_source,
+  bool ensure_effect_dag_pipeline(const MslModule& compiled_msl,
                                   id<MTLComputePipelineState>* out_pipeline, std::string* error) {
+    const std::string& ir_hash = compiled_msl.ir_hash;
+    const std::string& msl_source = compiled_msl.source;
     auto it = effect_dag_pipelines.find(ir_hash);
     if (it != effect_dag_pipelines.end()) { *out_pipeline = it->second.second; return true; }
     NSError* compile_error = nil;
@@ -689,7 +715,7 @@ struct DeviceHal::Impl {
     const core::FacetSlot* slot = resolve_facet(arena, pool, ref, expected_kind, error);
     if (slot == nullptr) return nil;
     const core::Allocation* allocation =
-        arena.lookup(slot->view.allocation, slot->view.allocation_generation);
+        arena.lookup(core::PointerRef{slot->view.allocation, slot->view.allocation_generation});
     if (allocation == nullptr) {
       if (error) *error = "facet backing allocation not found in arena";
       return nil;
@@ -746,11 +772,12 @@ struct DeviceHal::Impl {
       }
       std::memcpy(bytes.data(), [readback contents], image_bytes);
     }
-    out->resize(static_cast<size_t>(width) * height);
+    out->resize(static_cast<size_t>(width) * static_cast<size_t>(height));
     for (uint32_t y = 0; y < height; ++y) {
       for (uint32_t x = 0; x < width; ++x) {
-        (*out)[static_cast<size_t>(y) * width + x] =
-            decode_texel(bytes.data() + static_cast<size_t>(y) * row_bytes + x * kBytesPerTexel,
+        (*out)[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] =
+            decode_texel(bytes.data() + static_cast<size_t>(y) * row_bytes +
+                             static_cast<size_t>(x) * kBytesPerTexel,
                          texture.pixelFormat);
       }
     }
@@ -827,7 +854,7 @@ struct DeviceHal::Impl {
     const uint8_t* base = allocation.bytes.data();
     for (uint32_t layer = 0; layer < view.array_layers; ++layer) {
       for (uint32_t level = 0; level < view.mip_levels; ++level) {
-        const uint64_t offset = view.subresource_byte_offset(layer, level);
+        const uint64_t offset = view.subresource_byte_offset({layer, level});
         const uint64_t row_bytes = view.bytes_per_row(level);
         const MTLRegion region = MTLRegionMake2D(0, 0, view.mip_width(level), view.mip_height(level));
         [texture replaceRegion:region
@@ -850,7 +877,7 @@ struct DeviceHal::Impl {
     const core::FacetSlot* slot = resolve_facet(arena, pool, ref, expected_kind, error);
     if (slot == nullptr) return nil;
     const core::CanonicalView& view = slot->view;
-    const core::Allocation* allocation = arena.lookup(view.allocation, view.allocation_generation);
+    const core::Allocation* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
     if (allocation == nullptr) {
       if (error) *error = "facet backing allocation not found in arena";
       return nil;
@@ -919,12 +946,10 @@ struct DeviceHal::Impl {
   // to MipFilterNearest (the GL/Vulkan round-half-down level rule the reference
   // oracle documents) and Bilinear to MipFilterLinear (full trilinear on a
   // fractional lod, again matching the oracle).
-  id<MTLSamplerState> ensure_sampler_state(core::FilterMode filter, core::WrapMode wrap,
-                                           float lod_min = 0.0f,
-                                           float lod_max = std::numeric_limits<float>::max()) {
+  id<MTLSamplerState> ensure_sampler_state(core::FilterMode filter, core::WrapMode wrap, LodClamp lod) {
     std::array<uint32_t, 4> key{static_cast<uint32_t>(filter), static_cast<uint32_t>(wrap), 0, 0};
-    std::memcpy(&key[2], &lod_min, sizeof(float));
-    std::memcpy(&key[3], &lod_max, sizeof(float));
+    std::memcpy(&key[2], &lod.min, sizeof(float));
+    std::memcpy(&key[3], &lod.max, sizeof(float));
     auto it = sampler_cache.find(key);
     if (it != sampler_cache.end()) return it->second;
     MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
@@ -934,8 +959,8 @@ struct DeviceHal::Impl {
     descriptor.minFilter = mtl_filter;
     descriptor.magFilter = mtl_filter;
     descriptor.mipFilter = nearest ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
-    descriptor.lodMinClamp = lod_min;
-    descriptor.lodMaxClamp = lod_max;
+    descriptor.lodMinClamp = lod.min;
+    descriptor.lodMaxClamp = lod.max;
     const MTLSamplerAddressMode mtl_wrap =
         wrap == core::WrapMode::Clamp ? MTLSamplerAddressModeClampToEdge : MTLSamplerAddressModeRepeat;
     descriptor.sAddressMode = mtl_wrap;
@@ -955,11 +980,11 @@ struct DeviceHal::Impl {
   // B8 Tier0 requirement that dispatch sizing come from real TaskRecord
   // fields, not a placeholder.
   bool dispatch_and_wait(const std::vector<id<MTLBuffer>>& buffers, const std::vector<core::TaskRecord>& tasks,
-                        uint64_t wait_value, uint64_t signal_value, DispatchStats* stats, std::string* error) {
+                        core::TimelineGate gate, DispatchStats* stats, std::string* error) {
     const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
-    if (wait_value != 0) [command_buffer encodeWaitForEvent:timeline_event value:wait_value];
+    if (gate.wait != 0) [command_buffer encodeWaitForEvent:timeline_event value:gate.wait];
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
     if (encoder == nil) { if (error) *error = "failed to create Metal compute encoder"; return false; }
     [encoder setComputePipelineState:pipeline];
@@ -971,7 +996,7 @@ struct DeviceHal::Impl {
         [encoder dispatchThreadgroups:MTLSizeMake(task.x, task.y, task.z) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     }
     [encoder endEncoding];
-    if (signal_value != 0) [command_buffer encodeSignalEvent:timeline_event value:signal_value];
+    if (gate.signal != 0) [command_buffer encodeSignalEvent:timeline_event value:gate.signal];
     const auto submit_start = std::chrono::steady_clock::now();
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
@@ -1016,17 +1041,17 @@ struct DeviceHal::Impl {
   // buffer still needs useResource: for GPU residency even though it is
   // never itself bound at an index -- a real, distinct cost this milestone
   // deliberately reports rather than hides.
-  bool dispatch_indexed_and_wait(const std::vector<id<MTLBuffer>>& object_buffers, uint64_t wait_value,
-                                uint64_t signal_value, DispatchStats* stats, std::string* error) {
+  bool dispatch_indexed_and_wait(const std::vector<id<MTLBuffer>>& object_buffers, core::TimelineGate gate,
+                                DispatchStats* stats, std::string* error) {
     const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
-    if (wait_value != 0) [command_buffer encodeWaitForEvent:timeline_event value:wait_value];
+    if (gate.wait != 0) [command_buffer encodeWaitForEvent:timeline_event value:gate.wait];
 
     const size_t table_bytes = std::max<size_t>(object_buffers.size() * sizeof(uint64_t), sizeof(uint64_t));
     id<MTLBuffer> table_buffer = [device newBufferWithLength:table_bytes options:MTLResourceStorageModeShared];
     if (table_buffer == nil) { if (error) *error = "failed to allocate indexed binding table buffer"; return false; }
-    uint64_t* table = static_cast<uint64_t*>([table_buffer contents]);
+    auto* table = static_cast<uint64_t*>([table_buffer contents]);
     for (size_t index = 0; index < object_buffers.size(); ++index) table[index] = [object_buffers[index] gpuAddress];
 
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
@@ -1037,7 +1062,7 @@ struct DeviceHal::Impl {
     [encoder setBuffer:table_buffer offset:0 atIndex:0];
     [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [encoder endEncoding];
-    if (signal_value != 0) [command_buffer encodeSignalEvent:timeline_event value:signal_value];
+    if (gate.signal != 0) [command_buffer encodeSignalEvent:timeline_event value:gate.signal];
     const auto submit_start = std::chrono::steady_clock::now();
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
@@ -1221,17 +1246,16 @@ struct DeviceHal::Impl {
   // One thread per task (grid = (count,1,1) threadgroups of (1,1,1)
   // threads), so no two threads ever contend for the same ring slot --
   // each slot's Empty->Writing CAS can only ever be attempted once.
-  bool dispatch_task_publish(id<MTLBuffer> state_buffer, id<MTLBuffer> fields_buffer, id<MTLBuffer> inputs_buffer,
-                             uint32_t count, DispatchStats* stats, std::string* error) {
+  bool dispatch_task_publish(TaskRingBuffers buffers, uint32_t count, DispatchStats* stats, std::string* error) {
     const auto encode_start = std::chrono::steady_clock::now();
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
     if (encoder == nil) { if (error) *error = "failed to create Metal compute encoder"; return false; }
     [encoder setComputePipelineState:task_ring_pipeline];
-    [encoder setBuffer:state_buffer offset:0 atIndex:0];
-    [encoder setBuffer:fields_buffer offset:0 atIndex:1];
-    [encoder setBuffer:inputs_buffer offset:0 atIndex:2];
+    [encoder setBuffer:buffers.state offset:0 atIndex:0];
+    [encoder setBuffer:buffers.fields offset:0 atIndex:1];
+    [encoder setBuffer:buffers.inputs offset:0 atIndex:2];
     [encoder dispatchThreadgroups:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [encoder endEncoding];
     const auto submit_start = std::chrono::steady_clock::now();
@@ -1303,18 +1327,18 @@ struct DeviceHal::Impl {
   // 05 §10 makes a backend binary cache explicitly non-portable, and a key that
   // pretended to interpret the driver/compiler identity would be claiming
   // portability the artifact does not have.
-  std::string target_identity() const {
+  [[nodiscard]] std::string target_identity() const {
     return std::string([[device name] UTF8String]) + "|" +
            [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String] + "|MSL";
   }
 
-  compiler::PipelineKey make_pipeline_key(const std::string& source, const std::string& entry,
+  [[nodiscard]] compiler::PipelineKey make_pipeline_key(const ShaderEntry& shader,
                                           std::vector<std::pair<std::string, uint64_t>> constants,
                                           std::vector<uint32_t> attachment_formats,
                                           uint32_t sample_count) const {
     compiler::PipelineKey key;
-    key.code_object_hash = ir::sha256_hex(source);
-    key.entry = entry;
+    key.code_object_hash = ir::sha256_hex(shader.source);
+    key.entry = shader.entry;
     key.function_constants = std::move(constants);
     key.attachment_formats = std::move(attachment_formats);
     key.sample_count = sample_count;
@@ -1325,13 +1349,13 @@ struct DeviceHal::Impl {
   // One MTLLibrary per distinct MSL text, so two specializations of the same
   // source share the compiled library and differ only in the function constant
   // values applied to it.
-  id<MTLLibrary> ensure_library(const std::string& source, const std::string& hash, std::string* error) {
-    auto it = library_by_hash.find(hash);
+  id<MTLLibrary> ensure_library(const LibraryText& text, std::string* error) {
+    auto it = library_by_hash.find(text.hash);
     if (it != library_by_hash.end()) return it->second;
     NSError* compile_error = nil;
     MTLCompileOptions* options = [MTLCompileOptions new];
     id<MTLLibrary> library_object =
-        [device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+        [device newLibraryWithSource:[NSString stringWithUTF8String:text.source.c_str()]
                              options:options
                                error:&compile_error];
     if (library_object == nil) {
@@ -1339,7 +1363,7 @@ struct DeviceHal::Impl {
                                                 : "unknown MSL compile error";
       return nil;
     }
-    library_by_hash.emplace(hash, library_object);
+    library_by_hash.emplace(text.hash, library_object);
     return library_object;
   }
 
@@ -1388,7 +1412,7 @@ struct DeviceHal::Impl {
     const bool ok = cache.acquire(
         key, trigger,
         [&](uint64_t* binary_size, std::string* create_error) {
-          id<MTLLibrary> library_object = ensure_library(source, key.code_object_hash, create_error);
+          id<MTLLibrary> library_object = ensure_library({source, key.code_object_hash}, create_error);
           if (library_object == nil) return false;
           id<MTLFunction> function = ensure_function(library_object, key, create_error);
           if (function == nil) return false;
@@ -1431,7 +1455,7 @@ struct DeviceHal::Impl {
     const bool ok = cache.acquire(
         key, trigger,
         [&](uint64_t* binary_size, std::string* create_error) {
-          id<MTLLibrary> library_object = ensure_library(source, key.code_object_hash, create_error);
+          id<MTLLibrary> library_object = ensure_library({source, key.code_object_hash}, create_error);
           if (library_object == nil) return false;
           compiler::PipelineKey vertex_key = key;
           vertex_key.entry = vertex_entry;
@@ -1485,7 +1509,7 @@ struct DeviceHal::Impl {
     const std::string entry = array_dimension ? "vg_sample_facet_array" : "vg_sample_facet";
     std::vector<std::pair<std::string, uint64_t>> constants;
     if (checked) constants.emplace_back("vg_checked_profile", 1);
-    const compiler::PipelineKey key = make_pipeline_key(source, entry, constants, {}, 1);
+    const compiler::PipelineKey key = make_pipeline_key({source, entry}, constants, {}, 1);
     return acquire_compute_pipeline(pipeline_cache, compute_pipeline_by_key, source, key,
                                     checked ? "checked-profile facet generation guard (06 §6.4)"
                                             : "fast-native SampleFacet kernel",
@@ -1498,7 +1522,7 @@ struct DeviceHal::Impl {
   bool ensure_raster_pipeline(core::PixelFormat format, uint32_t sample_count,
                               id<MTLRenderPipelineState>* out, std::string* error) {
     const std::string source = compiler::raster_facet_metal_source();
-    const compiler::PipelineKey key = make_pipeline_key(source, "vg_raster_fragment", {},
+    const compiler::PipelineKey key = make_pipeline_key({source, "vg_raster_fragment"}, {},
                                                         {static_cast<uint32_t>(format)}, sample_count);
     return acquire_render_pipeline(pipeline_cache, render_pipeline_by_key, source, key, "vg_raster_vertex",
                                    to_mtl_pixel_format(format),
@@ -1688,7 +1712,7 @@ struct DeviceHal::Impl {
   bool transform_into_private_facet(core::Arena& arena, core::FacetPool& pool,
                                     const core::CanonicalView& view, core::FacetKind target_kind,
                                     core::FacetRef target_facet, TransformCost* cost, std::string* error) {
-    const core::Allocation* allocation = arena.lookup(view.allocation, view.allocation_generation);
+    const core::Allocation* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
     if (allocation == nullptr) {
       if (error) *error = "representation transform: backing allocation not found in arena";
       return false;
@@ -1716,7 +1740,7 @@ struct DeviceHal::Impl {
       if (blit == nil) { if (error) *error = "failed to create Metal blit encoder"; return false; }
       for (uint32_t layer = 0; layer < view.array_layers; ++layer) {
         for (uint32_t level = 0; level < view.mip_levels; ++level) {
-          const uint64_t offset = view.subresource_byte_offset(layer, level);
+          const uint64_t offset = view.subresource_byte_offset({layer, level});
           const uint64_t row_bytes = view.bytes_per_row(level);
           [blit copyFromBuffer:source
                   sourceOffset:offset
@@ -1832,19 +1856,19 @@ namespace {
 // build_*_compute_package() accepts the other's opcodes -- so this dispatch
 // is exhaustive and mutually exclusive, never both true for one module.
 bool is_pointer_graph_module(const ir::Module& module) {
-  return std::any_of(module.instructions.begin(), module.instructions.end(), [](const ir::Instruction& i) {
+  return std::ranges::any_of(module.instructions, [](const ir::Instruction& i) {
     return i.op == "load_ref" || i.op == "load_via" || i.op == "store_via";
   });
 }
 
 bool has_host_assisted_pipeline(const hal::LoweringReport& report) {
-  return std::any_of(report.events.begin(), report.events.end(), [](const hal::LoweringEvent& event) {
+  return std::ranges::any_of(report.events, [](const hal::LoweringEvent& event) {
     return event.operation == "metal_pipeline" && event.classification == hal::LoweringClass::HostAssisted;
   });
 }
 
 bool module_touches_allocation(const ir::Module& module, uint64_t allocation) {
-  return std::any_of(module.instructions.begin(), module.instructions.end(),
+  return std::ranges::any_of(module.instructions,
                      [allocation](const ir::Instruction& instruction) {
                        return instruction.allocation == allocation;
                      });
@@ -1872,6 +1896,7 @@ void attach_access_certificate(const hal::CompiledPlan& compiled, const core::Ar
   // full-arena DiscoverThenLease scan (ADR-025 / ADR-035).
   if (!compiled.plan.discovery_seeds.empty()) return;
   std::vector<core::PointerRef> touched;
+  touched.reserve(compiled.plan.module.instructions.size());
   for (const auto& instruction : compiled.plan.module.instructions)
     touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});
   core::AccessCertificate certificate;
@@ -2054,14 +2079,14 @@ bool DeviceHal::compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compi
     return false;
   }
 
-  const bool has_atomic = std::any_of(plan.module.instructions.begin(), plan.module.instructions.end(),
+  const bool has_atomic = std::ranges::any_of(plan.module.instructions,
                                       [](const ir::Instruction& i) { return i.op == "atomic_add"; });
 
   std::string pipeline_error;
   const bool pipeline_ok = indexed_binding
-      ? impl_->ensure_pipeline(indexed_package.package.canonical_ir_hash, indexed_package.package.metal_source,
+      ? impl_->ensure_pipeline({indexed_package.package.canonical_ir_hash, indexed_package.package.metal_source},
                               &pipeline_error, "vg_indexed_compute")
-      : impl_->ensure_pipeline(package.package.canonical_ir_hash, package.package.metal_source, &pipeline_error,
+      : impl_->ensure_pipeline({package.package.canonical_ir_hash, package.package.metal_source}, &pipeline_error,
                               pointer_graph ? "vg_pointer_graph_compute" : "vg_linear_compute");
   if (pipeline_ok) {
     compiled->report.supported = true;
@@ -2088,8 +2113,8 @@ bool DeviceHal::compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compi
         if (!pass_package.ok) { passes_ok = false; pass_error = pass_package.message; break; }
         std::string pipeline_error_for_pass;
         id<MTLComputePipelineState> pass_pipeline = nil;
-        if (!impl_->ensure_effect_dag_pipeline(pass_package.package.canonical_ir_hash,
-                                               pass_package.package.metal_source, &pass_pipeline,
+        if (!impl_->ensure_effect_dag_pipeline({pass_package.package.canonical_ir_hash,
+                                               pass_package.package.metal_source}, &pass_pipeline,
                                                &pipeline_error_for_pass)) {
           passes_ok = false;
           pass_error = pipeline_error_for_pass;
@@ -2358,7 +2383,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
 
       std::string pipeline_error;
       id<MTLComputePipelineState> pass_pipeline = nil;
-      if (!impl_->ensure_effect_dag_pipeline(pass_package.canonical_ir_hash, pass_package.metal_source,
+      if (!impl_->ensure_effect_dag_pipeline({pass_package.canonical_ir_hash, pass_package.metal_source},
                                              &pass_pipeline, &pipeline_error)) {
         submission->result.ok = false;
         submission->result.message = "Metal effect DAG pipeline compile failed: " + pipeline_error;
@@ -2376,7 +2401,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
         auto it = pass_generation_by_allocation.find(binding.allocation);
         core::Allocation* allocation = it == pass_generation_by_allocation.end()
             ? nullptr
-            : arena.lookup(binding.allocation, it->second.first, it->second.second);
+            : arena.lookup(core::RepresentationRef{binding.allocation, it->second.first, it->second.second});
         if (allocation == nullptr) {
           submission->result.ok = false;
           submission->result.poison = core::PoisonState::Poisoned;
@@ -2458,7 +2483,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       auto it = generation_by_allocation.find(allocation_id);
       core::Allocation* allocation = it == generation_by_allocation.end()
           ? nullptr
-          : arena.lookup(allocation_id, it->second.first, it->second.second);
+          : arena.lookup(core::RepresentationRef{allocation_id, it->second.first, it->second.second});
       if (allocation == nullptr) {
         submission->result.ok = false;
         submission->result.poison = core::PoisonState::Poisoned;
@@ -2477,7 +2502,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
 
     DispatchStats stats;
     std::string dispatch_error;
-    if (!impl_->dispatch_indexed_and_wait(object_buffers, wait_value, signal_value, &stats, &dispatch_error)) {
+    if (!impl_->dispatch_indexed_and_wait(object_buffers, {.wait = wait_value, .signal = signal_value}, &stats, &dispatch_error)) {
       submission->result.ok = false;
       submission->result.message = "Metal indexed dispatch failed: " + dispatch_error;
       return true;
@@ -2519,7 +2544,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
     auto it = generation_by_allocation.find(binding.allocation);
     core::Allocation* allocation = it == generation_by_allocation.end()
         ? nullptr
-        : arena.lookup(binding.allocation, it->second.first, it->second.second);
+        : arena.lookup(core::RepresentationRef{binding.allocation, it->second.first, it->second.second});
     if (allocation == nullptr) {
       submission->result.ok = false;
       submission->result.poison = core::PoisonState::Poisoned;
@@ -2538,7 +2563,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
 
   DispatchStats stats;
   std::string dispatch_error;
-  if (!impl_->dispatch_and_wait(buffers, {}, wait_value, signal_value, &stats, &dispatch_error)) {
+  if (!impl_->dispatch_and_wait(buffers, {}, {.wait = wait_value, .signal = signal_value}, &stats, &dispatch_error)) {
     submission->result.ok = false;
     submission->result.message = "Metal dispatch failed: " + dispatch_error;
     return true;
@@ -2599,7 +2624,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
     // do. dispatch_task_publish is fully synchronous (waitUntilCompleted),
     // so the Shared-storage buffers are already safe to read from the host
     // by the time it returns; no additional synchronization is needed.
-    const uint32_t count = static_cast<uint32_t>(tasks.size());
+    const auto count = static_cast<uint32_t>(tasks.size());
 
     id<MTLBuffer> state_buffer = [impl_->device newBufferWithLength:std::max<size_t>(count * sizeof(uint32_t), 1)
                                                               options:MTLResourceStorageModeShared];
@@ -2615,7 +2640,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       return true;
     }
     std::memset([state_buffer contents], 0, count * sizeof(uint32_t));
-    uint32_t* inputs = static_cast<uint32_t*>([inputs_buffer contents]);
+    auto* inputs = static_cast<uint32_t*>([inputs_buffer contents]);
     for (uint32_t i = 0; i < count; ++i) pack_task_record(tasks[i], inputs + i * kTaskRingWordsPerRecord);
 
     std::string task_pipeline_error;
@@ -2625,14 +2650,15 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
       return true;
     }
     std::string publish_error;
-    if (!impl_->dispatch_task_publish(state_buffer, fields_buffer, inputs_buffer, count, &stats, &publish_error)) {
+    if (!impl_->dispatch_task_publish({.state = state_buffer, .fields = fields_buffer, .inputs = inputs_buffer},
+                                      count, &stats, &publish_error)) {
       submission->result.ok = false;
       submission->result.message = "Metal task ring dispatch failed: " + publish_error;
       return true;
     }
 
-    const uint32_t* states = static_cast<const uint32_t*>([state_buffer contents]);
-    const uint32_t* fields = static_cast<const uint32_t*>([fields_buffer contents]);
+    const auto* states = static_cast<const uint32_t*>([state_buffer contents]);
+    const auto* fields = static_cast<const uint32_t*>([fields_buffer contents]);
     submission->published_tasks.reserve(count);
     for (uint32_t index : order) {
       if (states[index] != static_cast<uint32_t>(core::PublicationState::Published)) {
@@ -2660,7 +2686,7 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
         submission->result.message = "Metal Tier1 indirect dispatch failed: " + tier1_error;
         return true;
       }
-      const uint32_t* args = static_cast<const uint32_t*>([indirect_args_buffer contents]);
+      const auto* args = static_cast<const uint32_t*>([indirect_args_buffer contents]);
       const size_t stride_words = sizeof(MTLDispatchThreadgroupsIndirectArguments) / sizeof(uint32_t);
       impl_->last_tier1_indirect_dims.reserve(order.size());
       for (size_t i = 0; i < order.size(); ++i) {
@@ -2676,11 +2702,13 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
     // + per-Node indirect remains the EmulatedDevicePass fallback.
     if (compiled.plan.request_tier2_select) {
       std::string tier2_error;
-      if (!vg::metal::tier2::apply_select(static_cast<void*>(impl_->device),
-                                          static_cast<void*>(impl_->command_queue),
-                                          static_cast<void*>(fields_buffer), count, compiled.plan,
-                                          submission, &stats.encoder_count, &stats.command_buffer_count,
-                                          &stats.queue_wait_count, &tier2_error)) {
+      if (!vg::metal::tier2::apply_select({.device = static_cast<void*>(impl_->device),
+                                          .command_queue = static_cast<void*>(impl_->command_queue),
+                                          .fields_buffer = static_cast<void*>(fields_buffer)},
+                                         count, compiled.plan, submission,
+                                         {&stats.encoder_count, &stats.command_buffer_count,
+                                          &stats.queue_wait_count},
+                                         &tier2_error)) {
         submission->result.ok = false;
         submission->result.message = tier2_error;
         return true;
@@ -2731,7 +2759,7 @@ bool DeviceHal::run_cull_compact(const std::vector<uint32_t>& instance_visible,
     if (error) *error = "instance_visible and instance_ids must be the same size";
     return false;
   }
-  const uint32_t count = static_cast<uint32_t>(instance_visible.size());
+  const auto count = static_cast<uint32_t>(instance_visible.size());
   std::string pipeline_error;
   if (!impl_->ensure_cull_compact_pipeline(&pipeline_error)) {
     if (error) *error = "Metal cull/compact pipeline compile failed: " + pipeline_error;
@@ -2784,7 +2812,7 @@ bool DeviceHal::run_cull_compact(const std::vector<uint32_t>& instance_visible,
   }
 
   const uint32_t visible_count = *static_cast<const uint32_t*>([count_buffer contents]);
-  const uint32_t* compact = static_cast<const uint32_t*>([compact_buffer contents]);
+  const auto* compact = static_cast<const uint32_t*>([compact_buffer contents]);
   result->visible_count = visible_count;
   result->compact_ids.assign(compact, compact + std::min(visible_count, count));
   return true;
@@ -2846,7 +2874,7 @@ bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool
     return false;
   }
   const bool checked = profile == core::ValidationProfile::CheckedNative;
-  const uint32_t count = static_cast<uint32_t>(coords.size());
+  const auto count = static_cast<uint32_t>(coords.size());
 
   // The generation table is a snapshot of what the pool currently resolves
   // (core::FacetPool::snapshot_generations), which is exactly what the kernel's
@@ -2940,7 +2968,8 @@ bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool
     texture = impl_->ensure_guard_placeholder_texture(error);
     if (texture == nil) return false;
   }
-  id<MTLSamplerState> sampler = impl_->ensure_sampler_state(filter, wrap);
+  id<MTLSamplerState> sampler = impl_->ensure_sampler_state(
+      filter, wrap, {0.0f, std::numeric_limits<float>::max()});
   if (sampler == nil) { if (error) *error = "Metal sample facet sampler creation failed"; return false; }
 
   // The kernels take one `constant float& lod` per dispatch, not one per
@@ -2953,7 +2982,7 @@ bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool
   std::vector<std::pair<float, std::vector<uint32_t>>> lod_groups;
   for (uint32_t i = 0; i < count; ++i) {
     const float lod = coords[i].lod;
-    auto group = std::find_if(lod_groups.begin(), lod_groups.end(),
+    auto group = std::ranges::find_if(lod_groups,
                               [lod](const std::pair<float, std::vector<uint32_t>>& entry) {
                                 return entry.first == lod;
                               });
@@ -2970,7 +2999,7 @@ bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool
   id<MTLBuffer> violation_buffer = nil;
   if (checked) {
     const uint32_t token[2] = {ref.index, ref.generation};
-    const uint32_t slot_count = static_cast<uint32_t>(generations.size());
+    const auto slot_count = static_cast<uint32_t>(generations.size());
     token_buffer = [impl_->device newBufferWithLength:sizeof(token) options:MTLResourceStorageModeShared];
     table_buffer =
         [impl_->device newBufferWithLength:std::max<size_t>(generations.size() * sizeof(uint32_t), 1)
@@ -3033,7 +3062,7 @@ bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool
       if (error) *error = "Metal sample facet buffer allocation failed";
       return false;
     }
-    float* uv = static_cast<float*>([buffers.uv contents]);
+    auto* uv = static_cast<float*>([buffers.uv contents]);
     uint32_t* slices = array_dimension ? static_cast<uint32_t*>([buffers.slices contents]) : nullptr;
     for (size_t i = 0; i < indices.size(); ++i) {
       uv[i * 2 + 0] = coords[indices[i]].u;
@@ -3065,7 +3094,7 @@ bool DeviceHal::run_sample_facet(const core::Arena& arena, core::FacetPool& pool
 
   result->sampled_rgba.assign(count, {0.0f, 0.0f, 0.0f, 0.0f});
   for (const auto& buffers : group_buffers) {
-    const float* output = static_cast<const float*>([buffers.output contents]);
+    const auto* output = static_cast<const float*>([buffers.output contents]);
     for (size_t i = 0; i < buffers.indices->size(); ++i) {
       const uint32_t destination = (*buffers.indices)[i];
       result->sampled_rgba[destination] = {output[i * 4 + 0], output[i * 4 + 1], output[i * 4 + 2],
@@ -3130,7 +3159,7 @@ bool DeviceHal::run_storage_facet(const core::Arena& arena, core::FacetPool& poo
                " lies outside the subresources this canonical view declares";
     return false;
   }
-  const uint64_t texel_byte_offset = view.subresource_byte_offset(texel.layer, texel.level) +
+  const uint64_t texel_byte_offset = view.subresource_byte_offset({texel.layer, texel.level}) +
                                      static_cast<uint64_t>(texel.y) * view.bytes_per_row(texel.level) +
                                      static_cast<uint64_t>(texel.x) * kBytesPerTexel;
   std::string pipeline_error;
@@ -3187,11 +3216,11 @@ bool DeviceHal::run_storage_facet(const core::Arena& arena, core::FacetPool& poo
       if (error) *error = "Metal storage facet format buffer allocation failed";
       return false;
     }
-    const uint32_t format_code = static_cast<uint32_t>(view.format);
+    const auto format_code = static_cast<uint32_t>(view.format);
     std::memcpy([format_buffer contents], &format_code, sizeof(format_code));
     // The kernel indexes in texels, not bytes; core::bytes_per_texel is 4 for
     // both formats this milestone models, which is what makes that exact.
-    const uint32_t texel_index = static_cast<uint32_t>(texel_byte_offset / kBytesPerTexel);
+    const auto texel_index = static_cast<uint32_t>(texel_byte_offset / kBytesPerTexel);
     std::memcpy([texel_index_buffer contents], &texel_index, sizeof(texel_index));
   }
 
@@ -3332,7 +3361,7 @@ bool DeviceHal::run_representation_transform(core::Arena& arena, core::FacetPool
     if (error) *error = "representation transform result output is required";
     return false;
   }
-  const core::Allocation* allocation = arena.lookup(view.allocation, view.allocation_generation);
+  const core::Allocation* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
   if (allocation == nullptr) {
     if (error) *error = "representation transform: backing allocation not found in arena";
     return false;
@@ -3346,7 +3375,7 @@ bool DeviceHal::run_representation_transform(core::Arena& arena, core::FacetPool
   // no work still in flight.
   uint32_t new_epoch = 0;
   if (!arena.transform(view.allocation, view.allocation_generation, &new_epoch, error)) return false;
-  const uint32_t retired = static_cast<uint32_t>(pool.retire_stale(arena));
+  const auto retired = static_cast<uint32_t>(pool.retire_stale(arena));
 
   core::FacetRef out_facet{};
   if (!pool.acquire(arena, view, target_kind, &out_facet, error)) return false;
@@ -3390,7 +3419,7 @@ bool DeviceHal::run_representation_transform(core::Arena& arena, core::FacetPool
 }
 
 bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& pool,
-                                     core::FacetRef source_ref, core::FacetRef target_ref,
+                                     core::RasterFacetPair facets,
                                      const RasterDesc& desc, const std::vector<RasterVertex>& vertices,
                                      RasterResult* result, std::string* error) const {
   if (result == nullptr) { if (error) *error = "raster result output is required"; return false; }
@@ -3411,16 +3440,16 @@ bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& 
   // Both refs are capability tokens and both are bracketed: a pass reads one
   // facet and writes another, so neither slot may be recycled under work still
   // in flight (06 §6.4, §11).
-  FacetUseGuard source_use(pool, source_ref);
+  FacetUseGuard source_use(pool, facets.source);
   if (!source_use.begin(arena, error)) return false;
-  FacetUseGuard target_use(pool, target_ref);
+  FacetUseGuard target_use(pool, facets.target);
   if (!target_use.begin(arena, error)) return false;
 
   const core::FacetSlot* source_slot =
-      impl_->resolve_facet(arena, pool, source_ref, core::FacetKind::Sample, error);
+      impl_->resolve_facet(arena, pool, facets.source, core::FacetKind::Sample, error);
   if (source_slot == nullptr) return false;
   const core::FacetSlot* target_slot =
-      impl_->resolve_facet(arena, pool, target_ref, core::FacetKind::Attachment, error);
+      impl_->resolve_facet(arena, pool, facets.target, core::FacetKind::Attachment, error);
   if (target_slot == nullptr) return false;
   const core::CanonicalView& source_view = source_slot->view;
   const core::CanonicalView& target_view = target_slot->view;
@@ -3454,7 +3483,7 @@ bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& 
 
   bool source_cache_hit = false;
   std::string tex_error;
-  id<MTLTexture> source_texture = impl_->ensure_facet_texture(arena, pool, source_ref,
+  id<MTLTexture> source_texture = impl_->ensure_facet_texture(arena, pool, facets.source,
                                                               core::FacetKind::Sample, &source_cache_hit,
                                                               nullptr, &tex_error);
   if (source_texture == nil) {
@@ -3479,11 +3508,11 @@ bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& 
     }
   }
   id<MTLSamplerState> sampler =
-      impl_->ensure_sampler_state(desc.filter, desc.wrap, desc.source_lod, desc.source_lod);
+      impl_->ensure_sampler_state(desc.filter, desc.wrap, {.min = desc.source_lod, .max = desc.source_lod});
   if (sampler == nil) { if (error) *error = "Metal raster sampler creation failed"; return false; }
 
   bool target_cache_hit = false;
-  id<MTLTexture> target_texture = impl_->ensure_facet_texture(arena, pool, target_ref,
+  id<MTLTexture> target_texture = impl_->ensure_facet_texture(arena, pool, facets.target,
                                                               core::FacetKind::Attachment,
                                                               &target_cache_hit, nullptr, &tex_error);
   if (target_texture == nil) {
@@ -3651,9 +3680,9 @@ bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, s
         (void)shader_value;
         const auto start = std::chrono::steady_clock::now();
         compiler::PipelineKey key =
-            impl_->make_pipeline_key(compute_source, compute_entry, compute_constants(checked), {}, 1);
+            impl_->make_pipeline_key({compute_source, compute_entry}, compute_constants(checked), {}, 1);
         id<MTLLibrary> library_object =
-            impl_->ensure_library(compute_source, key.code_object_hash, error);
+            impl_->ensure_library({compute_source, key.code_object_hash}, error);
         if (library_object == nil) { release_naive(); return false; }
         id<MTLFunction> function = impl_->ensure_function(library_object, key, error);
         if (function == nil) { release_naive(); return false; }
@@ -3682,10 +3711,10 @@ bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, s
           (void)shader_value;
           const auto start = std::chrono::steady_clock::now();
           const compiler::PipelineKey key =
-              impl_->make_pipeline_key(raster_source, raster_fragment_entry, {},
+              impl_->make_pipeline_key({raster_source, raster_fragment_entry}, {},
                                        {static_cast<uint32_t>(format)}, sample_count);
           id<MTLLibrary> library_object =
-              impl_->ensure_library(raster_source, key.code_object_hash, error);
+              impl_->ensure_library({raster_source, key.code_object_hash}, error);
           if (library_object == nil) { release_naive(); return false; }
           compiler::PipelineKey vertex_key = key;
           vertex_key.entry = raster_vertex_entry;
@@ -3739,7 +3768,7 @@ bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, s
     for (uint64_t dynamic_value : kDynamicValues) {
       for (uint64_t shader_value : kShaderValues) {
         const compiler::PipelineKey base =
-            impl_->make_pipeline_key(compute_source, compute_entry, compute_constants(checked), {}, 1);
+            impl_->make_pipeline_key({compute_source, compute_entry}, compute_constants(checked), {}, 1);
         const std::vector<compiler::StateBlock> blocks{
             {"facet_generation_guard", compiler::StateBlockKind::PipelineKey, checked},
             {"threadgroup_width", compiler::StateBlockKind::DynamicState, dynamic_value},
@@ -3766,7 +3795,7 @@ bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, s
       for (uint64_t dynamic_value : kDynamicValues) {
         for (uint64_t shader_value : kShaderValues) {
           const compiler::PipelineKey base =
-              impl_->make_pipeline_key(raster_source, raster_fragment_entry, {},
+              impl_->make_pipeline_key({raster_source, raster_fragment_entry}, {},
                                        {static_cast<uint32_t>(format)}, sample_count);
           const std::vector<compiler::StateBlock> blocks{
               {"viewport", compiler::StateBlockKind::DynamicState, dynamic_value},
@@ -3807,7 +3836,7 @@ bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, s
   // real call with a real rejection, so "we reject it" is measured here rather
   // than asserted in a comment.
   const compiler::PipelineKey unsupported_base =
-      impl_->make_pipeline_key(raster_source, raster_fragment_entry, {},
+      impl_->make_pipeline_key({raster_source, raster_fragment_entry}, {},
                                {static_cast<uint32_t>(core::PixelFormat::RGBA8Unorm)}, 1);
   const compiler::PipelineClassification unsupported = classify_pipeline_state(
       unsupported_base,

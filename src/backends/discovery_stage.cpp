@@ -42,7 +42,7 @@ bool run_discovery_stage(const ExecutionPlan& plan, core::Arena& arena, Submissi
   core::WorkingSetLease lease;
   for (const auto& ref : discovery.reachable) {
     if (!lease.add(ref, discovery.reachable, error)) return false;
-    const core::Allocation* allocation = arena.lookup(ref.allocation, ref.generation);
+    const core::Allocation* allocation = arena.lookup(ref);
     if (allocation != nullptr) lease.byte_limit += allocation->size;
   }
   lease.complete = true;

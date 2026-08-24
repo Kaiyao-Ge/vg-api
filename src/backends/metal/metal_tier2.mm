@@ -263,11 +263,10 @@ id<MTLComputePipelineState> icb_node_pipeline(id<MTLDevice> device, uint32_t nod
   return pipeline;
 }
 
-void bump_counters(uint64_t encoders, uint64_t* encoder_count, uint64_t* command_buffer_count,
-                   uint64_t* queue_wait_count) {
-  if (encoder_count != nullptr) *encoder_count += encoders;
-  if (command_buffer_count != nullptr) *command_buffer_count += 1;
-  if (queue_wait_count != nullptr) *queue_wait_count += 1;
+void bump_counters(uint64_t encoders, DispatchCounters counters) {
+  if (counters.encoder_count != nullptr) *counters.encoder_count += encoders;
+  if (counters.command_buffer_count != nullptr) *counters.command_buffer_count += 1;
+  if (counters.queue_wait_count != nullptr) *counters.queue_wait_count += 1;
 }
 
 enum class IcbAttempt { Ok, Unauthorized, Unavailable };
@@ -292,8 +291,7 @@ bool finish_command_buffer(id<MTLCommandBuffer> command_buffer, std::string* err
 IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue,
                             id<MTLBuffer> fields_buffer, uint32_t task_count,
                             const hal::ExecutionPlan& plan, hal::Submission* submission,
-                            uint64_t* encoder_count, uint64_t* command_buffer_count,
-                            uint64_t* queue_wait_count, std::string* error) {
+                            DispatchCounters counters, std::string* error) {
   if (task_count == 0 || task_count > kMaxIcbCommands)
     return icb_unavailable(error, "ICB path requires 1..16384 published tasks");
   if (!argument_buffers_usable(device))
@@ -301,7 +299,7 @@ IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_qu
   if (!ensure_icb_encode_pipeline(device, error))
     return IcbAttempt::Unavailable;
 
-  const uint32_t class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
+  const auto class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
   std::vector<id<MTLComputePipelineState>> node_pipelines(class_count, nil);
   for (uint32_t i = 0; i < class_count; ++i) {
     node_pipelines[i] = icb_node_pipeline(device, plan.authorized_node_classes[i], error);
@@ -352,11 +350,11 @@ IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_qu
   std::memcpy([authorized_buffer contents], plan.authorized_node_classes.data(), authorized_bytes);
   std::memset([selected_buffer contents], 0, selected_bytes);
   std::memset([flag_buffer contents], 0, flag_bytes);
-  uint32_t* params = static_cast<uint32_t*>([params_buffer contents]);
+  auto* params = static_cast<uint32_t*>([params_buffer contents]);
   params[0] = task_count;
   params[1] = class_count;
   params[2] = compiler::kTaskRingWordsPerRecord;
-  uint32_t* slots = static_cast<uint32_t*>([slot_buffer contents]);
+  auto* slots = static_cast<uint32_t*>([slot_buffer contents]);
   for (uint32_t i = 0; i < task_count; ++i) slots[i] = i;
 
   [arg_encoder setArgumentBuffer:arg_buffer offset:0];
@@ -410,9 +408,9 @@ IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_qu
   ++encoders;
 
   if (!finish_command_buffer(command_buffer, error)) return IcbAttempt::Unavailable;
-  bump_counters(encoders, encoder_count, command_buffer_count, queue_wait_count);
+  bump_counters(encoders, counters);
 
-  const uint32_t* selected = static_cast<const uint32_t*>([selected_buffer contents]);
+  const auto* selected = static_cast<const uint32_t*>([selected_buffer contents]);
   g_last_selected_classes.assign(selected, selected + task_count);
   const uint32_t unauthorized = *static_cast<const uint32_t*>([flag_buffer contents]);
   if (unauthorized != 0) {
@@ -442,19 +440,19 @@ IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_qu
 bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue,
                          id<MTLBuffer> fields_buffer, uint32_t task_count,
                          const hal::ExecutionPlan& plan, hal::Submission* submission,
-                         uint64_t* encoder_count, uint64_t* command_buffer_count,
-                         uint64_t* queue_wait_count, const std::string& fallback_reason,
+                         DispatchCounters counters, const std::string& fallback_reason,
                          std::string* error) {
   if (!ensure_bucket_pipelines(device, error)) return false;
   const Pipelines& pipelines = cached_pipelines();
-  const uint32_t class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
+  const auto class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
 
-  const size_t authorized_bytes = class_count * sizeof(uint32_t);
-  const size_t counts_bytes = class_count * sizeof(uint32_t);
-  const size_t indices_bytes = static_cast<size_t>(class_count) * task_count * sizeof(uint32_t);
+  const size_t authorized_bytes = static_cast<size_t>(class_count) * sizeof(uint32_t);
+  const size_t counts_bytes = static_cast<size_t>(class_count) * sizeof(uint32_t);
+  const size_t indices_bytes = static_cast<size_t>(class_count) * static_cast<size_t>(task_count) *
+                               sizeof(uint32_t);
   const size_t selected_bytes = static_cast<size_t>(task_count) * sizeof(uint32_t);
   const size_t flag_bytes = sizeof(uint32_t);
-  const size_t indirect_bytes = class_count * 3 * sizeof(uint32_t);
+  const size_t indirect_bytes = static_cast<size_t>(class_count) * 3 * sizeof(uint32_t);
   const size_t params_bytes = 3 * sizeof(uint32_t);
   const uint64_t temporary_bytes = authorized_bytes + counts_bytes + indices_bytes + selected_bytes +
                                    flag_bytes + indirect_bytes + params_bytes;
@@ -477,7 +475,7 @@ bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue
   std::memset([indices_buffer contents], 0, indices_bytes);
   std::memset([selected_buffer contents], 0, selected_bytes);
   std::memset([flag_buffer contents], 0, flag_bytes);
-  uint32_t* params = static_cast<uint32_t*>([params_buffer contents]);
+  auto* params = static_cast<uint32_t*>([params_buffer contents]);
   params[0] = task_count;
   params[1] = class_count;
   params[2] = compiler::kTaskRingWordsPerRecord;
@@ -526,15 +524,16 @@ bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue
   [dispatch_encoder setBuffer:indices_buffer offset:0 atIndex:0];
   for (uint32_t node = 0; node < class_count; ++node) {
     [dispatch_encoder dispatchThreadgroupsWithIndirectBuffer:indirect_buffer
-                                        indirectBufferOffset:node * 3 * sizeof(uint32_t)
+                                        indirectBufferOffset:static_cast<NSUInteger>(node) * 3 *
+                                                             sizeof(uint32_t)
                                        threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
   }
   [dispatch_encoder endEncoding];
 
   if (!finish_command_buffer(command_buffer, error)) return false;
-  bump_counters(3, encoder_count, command_buffer_count, queue_wait_count);
+  bump_counters(3, counters);
 
-  const uint32_t* selected = static_cast<const uint32_t*>([selected_buffer contents]);
+  const auto* selected = static_cast<const uint32_t*>([selected_buffer contents]);
   g_last_selected_classes.assign(selected, selected + task_count);
   const uint32_t unauthorized = *static_cast<const uint32_t*>([flag_buffer contents]);
   if (unauthorized != 0) {
@@ -566,15 +565,12 @@ bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue
 
 const std::vector<uint32_t>& last_selected_node_classes() { return g_last_selected_classes; }
 
-bool apply_select(void* mtl_device, void* mtl_command_queue, void* mtl_fields_buffer,
-                  uint32_t task_count, const hal::ExecutionPlan& plan,
-                  hal::Submission* submission, uint64_t* encoder_count,
-                  uint64_t* command_buffer_count, uint64_t* queue_wait_count,
-                  std::string* error) {
+bool apply_select(const MetalSelectContext& metal, uint32_t task_count, const hal::ExecutionPlan& plan,
+                  hal::Submission* submission, DispatchCounters counters, std::string* error) {
   g_last_selected_classes.clear();
-  id<MTLDevice> device = static_cast<id<MTLDevice>>(mtl_device);
-  id<MTLCommandQueue> command_queue = static_cast<id<MTLCommandQueue>>(mtl_command_queue);
-  id<MTLBuffer> fields_buffer = static_cast<id<MTLBuffer>>(mtl_fields_buffer);
+  auto device = static_cast<id<MTLDevice>>(metal.device);
+  auto command_queue = static_cast<id<MTLCommandQueue>>(metal.command_queue);
+  auto fields_buffer = static_cast<id<MTLBuffer>>(metal.fields_buffer);
   if (device == nil || command_queue == nil || fields_buffer == nil) {
     if (error) *error = "Metal Tier2 select is missing a device, queue, or fields buffer";
     return false;
@@ -583,7 +579,7 @@ bool apply_select(void* mtl_device, void* mtl_command_queue, void* mtl_fields_bu
     if (error) *error = "Metal Tier2 select invoked without request_tier2_select";
     return false;
   }
-  const uint32_t class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
+  const auto class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
   if (class_count < 2 || class_count > kMaxAuthorizedClasses || task_count == 0) {
     if (error) *error = "Metal Tier2 select requires 2..16 authorized classes and a non-empty task graph";
     return false;
@@ -591,16 +587,14 @@ bool apply_select(void* mtl_device, void* mtl_command_queue, void* mtl_fields_bu
 
   std::string icb_error;
   const IcbAttempt icb = apply_icb_select(device, command_queue, fields_buffer, task_count, plan,
-                                          submission, encoder_count, command_buffer_count,
-                                          queue_wait_count, &icb_error);
+                                          submission, counters, &icb_error);
   if (icb == IcbAttempt::Ok) return true;
   if (icb == IcbAttempt::Unauthorized) {
     if (error) *error = icb_error;
     return false;
   }
   return apply_bucket_select(device, command_queue, fields_buffer, task_count, plan, submission,
-                             encoder_count, command_buffer_count, queue_wait_count, icb_error,
-                             error);
+                             counters, icb_error, error);
 }
 
 }  // namespace vg::metal::tier2

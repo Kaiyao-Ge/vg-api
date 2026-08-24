@@ -64,7 +64,7 @@ bool close_match(const Rgba& lhs, const Rgba& rhs) {
 
 size_t texel_offset(const vg::core::CanonicalView& view, uint32_t layer, uint32_t level, uint32_t x,
                     uint32_t y) {
-  return static_cast<size_t>(view.subresource_byte_offset(layer, level) +
+  return static_cast<size_t>(view.subresource_byte_offset({layer, level}) +
                              static_cast<uint64_t>(y) * view.bytes_per_row(level) +
                              static_cast<uint64_t>(x) * vg::core::bytes_per_texel(view.format));
 }
@@ -99,14 +99,19 @@ Bytes4 texel_pattern(uint32_t x, uint32_t y) {
           static_cast<uint8_t>(30 + 8 * x + 16 * y), 255};
 }
 
-vg::core::CanonicalView plain_view(uint64_t allocation, uint32_t width, uint32_t height) {
+struct Extent2 {
+  uint32_t width{};
+  uint32_t height{};
+};
+
+vg::core::CanonicalView plain_view(uint64_t allocation, Extent2 extent) {
   vg::core::CanonicalView view;
   view.allocation = allocation;
   view.allocation_generation = 1;
   view.format = vg::core::PixelFormat::RGBA8Unorm;
   view.dimension = vg::core::ViewDimension::Texture2D;
-  view.width = width;
-  view.height = height;
+  view.width = extent.width;
+  view.height = extent.height;
   return view;
 }
 
@@ -132,14 +137,14 @@ int main() {
     vg::core::Arena arena;
     const uint64_t backing_id = arena.allocate(168).id;
 
-    vg::core::CanonicalView view = plain_view(backing_id, 4, 4);
+    vg::core::CanonicalView view = plain_view(backing_id, {.width = 4, .height = 4});
     view.dimension = vg::core::ViewDimension::Texture2DArray;
     view.array_layers = 2;
     view.mip_levels = 3;
     assert(view.valid());
     assert(view.byte_size() == 168);
 
-    auto* backing = arena.lookup(backing_id, 1);
+    auto* backing = arena.lookup(vg::core::PointerRef{backing_id, 1});
     assert(backing != nullptr);
     for (uint32_t layer = 0; layer < view.array_layers; ++layer)
       for (uint32_t level = 0; level < view.mip_levels; ++level)
@@ -226,10 +231,10 @@ int main() {
   {
     vg::core::Arena arena;
     const uint64_t backing_id = arena.allocate(8).id;
-    vg::core::CanonicalView view = plain_view(backing_id, 2, 1);
+    vg::core::CanonicalView view = plain_view(backing_id, {.width = 2, .height = 1});
     assert(view.valid() && view.byte_size() == 8);
 
-    auto* backing = arena.lookup(backing_id, 1);
+    auto* backing = arena.lookup(vg::core::PointerRef{backing_id, 1});
     write_texel(*backing, view, 0, 0, 0, 0, Bytes4{0, 128, 255, 255});
     write_texel(*backing, view, 0, 0, 1, 0, Bytes4{255, 0, 64, 255});
 
@@ -272,12 +277,12 @@ int main() {
   {
     vg::core::Arena arena;
     const uint64_t backing_id = arena.allocate(168).id;
-    vg::core::CanonicalView view = plain_view(backing_id, 4, 4);
+    vg::core::CanonicalView view = plain_view(backing_id, {.width = 4, .height = 4});
     view.dimension = vg::core::ViewDimension::Texture2DArray;
     view.array_layers = 2;
     view.mip_levels = 3;
 
-    auto* backing = arena.lookup(backing_id, 1);
+    auto* backing = arena.lookup(vg::core::PointerRef{backing_id, 1});
     for (uint32_t layer = 0; layer < view.array_layers; ++layer)
       for (uint32_t level = 0; level < view.mip_levels; ++level)
         fill_subresource(*backing, view, layer, level, subresource_colour(layer, level));
@@ -329,11 +334,11 @@ int main() {
   {
     vg::core::Arena arena;
     const uint64_t backing_id = arena.allocate(84).id;
-    vg::core::CanonicalView view = plain_view(backing_id, 4, 4);
+    vg::core::CanonicalView view = plain_view(backing_id, {.width = 4, .height = 4});
     view.mip_levels = 3;
     assert(view.valid() && view.byte_size() == 84);
 
-    auto* backing = arena.lookup(backing_id, 1);
+    auto* backing = arena.lookup(vg::core::PointerRef{backing_id, 1});
     const Bytes4 preexisting{11, 22, 33, 44};
     fill_subresource(*backing, view, 0, 1, preexisting);
 
@@ -434,10 +439,10 @@ int main() {
     vg::core::Arena arena;
     const uint64_t source_id = arena.allocate(64).id;
     const uint64_t target_id = arena.allocate(64).id;
-    const vg::core::CanonicalView source = plain_view(source_id, 4, 4);
-    const vg::core::CanonicalView target = plain_view(target_id, 4, 4);
+    const vg::core::CanonicalView source = plain_view(source_id, {.width = 4, .height = 4});
+    const vg::core::CanonicalView target = plain_view(target_id, {.width = 4, .height = 4});
 
-    auto* source_allocation = arena.lookup(source_id, 1);
+    auto* source_allocation = arena.lookup(vg::core::PointerRef{source_id, 1});
     assert(source_allocation != nullptr);
     for (uint32_t y = 0; y < 4; ++y)
       for (uint32_t x = 0; x < 4; ++x) write_texel(*source_allocation, source, 0, 0, x, y, texel_pattern(x, y));
@@ -470,8 +475,8 @@ int main() {
     assert(sampled.ok);
     for (size_t index = 0; index < 16; ++index) {
       assert(exact_match(rendered.resolved_rgba[index], sampled.sampled_rgba[index]));
-      const uint32_t x = static_cast<uint32_t>(index % 4);
-      const uint32_t y = static_cast<uint32_t>(index / 4);
+      const auto x = static_cast<uint32_t>(index % 4);
+      const auto y = static_cast<uint32_t>(index / 4);
       assert(exact_match(rendered.resolved_rgba[index], unorm(texel_pattern(x, y))));
     }
 
@@ -507,10 +512,10 @@ int main() {
   {
     vg::core::Arena arena;
     const uint64_t backing_id = arena.allocate(84).id;
-    vg::core::CanonicalView view = plain_view(backing_id, 4, 4);
+    vg::core::CanonicalView view = plain_view(backing_id, {.width = 4, .height = 4});
     view.mip_levels = 3;
 
-    auto* backing = arena.lookup(backing_id, 1);
+    auto* backing = arena.lookup(vg::core::PointerRef{backing_id, 1});
     for (uint32_t y = 0; y < 4; ++y)
       for (uint32_t x = 0; x < 4; ++x) write_texel(*backing, view, 0, 0, x, y, texel_pattern(x, y));
 
@@ -555,10 +560,10 @@ int main() {
     vg::core::Arena arena;
     const uint64_t source_id = arena.allocate(64).id;
     const uint64_t target_id = arena.allocate(64).id;
-    const vg::core::CanonicalView source = plain_view(source_id, 4, 4);
-    const vg::core::CanonicalView target = plain_view(target_id, 4, 4);
+    const vg::core::CanonicalView source = plain_view(source_id, {.width = 4, .height = 4});
+    const vg::core::CanonicalView target = plain_view(target_id, {.width = 4, .height = 4});
 
-    auto* source_allocation = arena.lookup(source_id, 1);
+    auto* source_allocation = arena.lookup(vg::core::PointerRef{source_id, 1});
     for (uint32_t y = 0; y < 4; ++y)
       for (uint32_t x = 0; x < 4; ++x) write_texel(*source_allocation, source, 0, 0, x, y, texel_pattern(x, y));
 
@@ -616,14 +621,14 @@ int main() {
     desc.attachment.store = vg::reference::AttachmentStoreAction::Store;
     const auto quad = full_target_quad();
 
-    const auto bad_source = vg::reference::raster_triangles(arena, pool, attachment_ref, attachment_ref, desc, quad);
+    const auto bad_source = vg::reference::raster_triangles(arena, pool, {.source = attachment_ref, .target = attachment_ref}, desc, quad);
     assert(!bad_source.ok);
     assert(bad_source.message == "raster source: facet kind mismatch");
-    const auto bad_target = vg::reference::raster_triangles(arena, pool, sample_ref, sample_ref, desc, quad);
+    const auto bad_target = vg::reference::raster_triangles(arena, pool, {.source = sample_ref, .target = sample_ref}, desc, quad);
     assert(!bad_target.ok);
     assert(bad_target.message == "raster target: facet kind mismatch");
 
-    const auto via_tokens = vg::reference::raster_triangles(arena, pool, sample_ref, attachment_ref, desc, quad);
+    const auto via_tokens = vg::reference::raster_triangles(arena, pool, {.source = sample_ref, .target = attachment_ref}, desc, quad);
     assert(via_tokens.ok);
     assert(via_tokens.covered_fragment_count == 16);
 
@@ -640,7 +645,7 @@ int main() {
                                                             Rgba{0.0f, 1.0f, 0.0f, 1.0f});
     assert(!stale_storage.ok);
     assert(stale_storage.message == vg::core::to_string(vg::core::FacetStatus::EpochStale));
-    const auto stale_raster = vg::reference::raster_triangles(arena, pool, sample_ref, attachment_ref, desc, quad);
+    const auto stale_raster = vg::reference::raster_triangles(arena, pool, {.source = sample_ref, .target = attachment_ref}, desc, quad);
     assert(!stale_raster.ok);
     assert(stale_raster.message ==
            std::string("raster source: ") + vg::core::to_string(vg::core::FacetStatus::EpochStale));

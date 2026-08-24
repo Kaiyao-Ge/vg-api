@@ -28,13 +28,13 @@ thread_local std::string g_diagnostic;
 void set_diagnostic(const char* message) { g_diagnostic = message; }
 
 bool has_runtime(VgRuntime runtime) {
-  std::lock_guard<std::mutex> lock(g_runtime_mutex);
+  std::scoped_lock lock(g_runtime_mutex);
   return g_runtimes.contains(runtime);
 }
 
 VgResult validate_extensions(const VgStructHeader& header) {
   std::unordered_set<const void*> visited;
-  const VgStructHeader* extension = static_cast<const VgStructHeader*>(header.next);
+  const auto* extension = static_cast<const VgStructHeader*>(header.next);
   while (extension != nullptr) {
     if (!visited.insert(extension).second || extension->size < sizeof(VgStructHeader)) {
       set_diagnostic("extension chain is cyclic or has an invalid header size");
@@ -60,7 +60,7 @@ VgResult validate_header(const VgStructHeader& header, uint32_t type, size_t ful
 void VG_CALL destroy_runtime(VgRuntime runtime) {
   if (runtime == nullptr) return;
   {
-    std::lock_guard<std::mutex> lock(g_runtime_mutex);
+    std::scoped_lock lock(g_runtime_mutex);
     if (!g_runtimes.erase(runtime)) return;
   }
   VgFreeFn free_fn = runtime->free_fn;
@@ -92,7 +92,7 @@ VgResult VG_CALL create_runtime(const VgRuntimeDesc* desc, VgRuntime* out_runtim
     set_diagnostic("runtime allocation failed");
     return VG_ERROR_OUT_OF_HOST_MEMORY;
   }
-  VgRuntime_T* runtime = new (storage) VgRuntime_T();
+  auto* runtime = new (storage) VgRuntime_T();
   runtime->user = desc->user;
   runtime->allocate = desc->allocate;
   runtime->free_fn = desc->free;
@@ -104,7 +104,7 @@ VgResult VG_CALL create_runtime(const VgRuntimeDesc* desc, VgRuntime* out_runtim
   runtime->adapters.insert(runtime->adapters.end(), metal.begin(), metal.end());
   runtime->adapters.insert(runtime->adapters.end(), vulkan.begin(), vulkan.end());
   {
-    std::lock_guard<std::mutex> lock(g_runtime_mutex);
+    std::scoped_lock lock(g_runtime_mutex);
     g_runtimes.insert(runtime);
   }
   if (runtime->log != nullptr) runtime->log(runtime->user, VG_LOG_INFO, 0, "VG runtime created");
@@ -118,7 +118,7 @@ VgResult VG_CALL enumerate_adapters(VgRuntime runtime, uint32_t* inout_count,
     set_diagnostic("runtime is invalid or adapter count is missing");
     return VG_ERROR_INVALID_ARGUMENT;
   }
-  const uint32_t available = static_cast<uint32_t>(runtime->adapters.size());
+  const auto available = static_cast<uint32_t>(runtime->adapters.size());
   if (out_infos == nullptr) {
     *inout_count = available;
     return VG_SUCCESS;

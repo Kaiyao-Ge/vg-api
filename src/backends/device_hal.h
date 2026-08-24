@@ -58,7 +58,7 @@ struct CapabilitySnapshot {
   bool validation_available{};
   bool timestamps_available{};
 
-  bool supports(Capability capability) const {
+  [[nodiscard]] bool supports(Capability capability) const {
     return (capability_bits & static_cast<uint64_t>(capability)) != 0;
   }
 };
@@ -106,9 +106,9 @@ struct LoweringReport {
 
   void add(std::string operation, LoweringClass classification, uint64_t count,
            uint64_t bytes, std::string reason);
-  uint64_t count(LoweringClass classification) const;
-  bool has_hidden_host_wait() const;
-  std::string canonical_json() const;
+  [[nodiscard]] uint64_t count(LoweringClass classification) const;
+  [[nodiscard]] bool has_hidden_host_wait() const;
+  [[nodiscard]] std::string canonical_json() const;
 };
 
 // One Stage 5 (03 §7 "Representation") item: a Region's required facet and
@@ -447,7 +447,7 @@ bool apply_envelope_continuation(const ExecutionPlan& plan,
 class DeviceHal {
  public:
   virtual ~DeviceHal() = default;
-  virtual const CapabilitySnapshot& capabilities() const = 0;
+  [[nodiscard]] virtual const CapabilitySnapshot& capabilities() const = 0;
   virtual bool compile(const ExecutionPlan& plan, CompiledPlan* compiled,
                        std::string* error = nullptr) = 0;
   virtual bool submit(const CompiledPlan& compiled, core::Arena& arena,
@@ -459,12 +459,12 @@ class DeviceHal {
   // per-facet entry points still take an explicit pool so a test can drive one
   // it owns; this is the pool submit() itself uses.
   core::FacetPool& facet_pool() { return facet_pool_; }
-  const core::FacetPool& facet_pool() const { return facet_pool_; }
+  [[nodiscard]] const core::FacetPool& facet_pool() const { return facet_pool_; }
 
   // Issued continuation tokens live on the device so leftover cannot be
   // stolen by a later submit that omits pending_overflow (ADR-039).
   core::EnvelopeContinuationTable& envelope_continuations() { return envelope_continuations_; }
-  const core::EnvelopeContinuationTable& envelope_continuations() const {
+  [[nodiscard]] const core::EnvelopeContinuationTable& envelope_continuations() const {
     return envelope_continuations_;
   }
 

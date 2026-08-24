@@ -6,15 +6,15 @@
 
 namespace vg::reference {
 core::ExecutionResult execute(const ir::Module& module, core::Arena& arena, const core::Certificate* certificate,
-                              core::Timeline* timeline, uint64_t timeline_wait, uint64_t timeline_signal) {
+                              core::Timeline* timeline, core::TimelineGate gate) {
   core::ExecutionResult result;
   result.ok = true;
   result.poison = core::PoisonState::Valid;
   const auto verification = ir::verify(module);
   if (!verification.ok) { result.ok = false; result.poison = core::PoisonState::Poisoned; result.message = verification.message; result.fault.code = "IR_INVALID"; result.fault.message = verification.message; return result; }
-  if (timeline != nullptr && timeline_wait != 0) {
+  if (timeline != nullptr && gate.wait != 0) {
     std::string wait_error;
-    if (!timeline->validate_wait(timeline_wait, &wait_error)) {
+    if (!timeline->validate_wait(gate.wait, &wait_error)) {
       result.ok = false; result.outputs_valid = false; result.poison = core::PoisonState::Poisoned;
       result.message = wait_error; result.fault.code = "TIMELINE_WAIT_UNSATISFIED"; result.fault.message = wait_error;
       return result;
@@ -37,8 +37,7 @@ core::ExecutionResult execute(const ir::Module& module, core::Arena& arena, cons
   for (size_t index = 0; index < module.instructions.size(); ++index) {
     const auto& instruction = module.instructions[index];
     const uint32_t generation = instruction.generation;
-    core::Allocation* allocation = arena.lookup(instruction.allocation, generation,
-                                                instruction.representation_epoch);
+    core::Allocation* allocation = arena.lookup(core::RepresentationRef{instruction.allocation, generation, instruction.representation_epoch});
     if (allocation == nullptr || instruction.offset > allocation->size || instruction.size > allocation->size - instruction.offset) {
       result.ok = false; result.outputs_valid = false; result.poison = produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned; result.message = "stale generation, representation epoch, or out-of-bounds allocation reference"; result.fault = {static_cast<uint32_t>(index), {instruction.allocation, instruction.offset, instruction.size, ir::Access::Read, instruction.representation_epoch}, "STALE_OR_BOUNDS", result.message, 0}; return result;
     }
@@ -74,9 +73,9 @@ core::ExecutionResult execute(const ir::Module& module, core::Arena& arena, cons
       produced_output = true;
     }
   }
-  if (timeline != nullptr && timeline_signal != 0) {
+  if (timeline != nullptr && gate.signal != 0) {
     std::string signal_error;
-    if (!timeline->signal(timeline_signal, &signal_error)) {
+    if (!timeline->signal(gate.signal, &signal_error)) {
       result.ok = false; result.outputs_valid = false; result.poison = produced_output ? core::PoisonState::PartiallyProduced : core::PoisonState::Poisoned;
       result.message = signal_error; result.fault.code = "TIMELINE_SIGNAL_NOT_MONOTONIC"; result.fault.message = signal_error;
       return result;
@@ -91,7 +90,7 @@ TaskGraphExecutionResult execute_task_graph(const core::TaskGraph& task_graph) {
   if (!task_graph.validate_execution(&error)) { result.message = error; return result; }
 
   const auto& tasks = task_graph.tasks();
-  const uint32_t count = static_cast<uint32_t>(tasks.size());
+  const auto count = static_cast<uint32_t>(tasks.size());
   std::vector<uint32_t> order;
   if (!task_graph.deterministic_order(&order, &error)) { result.message = error; return result; }
 
@@ -133,7 +132,7 @@ uint32_t wrap_index(int32_t index, uint32_t size, core::WrapMode wrap) {
 }
 
 size_t texel_byte_offset(const core::CanonicalView& view, uint32_t layer, uint32_t level, uint32_t x, uint32_t y) {
-  return static_cast<size_t>(view.subresource_byte_offset(layer, level) +
+  return static_cast<size_t>(view.subresource_byte_offset({layer, level}) +
                              static_cast<uint64_t>(y) * view.bytes_per_row(level) +
                              static_cast<uint64_t>(x) * core::bytes_per_texel(view.format));
 }
@@ -191,7 +190,7 @@ const core::Allocation* resolve_view(const core::Arena& arena, const core::Canon
                                      std::string* error) {
   std::string shape_error;
   if (!view.valid(&shape_error)) { *error = std::string(what) + ": " + shape_error; return nullptr; }
-  const auto* allocation = arena.lookup(view.allocation, view.allocation_generation);
+  const auto* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
   if (allocation == nullptr) { *error = std::string(what) + ": backing allocation not found"; return nullptr; }
   if (allocation->bytes.size() < view.byte_size()) {
     *error = std::string(what) + ": allocation holds " + std::to_string(allocation->bytes.size()) +
@@ -218,19 +217,22 @@ bool check_subresource(const core::CanonicalView& view, uint32_t layer, uint32_t
 }
 
 std::array<float, 4> sample_level(const core::Allocation& allocation, const core::CanonicalView& view,
-                                  core::FilterMode filter, core::WrapMode wrap, float u, float v, uint32_t layer,
+                                  core::FilterMode filter, core::WrapMode wrap, SampleCoord uv,
                                   uint32_t level) {
+  const float u = uv.u;
+  const float v = uv.v;
+  const uint32_t layer = uv.array_slice;
   const uint32_t width = view.mip_width(level);
   const uint32_t height = view.mip_height(level);
   if (filter == core::FilterMode::Nearest) {
-    const int32_t xi = static_cast<int32_t>(std::floor(u * static_cast<float>(width)));
-    const int32_t yi = static_cast<int32_t>(std::floor(v * static_cast<float>(height)));
+    const auto xi = static_cast<int32_t>(std::floor(u * static_cast<float>(width)));
+    const auto yi = static_cast<int32_t>(std::floor(v * static_cast<float>(height)));
     return read_texel(allocation, view, layer, level, wrap_index(xi, width, wrap), wrap_index(yi, height, wrap));
   }
   const float px = u * static_cast<float>(width) - 0.5f;
   const float py = v * static_cast<float>(height) - 0.5f;
-  const int32_t x0 = static_cast<int32_t>(std::floor(px));
-  const int32_t y0 = static_cast<int32_t>(std::floor(py));
+  const auto x0 = static_cast<int32_t>(std::floor(px));
+  const auto y0 = static_cast<int32_t>(std::floor(py));
   const float fx = px - static_cast<float>(x0);
   const float fy = py - static_cast<float>(y0);
   const uint32_t xl = wrap_index(x0, width, wrap);
@@ -253,16 +255,16 @@ std::array<float, 4> sample_level(const core::Allocation& allocation, const core
 // `context` already names the caller and which input carries the lod/slice, so
 // a diagnostic reads as a VG-level statement about that input (05 §14) instead
 // of as a bare bounds complaint.
-bool check_sample_subresource(const core::CanonicalView& view, float lod, uint32_t array_slice,
+bool check_sample_subresource(const core::CanonicalView& view, const SampleCoord& coord,
                               const std::string& context, std::string* error) {
-  if (array_slice >= view.array_layers) {
-    *error = context + " requests array slice " + std::to_string(array_slice) +
+  if (coord.array_slice >= view.array_layers) {
+    *error = context + " requests array slice " + std::to_string(coord.array_slice) +
              " but the CanonicalView declares " + std::to_string(view.array_layers) + " layers";
     return false;
   }
-  const float max_lod = static_cast<float>(view.mip_levels - 1);
-  if (!(lod >= 0.0f) || !(lod <= max_lod)) {
-    *error = context + " requests lod " + std::to_string(lod) + " but the CanonicalView declares " +
+  const auto max_lod = static_cast<float>(view.mip_levels - 1);
+  if (!(coord.lod >= 0.0f) || !(coord.lod <= max_lod)) {
+    *error = context + " requests lod " + std::to_string(coord.lod) + " but the CanonicalView declares " +
              std::to_string(view.mip_levels) + " mip levels, so lod must be within [0, " +
              std::to_string(max_lod) + "]";
     return false;
@@ -283,15 +285,15 @@ std::array<float, 4> sample_view(const core::Allocation& allocation, const core:
     const float selected = std::ceil(coord.lod + 0.5f) - 1.0f;
     const uint32_t level =
         static_cast<uint32_t>(std::min(static_cast<float>(view.mip_levels - 1), std::max(0.0f, selected)));
-    rgba = sample_level(allocation, view, filter, wrap, coord.u, coord.v, coord.array_slice, level);
+    rgba = sample_level(allocation, view, filter, wrap, coord, level);
   } else {
     const float base = std::floor(coord.lod);
     const float fraction = coord.lod - base;
-    const uint32_t level = static_cast<uint32_t>(base);
-    rgba = sample_level(allocation, view, filter, wrap, coord.u, coord.v, coord.array_slice, level);
+    const auto level = static_cast<uint32_t>(base);
+    rgba = sample_level(allocation, view, filter, wrap, coord, level);
     if (fraction > 0.0f) {
       const auto coarse =
-          sample_level(allocation, view, filter, wrap, coord.u, coord.v, coord.array_slice, level + 1);
+          sample_level(allocation, view, filter, wrap, coord, level + 1);
       for (int c = 0; c < 4; ++c)
         rgba[static_cast<size_t>(c)] =
             rgba[static_cast<size_t>(c)] * (1.0f - fraction) + coarse[static_cast<size_t>(c)] * fraction;
@@ -400,10 +402,15 @@ float orient2d(float ax, float ay, float bx, float by, float px, float py) {
 // triangle only when that edge is a top or a left edge. With winding normalized
 // so orient2d over the three vertices is positive, those are the edges whose
 // dy is negative, plus the horizontal edge running in +x.
-bool edge_covers(float value, float dx, float dy) {
+struct EdgeDelta {
+  float dx{};
+  float dy{};
+};
+
+bool edge_covers(float value, EdgeDelta delta) {
   if (value > 0.0f) return true;
   if (value < 0.0f) return false;
-  return dy < 0.0f || (dy == 0.0f && dx > 0.0f);
+  return delta.dy < 0.0f || (delta.dy == 0.0f && delta.dx > 0.0f);
 }
 
 // Sound over-approximation of the read set (docs/START.md §4 invariant 4): a
@@ -417,8 +424,8 @@ bool raster_reads_its_target(const core::CanonicalView& source, const core::Cano
   if (source.allocation != target.allocation) return false;
   if (source.allocation_generation != target.allocation_generation) return false;
   if (desc.source_array_slice != desc.attachment.subresource.layer) return false;
-  const uint32_t first = static_cast<uint32_t>(std::floor(desc.source_lod));
-  const uint32_t last = static_cast<uint32_t>(std::ceil(desc.source_lod));
+  const auto first = static_cast<uint32_t>(std::floor(desc.source_lod));
+  const auto last = static_cast<uint32_t>(std::ceil(desc.source_lod));
   return desc.attachment.subresource.level >= first && desc.attachment.subresource.level <= last;
 }
 }  // namespace
@@ -431,7 +438,7 @@ SampleFacetResult sample_facet(const core::Arena& arena, const core::CanonicalVi
 
   result.sampled_rgba.reserve(coords.size());
   for (size_t index = 0; index < coords.size(); ++index) {
-    if (!check_sample_subresource(view, coords[index].lod, coords[index].array_slice,
+    if (!check_sample_subresource(view, coords[index],
                                   "sample facet: coordinate " + std::to_string(index), &result.message)) {
       result.sampled_rgba.clear();
       return result;
@@ -492,7 +499,7 @@ StorageFacetResult storage_facet(core::Arena& arena, const core::CanonicalView& 
                      std::to_string(width) + "x" + std::to_string(height);
     return result;
   }
-  auto* allocation = arena.lookup(view.allocation, view.allocation_generation);
+  auto* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
   write_texel(*allocation, view, target.layer, target.level, target.x, target.y, rgba);
   result.written_rgba = read_texel(*allocation, view, target.layer, target.level, target.x, target.y);
   result.ok = true;
@@ -514,7 +521,7 @@ AttachmentFacetResult attachment_facet(core::Arena& arena, const core::Canonical
                                        const AttachmentFacetDesc& desc) {
   AttachmentFacetResult result;
   if (resolve_view(arena, view, "attachment facet", &result.message) == nullptr) return result;
-  auto* allocation = arena.lookup(view.allocation, view.allocation_generation);
+  auto* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
   AttachmentPass pass;
   if (!begin_attachment_pass(*allocation, view, desc, "attachment facet", &pass, &result.message)) return result;
   end_attachment_pass(*allocation, view, desc, pass, &result.resolved_rgba, &result.stored);
@@ -549,7 +556,7 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
   }
   const auto* source_allocation = resolve_view(arena, source, "raster source", &result.message);
   if (source_allocation == nullptr) return result;
-  if (!check_sample_subresource(source, desc.source_lod, desc.source_array_slice,
+  if (!check_sample_subresource(source, SampleCoord{.lod = desc.source_lod, .array_slice = desc.source_array_slice},
                                 "raster source: RasterDesc", &result.message))
     return result;
   if (resolve_view(arena, target, "raster target", &result.message) == nullptr) return result;
@@ -560,14 +567,14 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
         "order-dependent image (02 §3.2). Sampling a different slice/level of the same allocation is allowed.";
     return result;
   }
-  auto* target_allocation = arena.lookup(target.allocation, target.allocation_generation);
+  auto* target_allocation = arena.lookup(core::PointerRef{target.allocation, target.allocation_generation});
   AttachmentPass pass;
   if (!begin_attachment_pass(*target_allocation, target, desc.attachment, "raster target", &pass,
                              &result.message))
     return result;
 
-  const float width = static_cast<float>(pass.width);
-  const float height = static_cast<float>(pass.height);
+  const auto width = static_cast<float>(pass.width);
+  const auto height = static_cast<float>(pass.height);
   for (size_t base = 0; base < vertices.size(); base += 3) {
     std::array<float, 3> x{};
     std::array<float, 3> y{};
@@ -589,10 +596,10 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
       std::swap(v[1], v[2]);
       area = -area;
     }
-    const float min_x = std::min(x[0], std::min(x[1], x[2]));
-    const float max_x = std::max(x[0], std::max(x[1], x[2]));
-    const float min_y = std::min(y[0], std::min(y[1], y[2]));
-    const float max_y = std::max(y[0], std::max(y[1], y[2]));
+    const float min_x = std::min({x[0], x[1], x[2]});
+    const float max_x = std::max({x[0], x[1], x[2]});
+    const float min_y = std::min({y[0], y[1], y[2]});
+    const float max_y = std::max({y[0], y[1], y[2]});
     const int64_t x_begin = std::max<int64_t>(0, static_cast<int64_t>(std::floor(min_x)) - 1);
     const int64_t x_end = std::min<int64_t>(static_cast<int64_t>(pass.width) - 1,
                                             static_cast<int64_t>(std::ceil(max_x)) + 1);
@@ -608,9 +615,9 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
           const float e01 = orient2d(x[0], y[0], x[1], y[1], sx, sy);
           const float e12 = orient2d(x[1], y[1], x[2], y[2], sx, sy);
           const float e20 = orient2d(x[2], y[2], x[0], y[0], sx, sy);
-          if (!edge_covers(e01, x[1] - x[0], y[1] - y[0])) continue;
-          if (!edge_covers(e12, x[2] - x[1], y[2] - y[1])) continue;
-          if (!edge_covers(e20, x[0] - x[2], y[0] - y[2])) continue;
+          if (!edge_covers(e01, {.dx = x[1] - x[0], .dy = y[1] - y[0]})) continue;
+          if (!edge_covers(e12, {.dx = x[2] - x[1], .dy = y[2] - y[1]})) continue;
+          if (!edge_covers(e20, {.dx = x[0] - x[2], .dy = y[0] - y[2]})) continue;
           const float w0 = e12 / area;
           const float w1 = e20 / area;
           const float w2 = e01 / area;
@@ -637,16 +644,16 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
   return result;
 }
 
-RasterResult raster_triangles(core::Arena& arena, const core::FacetPool& pool, core::FacetRef source_ref,
-                              core::FacetRef target_ref, const RasterDesc& desc,
+RasterResult raster_triangles(core::Arena& arena, const core::FacetPool& pool, core::RasterFacetPair facets,
+                              const RasterDesc& desc,
                               const std::vector<RasterVertex>& vertices) {
   RasterResult result;
   core::FacetStatus status = core::FacetStatus::Ok;
-  const core::FacetSlot* source_slot = pool.lookup(arena, source_ref, &status);
+  const core::FacetSlot* source_slot = pool.lookup(arena, facets.source, &status);
   if (source_slot == nullptr) { result.message = std::string("raster source: ") + core::to_string(status); return result; }
   if (source_slot->kind != core::FacetKind::Sample) { result.message = "raster source: facet kind mismatch"; return result; }
   const core::CanonicalView source = source_slot->view;
-  const core::FacetSlot* target_slot = pool.lookup(arena, target_ref, &status);
+  const core::FacetSlot* target_slot = pool.lookup(arena, facets.target, &status);
   if (target_slot == nullptr) { result.message = std::string("raster target: ") + core::to_string(status); return result; }
   if (target_slot->kind != core::FacetKind::Attachment) { result.message = "raster target: facet kind mismatch"; return result; }
   const core::CanonicalView target = target_slot->view;

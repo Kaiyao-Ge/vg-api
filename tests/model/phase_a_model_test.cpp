@@ -41,10 +41,10 @@ int main() {
     auto& allocation = arena.allocate(8 + (random() % 64));
     const uint64_t id = allocation.id;
     const uint32_t generation = allocation.generation;
-    assert(arena.lookup(id, generation) != nullptr);
+    assert(arena.lookup(vg::core::PointerRef{id, generation}) != nullptr);
     if ((random() & 1u) != 0) {
-      assert(arena.retire(id, generation));
-      assert(arena.lookup(id, generation) == nullptr);
+      assert(arena.retire(vg::core::PointerRef{id, generation}));
+      assert(arena.lookup(vg::core::PointerRef{id, generation}) == nullptr);
       assert(!arena.acquire(id, generation));
       assert(!arena.release(id, generation));
     } else {
@@ -52,11 +52,11 @@ int main() {
       assert(!arena.transform(id, generation, nullptr, &error));
       assert(arena.release(id, generation));
       assert(arena.transform(id, generation, nullptr));
-      const auto* current = arena.lookup(id, generation);
+      const auto* current = arena.lookup(vg::core::PointerRef{id, generation});
       assert(current != nullptr);
       assert(arena.consume(id, generation, current->representation_epoch,
                            vg::core::ConsumeProof{true, true, true, true}, &error));
-      assert(arena.lookup(id, generation) == nullptr);
+      assert(arena.lookup(vg::core::PointerRef{id, generation}) == nullptr);
     }
   }
   return 0;

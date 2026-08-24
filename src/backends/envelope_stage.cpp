@@ -21,7 +21,7 @@ void report_host_split(Submission* submission, uint64_t count, const char* reaso
 
 bool leftover_matches_graph(const ExecutionPlan& plan, const std::vector<uint32_t>& leftover,
                             std::string* error) {
-  const uint32_t task_count = static_cast<uint32_t>(plan.task_graph.tasks().size());
+  const auto task_count = static_cast<uint32_t>(plan.task_graph.tasks().size());
   for (uint32_t index : leftover) {
     if (index >= task_count) {
       if (error) *error = "envelope continuation leftover does not match this graph";

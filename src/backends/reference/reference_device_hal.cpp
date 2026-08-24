@@ -37,7 +37,7 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     capabilities_.timestamps_available = false;
   }
 
-  const hal::CapabilitySnapshot& capabilities() const override { return capabilities_; }
+  [[nodiscard]] const hal::CapabilitySnapshot& capabilities() const override { return capabilities_; }
 
   bool compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
                std::string* error) override {
@@ -145,7 +145,8 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     const auto submit_start = std::chrono::steady_clock::now();
     submission->result = execute(compiled.plan.module, arena,
                                  compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate,
-                                 &timeline_, compiled.plan.timeline_wait, compiled.plan.timeline_signal);
+                                 &timeline_, {.wait = compiled.plan.timeline_wait,
+                                              .signal = compiled.plan.timeline_signal});
     submission->timeline_value = timeline_.value();
     if (!submission->result.ok) {
       submission->cpu_submit_ns =
@@ -218,6 +219,7 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     // full-arena DiscoverThenLease scan (ADR-025 / ADR-035).
     if (compiled.plan.requested_certificate_mode.has_value() && compiled.plan.discovery_seeds.empty()) {
       std::vector<core::PointerRef> touched;
+      touched.reserve(compiled.plan.module.instructions.size());
       for (const auto& instruction : compiled.plan.module.instructions) {
         touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});
       }

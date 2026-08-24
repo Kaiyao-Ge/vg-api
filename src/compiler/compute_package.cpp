@@ -40,7 +40,7 @@ std::string binding_name(uint32_t binding) { return "allocation_" + std::to_stri
 // encoding of `value`). Codegen must reproduce that exact bit pattern so
 // GPU-executed stores read back identically to the reference oracle.
 uint32_t store_word_pattern(int64_t value) {
-  const uint32_t low_byte = static_cast<uint32_t>(static_cast<uint8_t>(value));
+  const auto low_byte = static_cast<uint32_t>(static_cast<uint8_t>(value));
   return low_byte * 0x01010101u;
 }
 
@@ -110,7 +110,7 @@ ComputePackageResult build_pointer_graph_compute_package(const ir::Module& modul
     const auto& instruction = module.instructions[index];
     package.source_map.push_back({static_cast<uint32_t>(index), static_cast<uint32_t>(5 + index), instruction.source});
     if (instruction.op == "load_ref") continue;
-    const auto binding = std::find_if(package.bindings.begin(), package.bindings.end(),
+    const auto binding = std::ranges::find_if(package.bindings,
                                       [&](const ComputeBinding& item) { return item.allocation == instruction.allocation; });
     const std::string name = binding_name(binding->binding);
     const std::string glsl_ref = "vg_pc.allocations[" + std::to_string(binding->binding) + "]";
@@ -177,7 +177,7 @@ ComputePackageResult build_linear_compute_package(const ir::Module& module) {
 
   for (size_t index = 0; index < module.instructions.size(); ++index) {
     const auto& instruction = module.instructions[index];
-    const auto binding = std::find_if(package.bindings.begin(), package.bindings.end(),
+    const auto binding = std::ranges::find_if(package.bindings,
                                       [&](const ComputeBinding& item) { return item.allocation == instruction.allocation; });
     const std::string name = binding_name(binding->binding);
     const std::string glsl_ref = "vg_pc.allocations[" + std::to_string(binding->binding) + "]";
@@ -195,7 +195,7 @@ ComputePackageResult build_linear_compute_package(const ir::Module& module) {
     } else {
       const uint64_t byte_offset = instruction.offset;
       const uint64_t word64 = byte_offset / 8;
-      const uint64_t operand = static_cast<uint64_t>(instruction.value);
+      const auto operand = static_cast<uint64_t>(instruction.value);
       metal << "  atomic_fetch_add_explicit((device atomic<ulong>*)((device uchar*)" << name << " + " << byte_offset
             << "), (ulong)" << operand << "UL, memory_order_relaxed);\n";
       glsl << "  atomicAdd(VgAllocationRef64(uint64_t(" << glsl_ref << ")).words64[" << word64 << "], uint64_t(" << operand << "UL));\n";
@@ -563,7 +563,7 @@ IndexedComputePackageResult build_indexed_compute_package(const ir::Module& modu
     const auto& instruction = module.instructions[index];
     std::string error;
     if (!supported_indexed_instruction(instruction, &error)) return {false, error, {}};
-    const auto it = std::find(package.referenced_allocations.begin(), package.referenced_allocations.end(),
+    const auto it = std::ranges::find(package.referenced_allocations,
                               instruction.allocation);
     if (it == package.referenced_allocations.end()) {
       table_index_by_instruction[index] = static_cast<uint32_t>(package.referenced_allocations.size());

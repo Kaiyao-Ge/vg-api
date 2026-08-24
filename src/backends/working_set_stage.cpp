@@ -17,7 +17,7 @@ bool sum_leased_bytes(const core::WorkingSetLease& lease, const core::Arena& are
                       std::string* error) {
   uint64_t total = 0;
   for (const core::PointerRef& ref : lease.allocations) {
-    const core::Allocation* allocation = arena.lookup(ref.allocation, ref.generation);
+    const core::Allocation* allocation = arena.lookup(ref);
     if (allocation == nullptr) {
       if (error) *error = "working-set lease names a missing or stale allocation";
       return false;

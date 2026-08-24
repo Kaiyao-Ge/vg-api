@@ -15,9 +15,9 @@ struct Value {
   explicit Value(std::string v) : data(std::move(v)) {}
   explicit Value(Array v) : data(std::move(v)) {}
   explicit Value(Object v) : data(std::move(v)) {}
-  bool is_object() const; bool is_array() const; bool is_string() const; bool is_int() const;
-  const Object& object() const; const Array& array() const; const std::string& string() const; int64_t integer() const;
-  const Value* find(const std::string& key) const;
+  [[nodiscard]] bool is_object() const; [[nodiscard]] bool is_array() const; [[nodiscard]] bool is_string() const; [[nodiscard]] bool is_int() const;
+  [[nodiscard]] const Object& object() const; [[nodiscard]] const Array& array() const; [[nodiscard]] const std::string& string() const; [[nodiscard]] int64_t integer() const;
+  [[nodiscard]] const Value* find(const std::string& key) const;
 };
 Value parse(const std::string& text);
 std::string canonical(const Value& value);

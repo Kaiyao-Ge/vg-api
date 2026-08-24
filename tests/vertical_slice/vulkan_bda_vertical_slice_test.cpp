@@ -104,7 +104,7 @@ bool run_fixture(const std::string& name, const std::string& root) {
 
   bool bytes_match = true;
   for (const auto& [id, allocation] : reference_arena.allocations()) {
-    const auto* vulkan_allocation = vulkan_arena.lookup(id, allocation.generation, allocation.representation_epoch);
+    const auto* vulkan_allocation = vulkan_arena.lookup(vg::core::RepresentationRef{id, allocation.generation, allocation.representation_epoch});
     if (vulkan_allocation == nullptr || vulkan_allocation->bytes != allocation.bytes) {
       std::cerr << name << ": byte mismatch for allocation " << id << "\n";
       bytes_match = false;

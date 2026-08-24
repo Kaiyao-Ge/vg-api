@@ -10,13 +10,13 @@
 namespace vg::reference {
 
 // `timeline` is the device's persistent timeline (owned by the caller across
-// submissions). When non-null and `timeline_wait != 0`, execution is refused
-// unless the wait point is already satisfied; on success, `timeline_signal`
+// submissions). When non-null and `gate.wait != 0`, execution is refused
+// unless the wait point is already satisfied; on success, `gate.signal`
 // (if non-zero) is applied to `*timeline`.
 core::ExecutionResult execute(const ir::Module& module, core::Arena& arena,
                               const core::Certificate* certificate = nullptr,
                               core::Timeline* timeline = nullptr,
-                              uint64_t timeline_wait = 0, uint64_t timeline_signal = 0);
+                              core::TimelineGate gate = {});
 
 struct TaskGraphExecutionResult {
   bool ok{};
@@ -315,8 +315,8 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
 // Both views reached through capability tokens, with the kinds the pass
 // actually uses enforced (Sample for the source, Attachment for the target):
 // a token a GPU backend must reject cannot quietly produce a reference image.
-RasterResult raster_triangles(core::Arena& arena, const core::FacetPool& pool, core::FacetRef source_ref,
-                              core::FacetRef target_ref, const RasterDesc& desc,
+RasterResult raster_triangles(core::Arena& arena, const core::FacetPool& pool, core::RasterFacetPair facets,
+                              const RasterDesc& desc,
                               const std::vector<RasterVertex>& vertices);
 
 }  // namespace vg::reference
