@@ -29,7 +29,7 @@ static void VG_CALL log_callback(void* user, uint32_t severity, uint32_t categor
 int main(void) {
   if (vgGetApi(0, NULL) != VG_ERROR_INVALID_ARGUMENT) return 1;
   VgApi too_small = {0};
-  too_small.size = (uint32_t)(sizeof(VgApi) - 1);
+  too_small.size = (uint32_t)(offsetof(VgApi, openAdapter) - 1);
   if (vgGetApi(VG_API_VERSION_1_0, &too_small) != VG_ERROR_INVALID_ARGUMENT) return 2;
   VgApi api = {0};
   api.size = sizeof(api);

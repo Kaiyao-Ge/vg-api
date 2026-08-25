@@ -3800,4 +3800,46 @@ std::unique_ptr<DeviceHal> make_device_hal() {
   return std::unique_ptr<DeviceHal>(new DeviceHal(std::move(impl)));
 }
 
+std::unique_ptr<DeviceHal> make_device_hal(const uint8_t uuid[16], std::string* error) {
+  const uint8_t prefix[8] = {0x56, 0x47, 0x50, 0x30, 0x4d, 0x45, 0x54, 0x4c};
+  if (std::memcmp(uuid, prefix, 8) != 0) {
+    if (error) *error = "uuid is not a Metal adapter uuid (VGP0METL prefix mismatch)";
+    return nullptr;
+  }
+  uint64_t target_registry_id = 0;
+  for (size_t i = 0; i < 8; ++i) target_registry_id |= (static_cast<uint64_t>(uuid[8 + i]) << (i * 8));
+
+  NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
+  if (devices.count == 0) {
+    id<MTLDevice> default_device = MTLCreateSystemDefaultDevice();
+    if (default_device != nil) devices = @[default_device];
+  }
+  id<MTLDevice> device = nil;
+  for (id<MTLDevice> candidate in devices) {
+    if ([candidate registryID] == target_registry_id) {
+      device = candidate;
+      break;
+    }
+  }
+  if (device == nil) {
+    if (error) *error = "no MTLDevice matches the requested adapter uuid";
+    return nullptr;
+  }
+
+  auto impl = std::make_unique<DeviceHal::Impl>();
+  impl->device = device;
+  impl->command_queue = [device newCommandQueue];
+  if (impl->command_queue == nil) {
+    if (error) *error = "MTLDevice failed to create a command queue";
+    return nullptr;
+  }
+  impl->snapshot.hal = make_hal_snapshot(device, &impl->snapshot);
+  id<MTLBuffer> buffer = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+  if (buffer != nil && [buffer respondsToSelector:@selector(gpuAddress)] && [buffer gpuAddress] != 0) {
+    impl->snapshot.supports_gpu_addresses = true;
+    impl->snapshot.hal.capability_bits |= static_cast<uint64_t>(hal::Capability::LinearAddress);
+  }
+  return std::unique_ptr<DeviceHal>(new DeviceHal(std::move(impl)));
+}
+
 }  // namespace vg::metal

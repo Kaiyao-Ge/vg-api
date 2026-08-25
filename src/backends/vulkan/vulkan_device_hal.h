@@ -222,6 +222,15 @@ class DeviceHal final : public vg::hal::DeviceHal {
  private:
   DeviceHal() = default;
 
+  // Shared body for both make_device_hal() overloads (ADR-044, F1). uuid ==
+  // nullptr keeps the pre-F1 behavior of taking the first enumerated
+  // physical device; a non-null uuid must match one vulkan_adapters()
+  // produced (vendorID + deviceID + first 8 bytes of pipelineCacheUUID) or
+  // this fails with VG-concept "no Vulkan physical device matches the
+  // requested adapter uuid" rather than silently falling back to the
+  // default (04-public-c-abi.md Sec.17 forbids implicit GPU selection).
+  static std::unique_ptr<DeviceHal> create_impl(const uint8_t* uuid, std::string* error);
+
   vg::hal::CapabilitySnapshot capabilities_;
 
   // What vkGetPhysicalDeviceFormatProperties reported for one core::PixelFormat
@@ -609,9 +618,19 @@ class DeviceHal final : public vg::hal::DeviceHal {
   bool can_lower_representation_requests(const vg::hal::ExecutionPlan& plan, std::string* reason) const;
 
   friend std::unique_ptr<DeviceHal> make_device_hal(std::string* error);
+  friend std::unique_ptr<DeviceHal> make_device_hal(const uint8_t uuid[16], std::string* error);
 };
 
 std::unique_ptr<DeviceHal> make_device_hal(std::string* error = nullptr);
+
+// ADR-044 (F1): honors a caller's openAdapter/createDevice choice instead of
+// always taking the first enumerated physical device -- 04-public-c-abi.md
+// Sec.17 forbids implicit GPU selection. uuid must match one
+// vulkan_adapters() (vulkan_probe.cpp) already produced (vendorID +
+// deviceID + first 8 bytes of pipelineCacheUUID). Returns nullptr and fills
+// *error when no VkPhysicalDevice matches. Compile-review-only per ADR-024 --
+// implemented but not counted as passed hardware evidence.
+std::unique_ptr<DeviceHal> make_device_hal(const uint8_t uuid[16], std::string* error);
 
 }  // namespace vg::vulkan
 

@@ -379,9 +379,17 @@ class DeviceHal final : public hal::DeviceHal {
   explicit DeviceHal(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
   friend std::unique_ptr<DeviceHal> make_device_hal();
+  friend std::unique_ptr<DeviceHal> make_device_hal(const uint8_t uuid[16], std::string* error);
 };
 
 std::unique_ptr<DeviceHal> make_device_hal();
+
+// ADR-044 (F1): honors a caller's openAdapter/createDevice choice instead of
+// always taking the system default device -- 04-public-c-abi.md Sec.17
+// forbids implicit GPU selection. uuid must match one metal_adapters() (or
+// metal_probe.mm) already produced (VGP0METL prefix + little-endian
+// registryID). Returns nullptr and fills *error when no MTLDevice matches.
+std::unique_ptr<DeviceHal> make_device_hal(const uint8_t uuid[16], std::string* error);
 
 }  // namespace vg::metal
 

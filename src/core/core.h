@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace vg::hal { struct ExecutionPlan; }
+
 namespace vg::core {
 
 enum class ObjectState { Active, Retired };
@@ -115,6 +117,21 @@ class Arena {
   // its current representation.
   bool release_representation(uint64_t id, uint32_t generation, std::string* error = nullptr);
   [[nodiscard]] const std::unordered_map<uint64_t, Allocation>& allocations() const { return allocations_; }
+  // Pointer-identity liveness check for a raw Allocation* obtained earlier
+  // (e.g. via arena_allocate's reinterpret_cast out-param) and now of unknown
+  // provenance to the caller. allocate()/retire()/consume() etc. never erase
+  // an allocations_ entry -- only destroying the whole Arena invalidates a
+  // pointer into this map -- so this exists to let a caller that still has
+  // this Arena alive confirm `ptr` actually points at one of its own live
+  // map entries *before* dereferencing it, rather than trusting an untrusted
+  // pointer's own bytes. Never dereferences `ptr` itself; only compares its
+  // address against `&kv.second` for entries this Arena owns.
+  [[nodiscard]] bool is_live_allocation(const Allocation* ptr) const {
+    for (const auto& kv : allocations_) {
+      if (&kv.second == ptr) return true;
+    }
+    return false;
+  }
   bool import_allocation(const RepresentationRef& ref, uint64_t size, ObjectState state,
                          const std::vector<uint8_t>& bytes, std::string* error = nullptr);
   [[nodiscard]] uint64_t id() const { return id_; }
@@ -824,11 +841,95 @@ struct ExecutionResult {
   FaultRecord fault;
   AccessWitness witness;
   bool outputs_valid{true};
+
+  // v1.2 (ADR-045): serializes the full execution outcome -- ok/poison/
+  // message/fault/witness entries/missing_effects/outputs_valid -- so the
+  // public C ABI's getSubmissionExecutionResult can surface it without a
+  // second ABI-fragile struct mirror, matching LoweringReport::canonical_json().
+  [[nodiscard]] std::string canonical_json() const;
 };
 
 bool validate_certificate(const Certificate& certificate,
                           const std::vector<ir::Effect>& effects,
                           std::string* error = nullptr);
+
+// ---- v1.1 / ADR-044 (F1): minimal C++ backing for the public C ABI's
+// Device/AddressDomain/CodeObject/Node/ExecutionEnvelope handles. Each type
+// here is the smallest object needed to reach the existing, already
+// hardware-verified Arena/TaskGraph/DeviceHal machinery from a thin C
+// wrapper -- not a redesign of any of it. Disclosed v1 narrowings are noted
+// per class; see ADR-044 for the full list. ----
+
+// One address domain per Device for v1.1 (ADR-044 disclosed narrowing);
+// multiple domains (e.g. a distinct host-visible staging domain) are
+// deferred past F1.
+struct AddressDomain {
+  uint32_t kind{};
+};
+
+// Owns the raw bytes handed to loadCodeObject plus a format tag. No caching
+// or precompilation for v1.1 -- submit() still parses fresh via
+// ir::parse_module every time, exactly matching pre-F1 behavior; this only
+// gives the bytes a handle and a lifetime (ADR-044 disclosed narrowing).
+struct CodeObject {
+  std::vector<uint8_t> bytes;
+  std::string format_tag;
+};
+
+// A CodeObject has exactly one runnable entry for v1.1, but the
+// index+generation pair is what the public VgNodeRef/VgTaskRecord.node
+// fields carry, mirroring VgFacetRef's staleness-checked-token model rather
+// than a bare caller-picked integer.
+struct NodeEntry {
+  std::string entry_name;
+  uint32_t generation{1};
+  bool live{true};
+};
+
+class NodeTable {
+ public:
+  struct Ref {
+    uint32_t index{};
+    uint32_t generation{};
+  };
+
+  Ref create(const std::string& entry_name);
+  bool destroy(Ref ref);
+  [[nodiscard]] NodeEntry* lookup(Ref ref);
+  [[nodiscard]] const NodeEntry* lookup(Ref ref) const;
+
+ private:
+  std::vector<NodeEntry> entries_;
+};
+
+// Combines what 04-public-c-abi.md Sec.17 calls the envelope's
+// "authorization + certificate + epoch + quota + timeline": which Node
+// classes may run, an access certificate mode, a per-submit task quota and
+// the timeline wait/signal values one submit() call authorizes. ADR-044
+// disclosed narrowing: certificate_touched is a whole-allocation PointerRef
+// set derived from the caller's VgAccessRange array (offset/size/access_mask
+// are recorded on the C-side VgAccessRange for a future range-granular
+// certificate but not yet enforced at that granularity here); one timeline
+// per device, so timeline_wait/timeline_signal are the only ones submit()
+// honors.
+class ExecutionEnvelope {
+ public:
+  std::vector<uint32_t> allowed_node_classes;
+  std::vector<PointerRef> certificate_touched;
+  bool has_certificate_mode{};
+  AccessCertificateMode certificate_mode{AccessCertificateMode::CertifiedPinned};
+  bool has_task_quota{};
+  uint32_t task_quota{};
+  uint64_t timeline_wait{};
+  uint64_t timeline_signal{};
+
+  // Splices this envelope's fields into `plan` ahead of compile()/submit().
+  // Defined in src/api/vg_api_execution.cpp, not core.cpp: that is the one
+  // place core-layer state legitimately reaches into backends::ExecutionPlan,
+  // and keeping the definition there avoids giving vg_core a backends/
+  // header dependency (core.h only forward-declares hal::ExecutionPlan).
+  void apply_to(hal::ExecutionPlan& plan) const;
+};
 
 }  // namespace vg::core
 

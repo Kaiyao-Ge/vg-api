@@ -51,9 +51,14 @@ PHASE_B_EXPERIMENTS = {
     "E009": ["vertical-slice.metal.tier1-indirect", "vertical-slice.metal.cull-compact"],
     "E012": ["vertical-slice.metal.effect-dag"],
 }
+# E004-discovery-revisit.json (Phase D's D2 revisit) shares id E004 with the
+# B-era E004-access-certificate.json below; excluding it by filename keeps
+# this glob at exactly one definition per id, the same fix Phase D itself
+# applies in the opposite direction via PHASE_D_DEFINITION_FILES.
 PHASE_B_DEFINITIONS = sorted(
     path for path in (ROOT / "experiments" / "definitions").glob("E*.json")
-    if json.loads(path.read_text(encoding="utf-8")).get("id") in PHASE_B_EXPERIMENTS
+    if path.name != "E004-discovery-revisit.json"
+    and json.loads(path.read_text(encoding="utf-8")).get("id") in PHASE_B_EXPERIMENTS
 )
 
 # Phase C Representation gate (ADR-030): E005/E008/E016 decide closure;

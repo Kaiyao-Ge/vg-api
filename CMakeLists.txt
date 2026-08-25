@@ -73,13 +73,18 @@ add_dependencies(vg_backend_reference vg_schema_generate)
 
 add_library(vg_api STATIC
     src/api/vg_api.cpp
+    src/api/vg_api_device.cpp
+    src/api/vg_api_arena.cpp
+    src/api/vg_api_code.cpp
+    src/api/vg_api_taskgraph.cpp
+    src/api/vg_api_execution.cpp
     src/backends/reference/reference_probe.cpp
 )
 target_compile_features(vg_api PRIVATE cxx_std_20)
 target_include_directories(vg_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(vg_api PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(vg_api PRIVATE VG_BUILDING_LIBRARY=1)
-target_link_libraries(vg_api PRIVATE vg_core)
+target_link_libraries(vg_api PRIVATE vg_core vg_backend_reference)
 set_target_properties(vg_api PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
 
 if(VG_ENABLE_METAL)
@@ -102,6 +107,7 @@ if(VG_ENABLE_METAL)
   target_link_libraries(vg_backend_metal PUBLIC vg_core vg_ir vg_compiler vg_backend_reference
                         "-framework Foundation" "-framework Metal")
   add_dependencies(vg_backend_metal vg_schema_generate)
+  target_link_libraries(vg_api PRIVATE vg_backend_metal)
 endif()
 
 if(VG_ENABLE_VULKAN)
@@ -127,6 +133,7 @@ if(VG_ENABLE_VULKAN)
   target_compile_definitions(vg_backend_vulkan PRIVATE VG_HAS_VULKAN=1 VG_GLSLC_PATH="${VG_GLSLC_EXECUTABLE}")
   target_link_libraries(vg_backend_vulkan PUBLIC vg_core vg_ir vg_compiler Vulkan::Vulkan)
   add_dependencies(vg_backend_vulkan vg_schema_generate)
+  target_link_libraries(vg_api PRIVATE vg_backend_vulkan)
 endif()
 
 add_executable(vg-platform-probe tools/vg-platform-probe.cpp)
@@ -173,6 +180,26 @@ if(BUILD_TESTING)
   target_link_libraries(vg_abi_facet_token_test PRIVATE vg_api vg_core)
   target_compile_features(vg_abi_facet_token_test PRIVATE cxx_std_20)
   add_test(NAME abi.facet-token COMMAND vg_abi_facet_token_test)
+
+  # F1 (ADR-044): the actual Checkpoint-A precondition -- proves the golden
+  # path is reachable through <vg/vg.h> alone, with only vg_api linked, not
+  # vg_core/vg_backend_reference directly.
+  add_executable(vg_c_abi_conformance_test tests/api/vg_c_abi_conformance_test.cpp)
+  target_link_libraries(vg_c_abi_conformance_test PRIVATE vg_api)
+  target_compile_features(vg_c_abi_conformance_test PRIVATE cxx_std_17)
+  add_test(NAME api.c-abi-conformance COMMAND vg_c_abi_conformance_test)
+
+  if(VG_ENABLE_METAL)
+    # Reruns E002 (ADR-028/TASK-B15 typed pointer graph) through the public
+    # C ABI alone, cross-checked against vertical-slice.metal.pointer-graph's
+    # internal-machinery result. Requires real Metal hardware because only
+    # metal_device_hal.mm branches on pointer_graph (CachedObject lowering);
+    # reference/Vulkan always take build_linear_compute_package.
+    add_executable(vg_e002_pointer_graph_abi_test tests/api/vg_e002_pointer_graph_abi_test.cpp)
+    target_link_libraries(vg_e002_pointer_graph_abi_test PRIVATE vg_api)
+    target_compile_features(vg_e002_pointer_graph_abi_test PRIVATE cxx_std_17)
+    add_test(NAME api.e002-pointer-graph-via-abi COMMAND vg_e002_pointer_graph_abi_test)
+  endif()
 
   add_test(NAME platform.probe COMMAND vg-platform-probe --validate)
   add_test(NAME tooling.schemas COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_schemas.py ${CMAKE_CURRENT_SOURCE_DIR})

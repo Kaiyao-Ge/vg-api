@@ -3653,9 +3653,10 @@ bool DeviceHal::run_pipeline_classification(const std::vector<RasterPipelineVari
 #endif
 }
 
-std::unique_ptr<DeviceHal> make_device_hal(std::string* error) {
+std::unique_ptr<DeviceHal> DeviceHal::create_impl(const uint8_t* uuid, std::string* error) {
   auto adapter = std::unique_ptr<DeviceHal>(new DeviceHal());
 #if !defined(VG_HAS_VULKAN)
+  (void)uuid;
   adapter->capabilities_.backend = vg::hal::BackendKind::Vulkan;
   adapter->capabilities_.adapter_name = "Vulkan unavailable (build without VG_HAS_VULKAN)";
   set_error(error, "Vulkan adapter is unavailable in this build");
@@ -3686,7 +3687,28 @@ std::unique_ptr<DeviceHal> make_device_hal(std::string* error) {
   }
   std::vector<VkPhysicalDevice> devices(device_count);
   vkEnumeratePhysicalDevices(adapter->instance_, &device_count, devices.data());
-  adapter->physical_device_ = devices.front();
+  if (uuid == nullptr) {
+    adapter->physical_device_ = devices.front();
+  } else {
+    bool matched = false;
+    for (VkPhysicalDevice candidate : devices) {
+      VkPhysicalDeviceProperties candidate_properties{};
+      vkGetPhysicalDeviceProperties(candidate, &candidate_properties);
+      uint8_t candidate_uuid[16] = {};
+      std::memcpy(candidate_uuid, &candidate_properties.vendorID, sizeof(candidate_properties.vendorID));
+      std::memcpy(candidate_uuid + 4, &candidate_properties.deviceID, sizeof(candidate_properties.deviceID));
+      std::memcpy(candidate_uuid + 8, candidate_properties.pipelineCacheUUID, 8);
+      if (std::memcmp(candidate_uuid, uuid, 16) == 0) {
+        adapter->physical_device_ = candidate;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      set_error(error, "no Vulkan physical device matches the requested adapter uuid");
+      return nullptr;
+    }
+  }
   VkPhysicalDeviceProperties properties{};
   vkGetPhysicalDeviceProperties(adapter->physical_device_, &properties);
 
@@ -3925,6 +3947,14 @@ std::unique_ptr<DeviceHal> make_device_hal(std::string* error) {
   }
   return adapter;
 #endif
+}
+
+std::unique_ptr<DeviceHal> make_device_hal(std::string* error) {
+  return DeviceHal::create_impl(nullptr, error);
+}
+
+std::unique_ptr<DeviceHal> make_device_hal(const uint8_t uuid[16], std::string* error) {
+  return DeviceHal::create_impl(uuid, error);
 }
 
 }  // namespace vg::vulkan

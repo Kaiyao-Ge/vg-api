@@ -57,9 +57,12 @@ Vulkan 对全部五行都是编译审查级（`vg_backend_vulkan` 在本机不�
   independent branches、fork-join）；cross-queue/representation-transition/
   external-present 诚实标注 `Unsupported`/`Deferred`。
 - **E002**（ADR-028，TASK-B15）：新增 `load_ref`/`load_via`/`store_via`
-  opcode + `PointerEdge`/`declared_pointer_edges`，Metal/reference 均为
-  `CachedObject` lowering（目标已在 host 侧静态解析，真实设备指针解引用
-  对此里程碑范围而言不成比例）。
+  opcode + `PointerEdge`/`declared_pointer_edges`，Metal 上为 `CachedObject`
+  lowering（目标已在 host 侧静态解析，真实设备指针解引用对此里程碑范围而言
+  不成比例）；reference 后端未接入 `is_pointer_graph_module` 分支，`compile()`
+  对该模块的 `compute_package` 事件仍分类为 `Direct`（ADR-028 只记录了 Metal
+  wiring 和 Vulkan 的文档 - only 改动，没有 reference wiring 一节，是本已知
+  范围，不是缺口）。
 - **E007**（ADR-029，TASK-B16）：新增 `IndexedComputeBinding`/
   `build_indexed_compute_package`，把 N 个独立分配折叠成 1 个
   argument-buffer 风格表绑定，Metal 上是真实的 `Direct` 设备指针表解引用
