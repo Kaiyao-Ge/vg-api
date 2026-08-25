@@ -46,7 +46,20 @@ bool same_task(const TaskRecord& a, const TaskRecord& b) {
   return a.node_index == b.node_index && a.node_generation == b.node_generation &&
          a.root_allocation == b.root_allocation && a.root_generation == b.root_generation && a.x == b.x &&
          a.y == b.y && a.z == b.z && a.flags == b.flags && a.contract_index == b.contract_index &&
-         a.payload_size == b.payload_size && a.payload_or_offset == b.payload_or_offset;
+         a.payload_size == b.payload_size && a.payload_or_offset == b.payload_or_offset &&
+         a.kind == b.kind && a.topology == b.topology &&
+         a.raster_facets.source.index == b.raster_facets.source.index &&
+         a.raster_facets.source.generation == b.raster_facets.source.generation &&
+         a.raster_facets.target.index == b.raster_facets.target.index &&
+         a.raster_facets.target.generation == b.raster_facets.target.generation &&
+         a.vertex_buffer_ref.index == b.vertex_buffer_ref.index &&
+         a.vertex_buffer_ref.generation == b.vertex_buffer_ref.generation &&
+         a.index_buffer_ref.index == b.index_buffer_ref.index &&
+         a.index_buffer_ref.generation == b.index_buffer_ref.generation &&
+         a.index_count == b.index_count && a.raster_filter == b.raster_filter &&
+         a.raster_wrap == b.raster_wrap && a.raster_tint[0] == b.raster_tint[0] &&
+         a.raster_tint[1] == b.raster_tint[1] && a.raster_tint[2] == b.raster_tint[2] &&
+         a.raster_tint[3] == b.raster_tint[3];
 }
 
 // Two tasks with an explicit dependency (1 depends on 0), non-trivial x/y/z
@@ -1835,6 +1848,252 @@ bool run_basic_raster(const std::string& root) {
   return true;
 }
 
+// F2 (ADR-043 Decision #3, ADR-046): rasterization is a shape of TaskRecord/
+// ExecutionPlan, not a parallel API -- unlike run_basic_raster above (which
+// calls run_raster_triangles() directly against a locally-constructed pool),
+// this drives a Raster-kind TaskRecord through the same TaskGraphBuilder ->
+// seal -> publish -> ExecutionPlan -> compile() -> submit() path
+// run_task_tier0 uses for Compute tasks. Facets are acquired against the
+// *device's own* facet_pool() (not a local one), because SubmitOps::raster
+// resolves task.raster_facets/vertex_buffer_ref against metal.facet_pool()
+// during submit(), not against whatever pool the caller happens to hold.
+bool run_task_graph_raster(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "task-graph-raster: no Metal device available on this host\n";
+    return false;
+  }
+
+  constexpr uint32_t kExtent = 4;
+  constexpr uint32_t kBytes = kExtent * kExtent * 4;
+  vg::core::Arena arena;
+  auto& source_alloc = arena.allocate(kBytes);
+  auto& target_alloc = arena.allocate(kBytes);
+  for (uint32_t y = 0; y < kExtent; ++y) {
+    for (uint32_t x = 0; x < kExtent; ++x) {
+      const uint64_t texel = (static_cast<uint64_t>(y) * kExtent + x) * 4;
+      source_alloc.bytes[texel + 0] = static_cast<uint8_t>(10 + 40 * x);
+      source_alloc.bytes[texel + 1] = static_cast<uint8_t>(20 + 40 * y);
+      source_alloc.bytes[texel + 2] = static_cast<uint8_t>(30 + 8 * x + 16 * y);
+      source_alloc.bytes[texel + 3] = 255;
+    }
+  }
+
+  const vg::core::CanonicalView source_view = make_rgba8_view(source_alloc, {.width = kExtent, .height = kExtent});
+  const vg::core::CanonicalView target_view = make_rgba8_view(target_alloc, {.width = kExtent, .height = kExtent});
+
+  vg::core::FacetRef source_ref;
+  vg::core::FacetRef target_ref;
+  std::string error;
+  if (!metal_device->facet_pool().acquire(arena, source_view, vg::core::FacetKind::Sample, &source_ref, &error) ||
+      !metal_device->facet_pool().acquire(arena, target_view, vg::core::FacetKind::Attachment, &target_ref,
+                                          &error)) {
+    std::cerr << "task-graph-raster: acquire failed: " << error << "\n";
+    return false;
+  }
+
+  const auto quad = metal_fullscreen_quad();
+  const uint64_t vertex_bytes = quad.size() * sizeof(vg::metal::RasterVertex);
+  auto& vertex_alloc = arena.allocate(vertex_bytes);
+  std::memcpy(vertex_alloc.bytes.data(), quad.data(), vertex_bytes);
+  const vg::core::CanonicalView vertex_view =
+      make_rgba8_view(vertex_alloc, {.width = static_cast<uint32_t>(vertex_bytes / 4), .height = 1});
+  vg::core::FacetRef vertex_ref;
+  if (!metal_device->facet_pool().acquire(arena, vertex_view, vg::core::FacetKind::Address, &vertex_ref, &error)) {
+    std::cerr << "task-graph-raster: vertex facet acquire failed: " << error << "\n";
+    return false;
+  }
+
+  TaskRecord raster_task{};
+  raster_task.kind = vg::core::TaskKind::Raster;
+  raster_task.raster_facets = {.source = source_ref, .target = target_ref};
+  raster_task.vertex_buffer_ref = vertex_ref;
+  raster_task.raster_filter = vg::core::FilterMode::Nearest;
+  raster_task.raster_wrap = vg::core::WrapMode::Clamp;
+
+  TaskGraphBuilder builder;
+  if (!builder.append(raster_task)) {
+    std::cerr << "task-graph-raster: failed to append raster task\n";
+    return false;
+  }
+  TaskGraph graph;
+  if (!builder.seal(&graph) || !graph.publish()) {
+    std::cerr << "task-graph-raster: failed to seal/publish task graph\n";
+    return false;
+  }
+
+  const auto module = make_probe_module(arena);
+  vg::hal::ExecutionPlan plan;
+  plan.capabilities = metal_device->capabilities();
+  plan.module = module;
+  plan.published = true;
+  plan.task_graph = graph;
+  plan.graph_epoch = arena.topology_epoch();
+
+  vg::hal::CompiledPlan compiled;
+  if (!metal_device->compile(plan, &compiled, &error)) {
+    std::cerr << "task-graph-raster: Metal compile failed: " << error << "\n";
+    return false;
+  }
+
+  vg::hal::Submission submission;
+  if (!metal_device->submit(compiled, arena, &submission, &error)) {
+    std::cerr << "task-graph-raster: Metal submit failed: " << error << "\n";
+    return false;
+  }
+  if (!submission.result.ok) {
+    std::cerr << "task-graph-raster: Metal execution reported failure: " << submission.result.message << "\n";
+    return false;
+  }
+  if (submission.raster_results.size() != 1) {
+    std::cerr << "task-graph-raster: expected exactly one raster_results entry, got "
+              << submission.raster_results.size() << "\n";
+    return false;
+  }
+  const auto& raster_result = submission.raster_results[0];
+  if (raster_result.task_index != 0 || raster_result.width != kExtent || raster_result.height != kExtent) {
+    std::cerr << "task-graph-raster: raster_results[0] shape mismatch\n";
+    return false;
+  }
+
+  // F2's fixed attachment defaults (load=Clear, store=Store, clear_rgba
+  // {0,0,0,1}, sample_count=1, subresource {0,0}) are hard-coded inside
+  // submit(); only filter/wrap/tint travel through the TaskRecord. Mirror
+  // both here so the oracle call matches exactly what submit() ran.
+  vg::metal::RasterDesc oracle_desc;
+  oracle_desc.filter = raster_task.raster_filter;
+  oracle_desc.wrap = raster_task.raster_wrap;
+  oracle_desc.attachment.load = vg::metal::AttachmentLoadAction::Clear;
+  oracle_desc.attachment.store = vg::metal::AttachmentStoreAction::Store;
+  oracle_desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
+  oracle_desc.attachment.sample_count = 1;
+  auto oracle = vg::reference::raster_triangles(arena, metal_device->facet_pool(),
+                                                {.source = source_ref, .target = target_ref},
+                                                to_reference_desc(oracle_desc), to_reference_vertices(quad));
+  if (!oracle.ok) {
+    std::cerr << "task-graph-raster: reference oracle failed: " << oracle.message << "\n";
+    return false;
+  }
+  if (raster_result.resolved_rgba.size() != oracle.resolved_rgba.size()) {
+    std::cerr << "task-graph-raster: resolved image size mismatch\n";
+    return false;
+  }
+  for (uint32_t y = 1; y + 1 < kExtent; ++y) {
+    for (uint32_t x = 1; x + 1 < kExtent; ++x) {
+      const size_t index = static_cast<size_t>(y) * kExtent + x;
+      if (!channels_close(raster_result.resolved_rgba[index], oracle.resolved_rgba[index], kNearestTol,
+                          "task-graph-raster", "interior pixel"))
+        return false;
+    }
+  }
+
+  // Second sub-case: an indexed raster draw is deferred to F5 and must be
+  // rejected at compile() time (Unsupported), not silently accepted
+  // (START.md Sec.4 invariant 10). TaskGraph::validate_execution() -- run
+  // inside plan.validate() ahead of the index_count check -- only requires
+  // the graph to be sealed/published with non-zero node/root generation; it
+  // never inspects FacetRef contents, so an otherwise-default TaskRecord
+  // (whose node_generation/root_generation both default to 1) is already
+  // enough to reach the index_count>0 rejection.
+  TaskRecord indexed_task{};
+  indexed_task.kind = vg::core::TaskKind::Raster;
+  indexed_task.index_count = 3;
+  TaskGraphBuilder indexed_builder;
+  if (!indexed_builder.append(indexed_task)) {
+    std::cerr << "task-graph-raster: failed to append indexed raster task\n";
+    return false;
+  }
+  TaskGraph indexed_graph;
+  if (!indexed_builder.seal(&indexed_graph) || !indexed_graph.publish()) {
+    std::cerr << "task-graph-raster: failed to seal/publish indexed task graph\n";
+    return false;
+  }
+  vg::hal::ExecutionPlan indexed_plan;
+  indexed_plan.capabilities = metal_device->capabilities();
+  indexed_plan.module = module;
+  indexed_plan.published = true;
+  indexed_plan.task_graph = indexed_graph;
+  indexed_plan.graph_epoch = arena.topology_epoch();
+  vg::hal::CompiledPlan indexed_compiled;
+  std::string indexed_error;
+  if (metal_device->compile(indexed_plan, &indexed_compiled, &indexed_error)) {
+    std::cerr << "task-graph-raster: indexed raster draw must be rejected at compile()\n";
+    return false;
+  }
+
+  // Third sub-case (post-review regression): in a graph mixing a normal
+  // Compute task with a Raster task whose vertex_buffer_ref was never
+  // acquired (so SubmitOps::raster fails it deterministically), submit()
+  // must still run SubmitOps::linear()'s IR dispatch to completion -- a
+  // raster failure must never abort the rest of a mixed compute+raster
+  // graph (ADR-046, ADR-043 Decision #3). submission.result.ok reports the
+  // raster failure (folded in last by DeviceHal::submit()'s `finish()`), but
+  // result.trace/timeline_value/published_tasks -- all only written by a
+  // completed linear() dispatch -- prove the compute half genuinely ran.
+  TaskRecord compute_task{};
+  compute_task.node_index = 0;
+  compute_task.root_allocation = 99;
+  compute_task.x = 2;
+  compute_task.y = 1;
+  compute_task.z = 1;
+  TaskRecord broken_raster_task{};
+  broken_raster_task.node_index = 1;
+  broken_raster_task.root_allocation = 99;
+  broken_raster_task.kind = vg::core::TaskKind::Raster;
+  // vertex_buffer_ref left default (never acquired against any facet pool),
+  // so SubmitOps::raster fails this task deterministically.
+  TaskGraphBuilder mixed_builder;
+  if (!mixed_builder.append(compute_task) || !mixed_builder.append(broken_raster_task)) {
+    std::cerr << "task-graph-raster: failed to build mixed compute+raster graph\n";
+    return false;
+  }
+  TaskGraph mixed_graph;
+  if (!mixed_builder.seal(&mixed_graph) || !mixed_graph.publish()) {
+    std::cerr << "task-graph-raster: failed to seal/publish mixed compute+raster graph\n";
+    return false;
+  }
+  vg::hal::ExecutionPlan mixed_plan;
+  mixed_plan.capabilities = metal_device->capabilities();
+  mixed_plan.module = module;
+  mixed_plan.published = true;
+  mixed_plan.task_graph = mixed_graph;
+  mixed_plan.graph_epoch = arena.topology_epoch();
+  mixed_plan.timeline_signal = 7;
+  vg::hal::CompiledPlan mixed_compiled;
+  std::string mixed_error;
+  if (!metal_device->compile(mixed_plan, &mixed_compiled, &mixed_error)) {
+    std::cerr << "task-graph-raster: mixed graph compile failed: " << mixed_error << "\n";
+    return false;
+  }
+  vg::hal::Submission mixed_submission;
+  if (!metal_device->submit(mixed_compiled, arena, &mixed_submission, &mixed_error)) {
+    std::cerr << "task-graph-raster: mixed graph submit() call itself failed: " << mixed_error << "\n";
+    return false;
+  }
+  if (mixed_submission.result.ok || mixed_submission.result.message.empty()) {
+    std::cerr << "task-graph-raster: mixed graph must report a raster failure via result.ok/message\n";
+    return false;
+  }
+  if (mixed_submission.result.trace.size() != module.instructions.size()) {
+    std::cerr << "task-graph-raster: mixed graph raster failure must not prevent compute dispatch "
+                 "(result.trace missing -- linear() did not run)\n";
+    return false;
+  }
+  if (mixed_submission.timeline_value != 7) {
+    std::cerr << "task-graph-raster: mixed graph timeline did not advance -- compute dispatch did not "
+                 "commit despite raster failure\n";
+    return false;
+  }
+  if (mixed_submission.published_tasks.size() != 2) {
+    std::cerr << "task-graph-raster: mixed graph published_tasks must still include both tasks\n";
+    return false;
+  }
+
+  std::cout << "task-graph-raster: ok\n";
+  return true;
+}
+
 // E013: run_pipeline_classification. After the sha256 key fix the expected
 // arithmetic is classified=6 (2 compute checked on/off + 4 raster
 // format×sample) and naive=24. Assert those exact counts when they match;
@@ -2566,7 +2825,7 @@ int main(int argc, char** argv) {
     std::cerr << "usage: vg_metal_task_timeline_test "
                  "<task-tier0|timeline|access-certificate|tier1-indirect|cull-compact|cull-compact-1m|effect-dag|pointer-graph|"
                  "indexed-binding|representation-layer|sample-facet|checked-facet-generation|basic-raster|"
-                 "pipeline-classification|consume-input|representation-churn> "
+                 "task-graph-raster|pipeline-classification|consume-input|representation-churn> "
                  "<repo_root>\n";
     return 2;
   }
@@ -2599,6 +2858,8 @@ int main(int argc, char** argv) {
     ok = run_checked_facet_generation(root);
   } else if (mode == "basic-raster") {
     ok = run_basic_raster(root);
+  } else if (mode == "task-graph-raster") {
+    ok = run_task_graph_raster(root);
   } else if (mode == "pipeline-classification") {
     ok = run_pipeline_classification(root);
   } else if (mode == "consume-input") {

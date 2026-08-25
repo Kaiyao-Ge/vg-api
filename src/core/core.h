@@ -3,6 +3,7 @@
 
 #include "ir/ir.h"
 
+#include <array>
 #include <cstdint>
 #include <atomic>
 #include <functional>
@@ -243,6 +244,16 @@ struct RasterFacetPair {
   FacetRef target{};
 };
 
+// F2 (ADR-043 Decision #3, ADR-046): discriminates the shape a TaskRecord
+// carries. Defaults to Compute so every pre-F2 caller's x/y/z dispatch
+// meaning is unchanged.
+enum class TaskKind : uint32_t { Compute, Raster };
+
+// F2: the only topology F2 supports. Indexed/strip/fan draws are F5+; a
+// raster TaskRecord requesting one is rejected at compile() time rather
+// than silently reinterpreted (START.md Sec.4 invariant 10).
+enum class Topology : uint32_t { TriangleList };
+
 struct FacetSlot {
   uint32_t generation{1};
   bool active{};
@@ -407,6 +418,22 @@ struct TaskRecord {
   uint32_t contract_index{};
   uint32_t payload_size{};
   uint64_t payload_or_offset{};
+  // F2 (ADR-046): raster is a shape of TaskRecord, not a parallel API.
+  // Everything below defaults to a no-op for a Compute task.
+  TaskKind kind{TaskKind::Compute};
+  Topology topology{Topology::TriangleList};
+  RasterFacetPair raster_facets{};
+  // Address-kind facet whose backing bytes are a tightly packed
+  // RasterVertex array; vertex count is derived from its byte length
+  // (Allocation::bytes.size() / sizeof(RasterVertex)), not stored here.
+  FacetRef vertex_buffer_ref{};
+  FacetRef index_buffer_ref{};
+  // >0 signals an indexed draw is requested. F2 rejects this at compile()
+  // time (Unsupported) -- real indexed draws land in F5.
+  uint32_t index_count{};
+  FilterMode raster_filter{FilterMode::Bilinear};
+  WrapMode raster_wrap{WrapMode::Clamp};
+  std::array<float, 4> raster_tint{1.0f, 1.0f, 1.0f, 1.0f};
 };
 
 struct PointerRef {

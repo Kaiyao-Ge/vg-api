@@ -13,14 +13,18 @@
 // which is bit-identical on both sides of the comparison.
 //
 // Assert-based like tests/unit/core_test.cpp -- no test framework.
+#include "backends/device_hal.h"
+#include "backends/reference/reference_device_hal.h"
 #include "backends/reference/reference_executor.h"
 #include "core/core.h"
+#include "ir/ir.h"
 
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -124,6 +128,27 @@ std::vector<vg::reference::RasterVertex> full_target_quad() {
   const vg::reference::RasterVertex bottom_left{-1.0f, -1.0f, 0.0f, 1.0f};
   const vg::reference::RasterVertex bottom_right{1.0f, -1.0f, 1.0f, 1.0f};
   return {top_left, top_right, bottom_left, top_right, bottom_right, bottom_left};
+}
+
+// A minimal single-load module: compile()'s build_linear_compute_package()
+// requires a valid module regardless of whether the task graph it accompanies
+// is raster-only, so this gives it one without the test caring about what it
+// computes.
+vg::ir::Module probe_module(vg::core::Arena& arena) {
+  const auto& allocation = arena.allocate(64);
+  vg::ir::Module module;
+  module.version = 1;
+  module.root_schema = "vg.test/v1";
+  vg::ir::Instruction load;
+  load.op = "load";
+  load.allocation = allocation.id;
+  load.generation = allocation.generation;
+  load.representation_epoch = allocation.representation_epoch;
+  load.offset = 0;
+  load.size = 4;
+  module.instructions.push_back(load);
+  module.declared_effects.push_back({allocation.id, 0, 64, vg::ir::Access::Read, allocation.representation_epoch});
+  return module;
 }
 
 }  // namespace
@@ -664,6 +689,119 @@ int main() {
         vg::reference::attachment_facet(arena, pool, attachment_ref, vg::reference::AttachmentFacetDesc{});
     assert(!retired.ok);
     assert(retired.message == vg::core::to_string(vg::core::FacetStatus::Retired));
+  }
+
+  // --- F2 (ADR-043 Decision #3, ADR-046): rasterization is a shape of
+  // TaskRecord/ExecutionPlan, not a parallel API. A Raster-kind task driven
+  // through TaskGraphBuilder -> seal -> publish -> ExecutionPlan ->
+  // compile() -> submit() must land in submission.raster_results with the
+  // exact same result raster_triangles() would produce called directly.
+  // Facets are acquired against the device's own facet_pool() (not a local
+  // one), since submit() resolves task.raster_facets/vertex_buffer_ref
+  // against that pool, not a caller-supplied one. ---
+  {
+    auto device = vg::reference::make_device_hal();
+    assert(device != nullptr);
+
+    vg::core::Arena arena;
+    constexpr uint32_t kExtent = 4;
+    const uint64_t source_id = arena.allocate(64).id;
+    const uint64_t target_id = arena.allocate(64).id;
+    const vg::core::CanonicalView source = plain_view(source_id, {.width = kExtent, .height = kExtent});
+    const vg::core::CanonicalView target = plain_view(target_id, {.width = kExtent, .height = kExtent});
+
+    auto* source_allocation = arena.lookup(vg::core::PointerRef{source_id, 1});
+    for (uint32_t y = 0; y < kExtent; ++y)
+      for (uint32_t x = 0; x < kExtent; ++x) write_texel(*source_allocation, source, 0, 0, x, y, texel_pattern(x, y));
+
+    std::string error;
+    vg::core::FacetRef source_ref, target_ref;
+    assert(device->facet_pool().acquire(arena, source, vg::core::FacetKind::Sample, &source_ref, &error));
+    assert(device->facet_pool().acquire(arena, target, vg::core::FacetKind::Attachment, &target_ref, &error));
+
+    const auto quad = full_target_quad();
+    const uint64_t vertex_bytes = quad.size() * sizeof(vg::reference::RasterVertex);
+    auto& vertex_alloc = arena.allocate(vertex_bytes);
+    std::memcpy(vertex_alloc.bytes.data(), quad.data(), vertex_bytes);
+    const vg::core::CanonicalView vertex_view =
+        plain_view(vertex_alloc.id, {.width = static_cast<uint32_t>(vertex_bytes / 4), .height = 1});
+    vg::core::FacetRef vertex_ref;
+    assert(device->facet_pool().acquire(arena, vertex_view, vg::core::FacetKind::Address, &vertex_ref, &error));
+
+    vg::core::TaskRecord raster_task{};
+    raster_task.kind = vg::core::TaskKind::Raster;
+    raster_task.raster_facets = {.source = source_ref, .target = target_ref};
+    raster_task.vertex_buffer_ref = vertex_ref;
+    raster_task.raster_filter = vg::core::FilterMode::Nearest;
+    raster_task.raster_wrap = vg::core::WrapMode::Clamp;
+
+    vg::core::TaskGraphBuilder builder;
+    assert(builder.append(raster_task));
+    vg::core::TaskGraph graph;
+    assert(builder.seal(&graph) && graph.publish());
+
+    const auto module = probe_module(arena);
+    vg::hal::ExecutionPlan plan;
+    plan.capabilities = device->capabilities();
+    plan.module = module;
+    plan.published = true;
+    plan.task_graph = graph;
+    plan.graph_epoch = arena.topology_epoch();
+
+    vg::hal::CompiledPlan compiled;
+    assert(device->compile(plan, &compiled, &error));
+
+    vg::hal::Submission submission;
+    assert(device->submit(compiled, arena, &submission, &error));
+    assert(submission.result.ok);
+    assert(submission.raster_results.size() == 1);
+    const auto& task_result = submission.raster_results[0];
+    assert(task_result.task_index == 0);
+    assert(task_result.width == kExtent);
+    assert(task_result.height == kExtent);
+
+    // F2's fixed attachment defaults are hard-coded inside submit(); mirror
+    // them here so the direct call matches exactly what submit() ran.
+    vg::reference::RasterDesc oracle_desc;
+    oracle_desc.filter = raster_task.raster_filter;
+    oracle_desc.wrap = raster_task.raster_wrap;
+    oracle_desc.attachment.load = vg::reference::AttachmentLoadAction::Clear;
+    oracle_desc.attachment.store = vg::reference::AttachmentStoreAction::Store;
+    oracle_desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
+    oracle_desc.attachment.sample_count = 1;
+    const auto oracle = vg::reference::raster_triangles(arena, device->facet_pool(), {.source = source_ref, .target = target_ref},
+                                                        oracle_desc, quad);
+    assert(oracle.ok);
+    assert(task_result.resolved_rgba.size() == oracle.resolved_rgba.size());
+    assert(task_result.stored == oracle.stored);
+    assert(task_result.contents_defined == oracle.contents_defined);
+    for (size_t i = 0; i < oracle.resolved_rgba.size(); ++i) assert(exact_match(task_result.resolved_rgba[i], oracle.resolved_rgba[i]));
+
+    // Second sub-case: an indexed raster draw is deferred to F5 and must be
+    // rejected at compile() time. TaskGraph::validate_execution() -- run
+    // ahead of the index_count check inside compile() -- only requires the
+    // graph to be sealed/published with non-zero node/root generation; it
+    // never inspects FacetRef contents, so an otherwise-default TaskRecord
+    // (node_generation/root_generation both default to 1) already reaches
+    // that rejection.
+    vg::core::TaskRecord indexed_task{};
+    indexed_task.kind = vg::core::TaskKind::Raster;
+    indexed_task.index_count = 3;
+    vg::core::TaskGraphBuilder indexed_builder;
+    assert(indexed_builder.append(indexed_task));
+    vg::core::TaskGraph indexed_graph;
+    assert(indexed_builder.seal(&indexed_graph) && indexed_graph.publish());
+
+    vg::hal::ExecutionPlan indexed_plan;
+    indexed_plan.capabilities = device->capabilities();
+    indexed_plan.module = module;
+    indexed_plan.published = true;
+    indexed_plan.task_graph = indexed_graph;
+    indexed_plan.graph_epoch = arena.topology_epoch();
+    vg::hal::CompiledPlan indexed_compiled;
+    std::string indexed_error;
+    assert(!device->compile(indexed_plan, &indexed_compiled, &indexed_error));
+    assert(indexed_error == "indexed raster draws deferred to F5");
   }
 
   return 0;

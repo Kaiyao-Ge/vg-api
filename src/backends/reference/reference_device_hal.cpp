@@ -4,6 +4,7 @@
 #include "backends/reference/tier2_oracle.h"
 
 #include <chrono>
+#include <cstring>
 #include <vector>
 
 namespace vg::reference {
@@ -100,6 +101,21 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         return false;
       }
     }
+    // F2 (ADR-043 Decision #3): an indexed raster draw asks this backend to
+    // consume task.index_buffer_ref, which is not implemented until F5.
+    // Rejected here the same way ConsumeInput is above -- an explicit
+    // Unsupported LoweringEvent with the reason, not a silently accepted
+    // request that submit() would later have to ignore or misinterpret.
+    for (const auto& task : plan.task_graph.tasks()) {
+      if (task.kind == core::TaskKind::Raster && task.index_count > 0) {
+        compiled->report.supported = false;
+        compiled->report.diagnostic = "indexed raster draws deferred to F5";
+        compiled->report.add("raster_task", hal::LoweringClass::Unsupported, 1, 0,
+                             compiled->report.diagnostic);
+        if (error) *error = compiled->report.diagnostic;
+        return false;
+      }
+    }
     return true;
   }
 
@@ -186,6 +202,78 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
           }
           submission->published_tasks.push_back(tasks[index]);
         }
+      }
+      // F2 (ADR-043 Decision #3): a Raster task's vertex bytes are only
+      // guaranteed visible in `arena` once execute() above has returned, so
+      // this walks the sealed task graph now rather than during publish
+      // above. task_index reports position in the task graph itself (not
+      // publish order), matching RasterTaskResult's contract. `tasks` above
+      // is scoped to the publish_order block, so re-fetch here.
+      const auto& all_tasks = compiled.plan.task_graph.tasks();
+      for (uint32_t task_index = 0; task_index < all_tasks.size(); ++task_index) {
+        const core::TaskRecord& task = all_tasks[task_index];
+        if (task.kind != core::TaskKind::Raster) continue;
+        core::FacetStatus vertex_status = core::FacetStatus::Ok;
+        const core::FacetSlot* vertex_slot = facet_pool().lookup(arena, task.vertex_buffer_ref, &vertex_status);
+        if (vertex_slot == nullptr || vertex_slot->kind != core::FacetKind::Address) {
+          submission->result.ok = false;
+          submission->result.message = vertex_slot == nullptr
+              ? std::string("raster task vertex buffer: ") + core::to_string(vertex_status)
+              : std::string("raster task vertex buffer: facet kind mismatch");
+          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - submit_start)
+                                          .count();
+          return true;
+        }
+        auto* vertex_allocation = arena.lookup(
+            core::PointerRef{vertex_slot->view.allocation, vertex_slot->view.allocation_generation});
+        if (vertex_allocation == nullptr) {
+          submission->result.ok = false;
+          submission->result.message = "raster task vertex buffer: allocation not found";
+          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - submit_start)
+                                          .count();
+          return true;
+        }
+        if (vertex_allocation->bytes.size() % sizeof(RasterVertex) != 0) {
+          submission->result.ok = false;
+          submission->result.message = "raster task vertex buffer byte size is not a multiple of sizeof(RasterVertex)";
+          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - submit_start)
+                                          .count();
+          return true;
+        }
+        const size_t vertex_count = vertex_allocation->bytes.size() / sizeof(RasterVertex);
+        std::vector<RasterVertex> vertices(vertex_count);
+        if (vertex_count > 0) {
+          std::memcpy(vertices.data(), vertex_allocation->bytes.data(), vertex_count * sizeof(RasterVertex));
+        }
+        RasterDesc desc;
+        desc.attachment.load = AttachmentLoadAction::Clear;
+        desc.attachment.store = AttachmentStoreAction::Store;
+        desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
+        desc.attachment.sample_count = 1;
+        desc.attachment.subresource = {};
+        desc.filter = task.raster_filter;
+        desc.wrap = task.raster_wrap;
+        desc.tint = task.raster_tint;
+        const RasterResult raster_result = raster_triangles(arena, facet_pool(), task.raster_facets, desc, vertices);
+        if (!raster_result.ok) {
+          submission->result.ok = false;
+          submission->result.message = raster_result.message;
+          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - submit_start)
+                                          .count();
+          return true;
+        }
+        hal::RasterTaskResult task_result;
+        task_result.task_index = task_index;
+        task_result.resolved_rgba = raster_result.resolved_rgba;
+        task_result.width = raster_result.width;
+        task_result.height = raster_result.height;
+        task_result.stored = raster_result.stored;
+        task_result.contents_defined = raster_result.contents_defined;
+        submission->raster_results.push_back(std::move(task_result));
       }
       if (compiled.plan.request_tier2_select) {
         // Host-walk of the sealed graph: Serialized, never DevicePass.

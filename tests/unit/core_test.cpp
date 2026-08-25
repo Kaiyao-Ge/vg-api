@@ -30,6 +30,19 @@ int main() {
   assert(arena.lookup(vg::core::PointerRef{allocation.id, 1}) == nullptr);
   auto& second_allocation = arena.allocate(16);
 
+  // F2 (ADR-043 Decision #3, ADR-046): a default-constructed TaskRecord must
+  // read as a plain Compute task with F2's fixed raster defaults, so every
+  // pre-F2 caller that never touches these fields keeps its old meaning.
+  {
+    vg::core::TaskRecord default_task{};
+    assert(default_task.kind == vg::core::TaskKind::Compute);
+    assert(default_task.topology == vg::core::Topology::TriangleList);
+    assert(default_task.index_count == 0);
+    assert(default_task.raster_filter == vg::core::FilterMode::Bilinear);
+    assert(default_task.raster_wrap == vg::core::WrapMode::Clamp);
+    assert(default_task.raster_tint[0] == 1.0f && default_task.raster_tint[1] == 1.0f &&
+           default_task.raster_tint[2] == 1.0f && default_task.raster_tint[3] == 1.0f);
+  }
 
   vg::core::TaskGraphBuilder builder;
   vg::core::TaskRecord first{}; first.node_index = 1; first.root_allocation = 1;

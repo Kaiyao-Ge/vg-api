@@ -1703,6 +1703,198 @@ struct DeviceHal::Impl {
     return rp;
   }
 
+  // F2 (ADR-043 Decision #3): everything run_raster_triangles() does except
+  // building the vertex/tint buffers -- moved here (not rewritten) so a
+  // plan-driven raster TaskRecord (SubmitOps::raster, whose vertex buffer is
+  // resolved through FacetPool rather than handed a host
+  // std::vector<RasterVertex>) runs the exact same facet-acquisition /
+  // pipeline / draw / readback code as the original hardware-verified path.
+  // `vertex_count` stands in for `vertices.size()` since the caller-supplied
+  // MTLBuffer alone carries no length.
+  bool run_raster_pass(const core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
+                       const RasterDesc& desc, id<MTLBuffer> vertex_buffer, id<MTLBuffer> tint_buffer,
+                       uint32_t vertex_count, RasterResult* result, std::string* error) {
+    if (result == nullptr) { if (error) *error = "raster result output is required"; return false; }
+    if (vertex_count == 0 || vertex_count % 3 != 0) {
+      if (error) *error = "raster vertex count must be a non-zero multiple of 3 (triangle list)";
+      return false;
+    }
+    const bool multisampled = desc.attachment.sample_count > 1;
+    if (multisampled != (desc.attachment.store == AttachmentStoreAction::MultisampleResolve)) {
+      if (error) *error = "raster: MultisampleResolve and sample_count > 1 must be requested together";
+      return false;
+    }
+    if (multisampled && desc.attachment.load == AttachmentLoadAction::Load) {
+      if (error) *error = "Unsupported: a transient multisample attachment has no prior contents to load";
+      return false;
+    }
+
+    // Both refs are capability tokens and both are bracketed: a pass reads one
+    // facet and writes another, so neither slot may be recycled under work still
+    // in flight (06 §6.4, §11).
+    FacetUseGuard source_use(pool, facets.source);
+    if (!source_use.begin(arena, error)) return false;
+    FacetUseGuard target_use(pool, facets.target);
+    if (!target_use.begin(arena, error)) return false;
+
+    const core::FacetSlot* source_slot =
+        resolve_facet(arena, pool, facets.source, core::FacetKind::Sample, error);
+    if (source_slot == nullptr) return false;
+    const core::FacetSlot* target_slot =
+        resolve_facet(arena, pool, facets.target, core::FacetKind::Attachment, error);
+    if (target_slot == nullptr) return false;
+    const core::CanonicalView& source_view = source_slot->view;
+    const core::CanonicalView& target_view = target_slot->view;
+    if (!subresource_in_range(target_view, desc.attachment.subresource, error)) return false;
+    if (desc.source_array_slice >= source_view.array_layers) {
+      if (error)
+        *error = "raster source names array slice " + std::to_string(desc.source_array_slice) +
+                 " of a canonical view declaring " + std::to_string(source_view.array_layers) + " layer(s)";
+      return false;
+    }
+    if (!(desc.source_lod >= 0.0f) || desc.source_lod > static_cast<float>(source_view.mip_levels - 1)) {
+      if (error)
+        *error = "raster source names lod " + std::to_string(desc.source_lod) +
+                 " of a canonical view declaring " + std::to_string(source_view.mip_levels) + " mip level(s)";
+      return false;
+    }
+    // Reading the very subresource being written has no defined result, and a
+    // pass that returned an order-dependent image for it would be worse than
+    // useless as a differential against the oracle, which refuses it for exactly
+    // this reason. Sharing an allocation is fine as long as the subresource
+    // differs, so generating one mip level from another stays expressible.
+    if (source_view.allocation == target_view.allocation &&
+        desc.source_array_slice == desc.attachment.subresource.layer &&
+        static_cast<uint32_t>(desc.source_lod) == desc.attachment.subresource.level &&
+        desc.source_lod == static_cast<float>(static_cast<uint32_t>(desc.source_lod))) {
+      if (error)
+        *error = "raster source and target name the same subresource of the same allocation; a read of the "
+                 "surface being written has no defined result";
+      return false;
+    }
+
+    bool source_cache_hit = false;
+    std::string tex_error;
+    id<MTLTexture> source_texture = ensure_facet_texture(arena, pool, facets.source,
+                                                          core::FacetKind::Sample, &source_cache_hit,
+                                                          nullptr, &tex_error);
+    if (source_texture == nil) {
+      if (error) *error = tex_error.empty() ? "Metal raster source texture creation failed" : tex_error;
+      return false;
+    }
+    // The shared fragment stage declares `texture2d<float>` and takes no slice or
+    // level argument, so an array source reaches it as a single-slice 2D view
+    // over the whole mip chain -- a real reinterpretation of the same storage,
+    // not a copy and not a silently ignored slice. The requested level is then
+    // pinned through the sampler's lod clamps below, which is exact for a
+    // fractional lod too because MipFilterLinear blends the two levels the clamp
+    // lands between.
+    if (source_view.dimension == core::ViewDimension::Texture2DArray) {
+      source_texture = [source_texture newTextureViewWithPixelFormat:source_texture.pixelFormat
+                                                         textureType:MTLTextureType2D
+                                                              levels:NSMakeRange(0, source_view.mip_levels)
+                                                              slices:NSMakeRange(desc.source_array_slice, 1)];
+      if (source_texture == nil) {
+        if (error) *error = "Metal raster source array-slice texture view creation failed";
+        return false;
+      }
+    }
+    id<MTLSamplerState> sampler =
+        ensure_sampler_state(desc.filter, desc.wrap, {.min = desc.source_lod, .max = desc.source_lod});
+    if (sampler == nil) { if (error) *error = "Metal raster sampler creation failed"; return false; }
+
+    bool target_cache_hit = false;
+    id<MTLTexture> target_texture = ensure_facet_texture(arena, pool, facets.target,
+                                                          core::FacetKind::Attachment,
+                                                          &target_cache_hit, nullptr, &tex_error);
+    if (target_texture == nil) {
+      if (error) *error = tex_error.empty() ? "Metal raster target texture creation failed" : tex_error;
+      return false;
+    }
+
+    // Attachment format and sample count are compiled into the pipeline and are
+    // therefore key state (06 §7); the viewport set below and the tint bound at
+    // fragment buffer(0) are not, and must not enlarge the key.
+    std::string pipeline_error;
+    id<MTLRenderPipelineState> pipeline_state = nil;
+    if (!ensure_raster_pipeline(target_view.format, desc.attachment.sample_count, &pipeline_state,
+                                &pipeline_error)) {
+      if (error) *error = "Metal raster pipeline compile failed: " + pipeline_error;
+      return false;
+    }
+
+    const uint32_t level = desc.attachment.subresource.level;
+    const uint32_t width = target_view.mip_width(level);
+    const uint32_t height = target_view.mip_height(level);
+    bool store_traffic_avoided = false;
+    MTLRenderPassDescriptor* rp = make_render_pass(target_texture, desc.attachment, target_view,
+                                                   &store_traffic_avoided, error);
+    if (rp == nil) return false;
+
+    id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
+    if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
+    id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:rp];
+    if (encoder == nil) { if (error) *error = "failed to create Metal render encoder"; return false; }
+    [encoder setRenderPipelineState:pipeline_state];
+    // Dynamic state, deliberately: a viewport change must not compile a second
+    // pipeline (06 §7's "小的动态状态不应无故扩大 key").
+    [encoder setViewport:(MTLViewport){0.0, 0.0, static_cast<double>(width), static_cast<double>(height),
+                                       0.0, 1.0}];
+    [encoder setVertexBuffer:vertex_buffer offset:0 atIndex:compiler::kRasterVertexBufferIndex];
+    [encoder setFragmentTexture:source_texture atIndex:compiler::kRasterTextureIndex];
+    [encoder setFragmentSamplerState:sampler atIndex:compiler::kRasterSamplerIndex];
+    [encoder setFragmentBuffer:tint_buffer offset:0 atIndex:compiler::kRasterTintBufferIndex];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertex_count];
+    [encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    if (command_buffer.status == MTLCommandBufferStatusError || command_buffer.error != nil) {
+      if (error)
+        *error = command_buffer.error != nil ? [[command_buffer.error localizedDescription] UTF8String]
+                                              : "Metal raster pass failed";
+      return false;
+    }
+
+    const bool stored = desc.attachment.store == AttachmentStoreAction::Store ||
+                        desc.attachment.store == AttachmentStoreAction::MultisampleResolve;
+    // The whole target subresource, not texel (0,0): an image-correctness
+    // differential against reference::raster_triangles needs every pixel, and a
+    // single-texel readback would let a coverage or interpolation regression pass
+    // unnoticed.
+    if (!read_texture_region(target_texture, desc.attachment.subresource.layer, level, 0, 0, width,
+                             height, &result->resolved_rgba, error))
+      return false;
+
+    result->width = width;
+    result->height = height;
+    result->sample_count = desc.attachment.sample_count;
+    result->covered_fragment_count = 0;
+    result->stored = stored;
+    // A DontCare load leaves the previous bytes visible and a DontCare store
+    // leaves memory untouched; in both cases the contract does not define what a
+    // reader sees, so the values returned must not be used as an expectation.
+    result->contents_defined = stored && desc.attachment.load != AttachmentLoadAction::DontCare;
+    result->facet_cache_hit = source_cache_hit && target_cache_hit;
+    result->encoder_count = 1;
+    result->report = make_facet_report();
+    result->report.encoder_count = 1;
+    result->report.command_buffer_count = 1;
+    result->report.queue_wait_count = 1;
+    result->report.add("raster_attachment_store", hal::LoweringClass::Direct, vertex_count / 3, 0,
+                       std::string("real MTLRenderPipelineState triangle-list draw into a render "
+                                   "attachment; ") +
+                           kRasterClipSpaceNote);
+    result->report.add("raster_source_sample",
+                       source_cache_hit ? hal::LoweringClass::CachedObject : hal::LoweringClass::DevicePass, 1,
+                       0,
+                       "SampleFacet read through a texture2d view of the requested array slice, level pinned "
+                       "by the sampler's lod clamps");
+    result->report.add(multisampled ? "raster_resolve" : "raster_store", hal::LoweringClass::Direct, 1, 0,
+                       store_traffic_avoided ? "attachment samples never reached device memory"
+                                             : "attachment contents written to device memory");
+    return true;
+  }
+
   // ---- Representation transform, shared by both paths that perform one ------
   //
   // 02 §8: `retile`/format conversion is a representation transform, not a
@@ -1967,6 +2159,15 @@ struct DeviceHal::CompileOps {
       return fail(compiled, "compute_package",
                   "indexed binding combined with effect DAG passes or a task graph is out of scope (TASK-B16)",
                   error);
+    }
+    // F2 (ADR-043 Decision #3): indexed raster draws are real hardware work
+    // deferred to F5, not a shape this backend silently reinterprets as
+    // non-indexed (START.md §4 invariant 10).
+    for (const auto& task : plan.task_graph.tasks()) {
+      if (task.kind == core::TaskKind::Raster && task.index_count > 0) {
+        init(compiled, plan);
+        return fail(compiled, "raster_task", "indexed raster draws deferred to F5", error);
+      }
     }
     return true;
   }
@@ -2249,6 +2450,101 @@ struct DeviceHal::SubmitOps {
       submission->report.add("consume_input_backing_release", hal::LoweringClass::Direct, 1, released_linear,
                              "the superseded linear representation's device buffer was destroyed at once "
                              "rather than retained to command-buffer completion (06 §11, E005)");
+    }
+    return true;
+  }
+
+  // F2 (ADR-043 Decision #3): runs every Raster-kind TaskRecord in the
+  // compiled plan's task graph through Impl::run_raster_pass() -- the same
+  // facet-acquisition/pipeline/draw/readback code run_raster_triangles() uses
+  // -- so the rasterizer is reachable through compile()/submit() by being
+  // moved, not rewritten.
+  //
+  // A per-task failure here (stale facet, missing allocation, malformed
+  // vertex buffer, dispatch error) is reported as a *soft* failure: it is
+  // recorded into `*out_message` and this function returns false, but it
+  // must never abort DeviceHal::submit() itself -- a task graph can mix
+  // compute and raster tasks, and a raster failure must not prevent the
+  // rest of the graph (in particular the compute dispatch in
+  // SubmitOps::linear) from running. This function therefore never touches
+  // `submission->result` directly; DeviceHal::submit() folds the outcome in
+  // via `finish()` only after the remaining stages have run, so a later
+  // stage's own `result.ok = true` can never silently overwrite a raster
+  // failure that happened earlier in the chain.
+  static bool raster(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
+                     hal::Submission* submission, std::string* out_message) {
+    const auto& tasks = compiled.plan.task_graph.tasks();
+    for (size_t task_index = 0; task_index < tasks.size(); ++task_index) {
+      const core::TaskRecord& task = tasks[task_index];
+      if (task.kind != core::TaskKind::Raster) continue;
+
+      std::string task_error;
+      id<MTLBuffer> vertex_buffer = metal.impl_->ensure_facet_buffer(
+          arena, metal.facet_pool(), task.vertex_buffer_ref, core::FacetKind::Address, &task_error);
+      if (vertex_buffer == nil) {
+        if (out_message) *out_message = task_error;
+        return false;
+      }
+
+      // ensure_facet_buffer() already resolved the facet slot internally to
+      // reach the allocation's device buffer; resolving it again here is
+      // read-only and cheap, and is the only way to reach the backing
+      // Allocation's byte length to derive a vertex count.
+      const core::FacetSlot* vertex_slot = metal.impl_->resolve_facet(
+          arena, metal.facet_pool(), task.vertex_buffer_ref, core::FacetKind::Address, &task_error);
+      if (vertex_slot == nullptr) {
+        if (out_message) *out_message = task_error;
+        return false;
+      }
+      const core::Allocation* vertex_allocation = arena.lookup(
+          core::PointerRef{vertex_slot->view.allocation, vertex_slot->view.allocation_generation});
+      if (vertex_allocation == nullptr) {
+        if (out_message) *out_message = "raster task vertex buffer allocation not found in arena";
+        return false;
+      }
+      if (vertex_allocation->bytes.size() % sizeof(RasterVertex) != 0) {
+        if (out_message)
+          *out_message = "raster task vertex buffer byte size is not a multiple of sizeof(RasterVertex)";
+        return false;
+      }
+      const uint32_t vertex_count =
+          static_cast<uint32_t>(vertex_allocation->bytes.size() / sizeof(RasterVertex));
+
+      id<MTLBuffer> tint_buffer = [metal.impl_->device newBufferWithLength:sizeof(float) * 4
+                                                                  options:MTLResourceStorageModeShared];
+      if (tint_buffer == nil) {
+        if (out_message) *out_message = "Metal raster buffer allocation failed";
+        return false;
+      }
+      std::memcpy([tint_buffer contents], task.raster_tint.data(), sizeof(float) * 4);
+
+      // F2 fixed defaults for the backend-private half of RasterDesc; the
+      // rest (filter/wrap/tint) comes straight off the TaskRecord.
+      RasterDesc desc;
+      desc.attachment.load = AttachmentLoadAction::Clear;
+      desc.attachment.store = AttachmentStoreAction::Store;
+      desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
+      desc.attachment.sample_count = 1;
+      desc.attachment.subresource = {0, 0};
+      desc.filter = task.raster_filter;
+      desc.wrap = task.raster_wrap;
+      desc.tint = task.raster_tint;
+
+      RasterResult result;
+      if (!metal.impl_->run_raster_pass(arena, metal.facet_pool(), task.raster_facets, desc, vertex_buffer,
+                                        tint_buffer, vertex_count, &result, &task_error)) {
+        if (out_message) *out_message = task_error;
+        return false;
+      }
+
+      submission->raster_results.push_back(hal::RasterTaskResult{
+          .task_index = static_cast<uint32_t>(task_index),
+          .resolved_rgba = result.resolved_rgba,
+          .width = result.width,
+          .height = result.height,
+          .stored = result.stored,
+          .contents_defined = result.contents_defined,
+      });
     }
     return true;
   }
@@ -2602,18 +2898,33 @@ bool DeviceHal::submit(const hal::CompiledPlan& compiled, core::Arena& arena, ha
                        std::string* error) {
   if (!SubmitOps::begin(compiled, arena, submission, error)) return false;
   if (!SubmitOps::stage5(*this, compiled, arena, submission, error)) return false;
+  // F2 (ADR-043 Decision #3): raster runs before the compute-execution-flavor
+  // branches below so it executes regardless of which one the plan takes.
+  // Its outcome is folded into submission->result by `finish()` below, after
+  // whichever branch actually ran -- never here -- so a later stage's own
+  // successful `result.ok = true` can never silently overwrite a raster
+  // failure (see SubmitOps::raster's comment).
+  std::string raster_error;
+  const bool raster_ok = SubmitOps::raster(*this, compiled, arena, submission, &raster_error);
+  const auto finish = [&](bool ok) {
+    if (!raster_ok && submission->result.ok) {
+      submission->result.ok = false;
+      submission->result.message = raster_error;
+    }
+    return ok;
+  };
   const uint64_t wait_value = compiled.plan.timeline_wait;
   const uint64_t signal_value = compiled.plan.timeline_signal;
   bool result = false;
   if (SubmitOps::take(SubmitOps::precheck_timeline(*this, wait_value, signal_value, submission), &result))
-    return result;
+    return finish(result);
   if (SubmitOps::take(SubmitOps::host_assisted(*this, compiled, arena, signal_value, submission, error), &result))
-    return result;
-  if (SubmitOps::take(SubmitOps::certificate(compiled, submission), &result)) return result;
-  if (SubmitOps::take(SubmitOps::effect_dag(*this, compiled, arena, submission), &result)) return result;
+    return finish(result);
+  if (SubmitOps::take(SubmitOps::certificate(compiled, submission), &result)) return finish(result);
+  if (SubmitOps::take(SubmitOps::effect_dag(*this, compiled, arena, submission), &result)) return finish(result);
   if (SubmitOps::take(SubmitOps::indexed(*this, compiled, arena, wait_value, signal_value, submission), &result))
-    return result;
-  return SubmitOps::linear(*this, compiled, arena, wait_value, signal_value, submission, error);
+    return finish(result);
+  return finish(SubmitOps::linear(*this, compiled, arena, wait_value, signal_value, submission, error));
 }
 
 bool DeviceHal::probe_buffer(size_t length, bool private_storage, BufferSnapshot* result,
@@ -3312,115 +3623,13 @@ bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& 
                                      core::RasterFacetPair facets,
                                      const RasterDesc& desc, const std::vector<RasterVertex>& vertices,
                                      RasterResult* result, std::string* error) const {
-  if (result == nullptr) { if (error) *error = "raster result output is required"; return false; }
-  if (vertices.empty() || vertices.size() % 3 != 0) {
-    if (error) *error = "raster vertex count must be a non-zero multiple of 3 (triangle list)";
-    return false;
-  }
-  const bool multisampled = desc.attachment.sample_count > 1;
-  if (multisampled != (desc.attachment.store == AttachmentStoreAction::MultisampleResolve)) {
-    if (error) *error = "raster: MultisampleResolve and sample_count > 1 must be requested together";
-    return false;
-  }
-  if (multisampled && desc.attachment.load == AttachmentLoadAction::Load) {
-    if (error) *error = "Unsupported: a transient multisample attachment has no prior contents to load";
-    return false;
-  }
-
-  // Both refs are capability tokens and both are bracketed: a pass reads one
-  // facet and writes another, so neither slot may be recycled under work still
-  // in flight (06 §6.4, §11).
-  FacetUseGuard source_use(pool, facets.source);
-  if (!source_use.begin(arena, error)) return false;
-  FacetUseGuard target_use(pool, facets.target);
-  if (!target_use.begin(arena, error)) return false;
-
-  const core::FacetSlot* source_slot =
-      impl_->resolve_facet(arena, pool, facets.source, core::FacetKind::Sample, error);
-  if (source_slot == nullptr) return false;
-  const core::FacetSlot* target_slot =
-      impl_->resolve_facet(arena, pool, facets.target, core::FacetKind::Attachment, error);
-  if (target_slot == nullptr) return false;
-  const core::CanonicalView& source_view = source_slot->view;
-  const core::CanonicalView& target_view = target_slot->view;
-  if (!subresource_in_range(target_view, desc.attachment.subresource, error)) return false;
-  if (desc.source_array_slice >= source_view.array_layers) {
-    if (error)
-      *error = "raster source names array slice " + std::to_string(desc.source_array_slice) +
-               " of a canonical view declaring " + std::to_string(source_view.array_layers) + " layer(s)";
-    return false;
-  }
-  if (!(desc.source_lod >= 0.0f) || desc.source_lod > static_cast<float>(source_view.mip_levels - 1)) {
-    if (error)
-      *error = "raster source names lod " + std::to_string(desc.source_lod) +
-               " of a canonical view declaring " + std::to_string(source_view.mip_levels) + " mip level(s)";
-    return false;
-  }
-  // Reading the very subresource being written has no defined result, and a
-  // pass that returned an order-dependent image for it would be worse than
-  // useless as a differential against the oracle, which refuses it for exactly
-  // this reason. Sharing an allocation is fine as long as the subresource
-  // differs, so generating one mip level from another stays expressible.
-  if (source_view.allocation == target_view.allocation &&
-      desc.source_array_slice == desc.attachment.subresource.layer &&
-      static_cast<uint32_t>(desc.source_lod) == desc.attachment.subresource.level &&
-      desc.source_lod == static_cast<float>(static_cast<uint32_t>(desc.source_lod))) {
-    if (error)
-      *error = "raster source and target name the same subresource of the same allocation; a read of the "
-               "surface being written has no defined result";
-    return false;
-  }
-
-  bool source_cache_hit = false;
-  std::string tex_error;
-  id<MTLTexture> source_texture = impl_->ensure_facet_texture(arena, pool, facets.source,
-                                                              core::FacetKind::Sample, &source_cache_hit,
-                                                              nullptr, &tex_error);
-  if (source_texture == nil) {
-    if (error) *error = tex_error.empty() ? "Metal raster source texture creation failed" : tex_error;
-    return false;
-  }
-  // The shared fragment stage declares `texture2d<float>` and takes no slice or
-  // level argument, so an array source reaches it as a single-slice 2D view
-  // over the whole mip chain -- a real reinterpretation of the same storage,
-  // not a copy and not a silently ignored slice. The requested level is then
-  // pinned through the sampler's lod clamps below, which is exact for a
-  // fractional lod too because MipFilterLinear blends the two levels the clamp
-  // lands between.
-  if (source_view.dimension == core::ViewDimension::Texture2DArray) {
-    source_texture = [source_texture newTextureViewWithPixelFormat:source_texture.pixelFormat
-                                                       textureType:MTLTextureType2D
-                                                            levels:NSMakeRange(0, source_view.mip_levels)
-                                                            slices:NSMakeRange(desc.source_array_slice, 1)];
-    if (source_texture == nil) {
-      if (error) *error = "Metal raster source array-slice texture view creation failed";
-      return false;
-    }
-  }
-  id<MTLSamplerState> sampler =
-      impl_->ensure_sampler_state(desc.filter, desc.wrap, {.min = desc.source_lod, .max = desc.source_lod});
-  if (sampler == nil) { if (error) *error = "Metal raster sampler creation failed"; return false; }
-
-  bool target_cache_hit = false;
-  id<MTLTexture> target_texture = impl_->ensure_facet_texture(arena, pool, facets.target,
-                                                              core::FacetKind::Attachment,
-                                                              &target_cache_hit, nullptr, &tex_error);
-  if (target_texture == nil) {
-    if (error) *error = tex_error.empty() ? "Metal raster target texture creation failed" : tex_error;
-    return false;
-  }
-
-  // Attachment format and sample count are compiled into the pipeline and are
-  // therefore key state (06 §7); the viewport set below and the tint bound at
-  // fragment buffer(0) are not, and must not enlarge the key.
-  std::string pipeline_error;
-  id<MTLRenderPipelineState> pipeline_state = nil;
-  if (!impl_->ensure_raster_pipeline(target_view.format, desc.attachment.sample_count, &pipeline_state,
-                                     &pipeline_error)) {
-    if (error) *error = "Metal raster pipeline compile failed: " + pipeline_error;
-    return false;
-  }
-
+  // Step 3 only ("moved, not rewritten" -- ADR-043 Decision #3, F2): building
+  // the host-supplied vertex/tint buffers is the one piece of
+  // run_raster_triangles() that a plan-driven raster TaskRecord cannot share,
+  // since SubmitOps::raster resolves its vertex buffer straight off a facet
+  // instead of a host std::vector<RasterVertex>. Everything else (facet
+  // acquisition/validation, pipeline, draw, readback) now lives in
+  // Impl::run_raster_pass(), unchanged.
   id<MTLBuffer> vertex_buffer =
       [impl_->device newBufferWithLength:vertices.size() * sizeof(RasterVertex)
                                  options:MTLResourceStorageModeShared];
@@ -3436,76 +3645,8 @@ bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& 
   std::memcpy([vertex_buffer contents], vertices.data(), vertices.size() * sizeof(RasterVertex));
   std::memcpy([tint_buffer contents], desc.tint.data(), sizeof(float) * 4);
 
-  const uint32_t level = desc.attachment.subresource.level;
-  const uint32_t width = target_view.mip_width(level);
-  const uint32_t height = target_view.mip_height(level);
-  bool store_traffic_avoided = false;
-  MTLRenderPassDescriptor* rp = impl_->make_render_pass(target_texture, desc.attachment, target_view,
-                                                        &store_traffic_avoided, error);
-  if (rp == nil) return false;
-
-  id<MTLCommandBuffer> command_buffer = [impl_->command_queue commandBuffer];
-  if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
-  id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:rp];
-  if (encoder == nil) { if (error) *error = "failed to create Metal render encoder"; return false; }
-  [encoder setRenderPipelineState:pipeline_state];
-  // Dynamic state, deliberately: a viewport change must not compile a second
-  // pipeline (06 §7's "小的动态状态不应无故扩大 key").
-  [encoder setViewport:(MTLViewport){0.0, 0.0, static_cast<double>(width), static_cast<double>(height),
-                                     0.0, 1.0}];
-  [encoder setVertexBuffer:vertex_buffer offset:0 atIndex:compiler::kRasterVertexBufferIndex];
-  [encoder setFragmentTexture:source_texture atIndex:compiler::kRasterTextureIndex];
-  [encoder setFragmentSamplerState:sampler atIndex:compiler::kRasterSamplerIndex];
-  [encoder setFragmentBuffer:tint_buffer offset:0 atIndex:compiler::kRasterTintBufferIndex];
-  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertices.size()];
-  [encoder endEncoding];
-  [command_buffer commit];
-  [command_buffer waitUntilCompleted];
-  if (command_buffer.status == MTLCommandBufferStatusError || command_buffer.error != nil) {
-    if (error)
-      *error = command_buffer.error != nil ? [[command_buffer.error localizedDescription] UTF8String]
-                                            : "Metal raster pass failed";
-    return false;
-  }
-
-  const bool stored = desc.attachment.store == AttachmentStoreAction::Store ||
-                      desc.attachment.store == AttachmentStoreAction::MultisampleResolve;
-  // The whole target subresource, not texel (0,0): an image-correctness
-  // differential against reference::raster_triangles needs every pixel, and a
-  // single-texel readback would let a coverage or interpolation regression pass
-  // unnoticed.
-  if (!impl_->read_texture_region(target_texture, desc.attachment.subresource.layer, level, 0, 0, width,
-                                  height, &result->resolved_rgba, error))
-    return false;
-
-  result->width = width;
-  result->height = height;
-  result->sample_count = desc.attachment.sample_count;
-  result->covered_fragment_count = 0;
-  result->stored = stored;
-  // A DontCare load leaves the previous bytes visible and a DontCare store
-  // leaves memory untouched; in both cases the contract does not define what a
-  // reader sees, so the values returned must not be used as an expectation.
-  result->contents_defined = stored && desc.attachment.load != AttachmentLoadAction::DontCare;
-  result->facet_cache_hit = source_cache_hit && target_cache_hit;
-  result->encoder_count = 1;
-  result->report = make_facet_report();
-  result->report.encoder_count = 1;
-  result->report.command_buffer_count = 1;
-  result->report.queue_wait_count = 1;
-  result->report.add("raster_attachment_store", hal::LoweringClass::Direct, vertices.size() / 3, 0,
-                     std::string("real MTLRenderPipelineState triangle-list draw into a render "
-                                 "attachment; ") +
-                         kRasterClipSpaceNote);
-  result->report.add("raster_source_sample",
-                     source_cache_hit ? hal::LoweringClass::CachedObject : hal::LoweringClass::DevicePass, 1,
-                     0,
-                     "SampleFacet read through a texture2d view of the requested array slice, level pinned "
-                     "by the sampler's lod clamps");
-  result->report.add(multisampled ? "raster_resolve" : "raster_store", hal::LoweringClass::Direct, 1, 0,
-                     store_traffic_avoided ? "attachment samples never reached device memory"
-                                           : "attachment contents written to device memory");
-  return true;
+  return impl_->run_raster_pass(arena, pool, facets, desc, vertex_buffer, tint_buffer,
+                                static_cast<uint32_t>(vertices.size()), result, error);
 }
 
 bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, std::string* error) const {

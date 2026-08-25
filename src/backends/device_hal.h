@@ -5,6 +5,7 @@
 #include "compiler/compiler.h"
 #include "ir/ir.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -259,6 +260,22 @@ struct CompiledPlan {
   bool representation_supported{true};
 };
 
+// F2 (ADR-046): the backend-neutral subset of Metal's RasterResult /
+// reference's RasterResult -- both already mirror each other field for
+// field, so this carries only what a caller needs to check pixels against
+// the reference oracle after a plan-driven raster task runs. Per-run
+// diagnostics (encoder_count, facet_cache_hit, covered_fragment_count)
+// stay backend-local and observable through LoweringReport instead of
+// being duplicated here.
+struct RasterTaskResult {
+  uint32_t task_index{};
+  std::vector<std::array<float, 4>> resolved_rgba;
+  uint32_t width{};
+  uint32_t height{};
+  bool stored{};
+  bool contents_defined{true};
+};
+
 struct Submission {
   uint32_t abi_version{kDeviceHalAbiVersion};
   core::ExecutionResult result;
@@ -336,6 +353,11 @@ struct Submission {
   // the two differ by the whole superseded backing, which is the peak the
   // experiment is trying to remove.
   uint64_t released_backing_bytes{};
+  // F2: one entry per Raster-kind TaskRecord in compiled.plan.task_graph
+  // that actually ran during this submit(), in task_graph.tasks() order.
+  // Empty when the plan carried no raster task, same convention as
+  // published_tasks staying empty for a plan with no task_graph.
+  std::vector<RasterTaskResult> raster_results;
 };
 
 // What one request's *physical* transform cost the backend, reported back to
