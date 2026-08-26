@@ -237,7 +237,26 @@ MTLTextureSwizzle to_mtl_swizzle(core::Swizzle swizzle) {
 }
 
 MTLPixelFormat to_mtl_pixel_format(core::PixelFormat format) {
-  return format == core::PixelFormat::RGBA8Unorm ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatR32Float;
+  switch (format) {
+    case core::PixelFormat::RGBA8Unorm: return MTLPixelFormatRGBA8Unorm;
+    case core::PixelFormat::R32Float: return MTLPixelFormatR32Float;
+    case core::PixelFormat::Depth32Float: return MTLPixelFormatDepth32Float;
+  }
+  return MTLPixelFormatInvalid;
+}
+
+MTLCompareFunction to_mtl_compare_function(core::DepthCompareOp op) {
+  switch (op) {
+    case core::DepthCompareOp::Never: return MTLCompareFunctionNever;
+    case core::DepthCompareOp::Less: return MTLCompareFunctionLess;
+    case core::DepthCompareOp::Equal: return MTLCompareFunctionEqual;
+    case core::DepthCompareOp::LessEqual: return MTLCompareFunctionLessEqual;
+    case core::DepthCompareOp::Greater: return MTLCompareFunctionGreater;
+    case core::DepthCompareOp::NotEqual: return MTLCompareFunctionNotEqual;
+    case core::DepthCompareOp::GreaterEqual: return MTLCompareFunctionGreaterEqual;
+    case core::DepthCompareOp::Always: return MTLCompareFunctionAlways;
+  }
+  return MTLCompareFunctionAlways;
 }
 
 // A Texture2DArray view lowers to MTLTextureType2DArray even when it names a
@@ -537,6 +556,12 @@ struct DeviceHal::Impl {
   compiler::PipelineClassificationCache pipeline_cache;
   std::unordered_map<uint64_t, id<MTLComputePipelineState>> compute_pipeline_by_key;
   std::unordered_map<uint64_t, id<MTLRenderPipelineState>> render_pipeline_by_key;
+  // MTLDepthStencilState is not part of MTLRenderPipelineState, but the F4
+  // depth test/write/compare choices are immutable encoder state and are kept
+  // under the same classified PipelineKey discipline.  Keeping real objects
+  // here makes cache hits observable and prevents recreating a descriptor per
+  // draw.
+  std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_stencil_by_key;
   std::unordered_map<std::string, id<MTLLibrary>> library_by_hash;
   // Bound only on the path where the in-shader guard is expected to reject the
   // token before the kernel's first sample (see run_sample_facet). It is never
@@ -1465,6 +1490,7 @@ struct DeviceHal::Impl {
                                std::unordered_map<uint64_t, id<MTLRenderPipelineState>>& objects,
                                const std::string& source, const compiler::PipelineKey& key,
                                const std::string& vertex_entry, MTLPixelFormat color_format,
+                               MTLPixelFormat depth_format,
                                const std::string& trigger, id<MTLRenderPipelineState>* out,
                                compiler::SpecializationReport* report, std::string* error) {
     const uint64_t digest = key.hash();
@@ -1485,6 +1511,7 @@ struct DeviceHal::Impl {
           descriptor.vertexFunction = vertex_function;
           descriptor.fragmentFunction = fragment_function;
           descriptor.colorAttachments[0].pixelFormat = color_format;
+          descriptor.depthAttachmentPixelFormat = depth_format;
           descriptor.rasterSampleCount = key.sample_count;
           // No MTLVertexDescriptor on purpose: the vertex stage indexes a
           // `device const VgRasterVertex*` at buffer(0) by [[vertex_id]].
@@ -1511,6 +1538,35 @@ struct DeviceHal::Impl {
     }
     if (out) *out = it->second;
     if (report) *report = local;
+    return true;
+  }
+
+  bool ensure_depth_stencil_state(const compiler::PipelineKey& key, bool test_enable,
+                                  bool write_enable, core::DepthCompareOp compare_op,
+                                  id<MTLDepthStencilState>* out, bool* cache_hit,
+                                  std::string* error) {
+    const uint64_t digest = key.hash();
+    auto found = depth_stencil_by_key.find(digest);
+    if (found != depth_stencil_by_key.end()) {
+      if (out) *out = found->second;
+      if (cache_hit) *cache_hit = true;
+      return true;
+    }
+    MTLDepthStencilDescriptor* descriptor = [MTLDepthStencilDescriptor new];
+    // Metal ignores compare/write only if there is no depth attachment.  We
+    // bind one on every F4 pass, and keep disabled testing semantically exact:
+    // Always plus writes disabled means the attachment is not modified.
+    descriptor.depthCompareFunction = test_enable ? to_mtl_compare_function(compare_op)
+                                                   : MTLCompareFunctionAlways;
+    descriptor.depthWriteEnabled = write_enable;
+    id<MTLDepthStencilState> created = [device newDepthStencilStateWithDescriptor:descriptor];
+    if (created == nil) {
+      if (error) *error = "Metal depth-stencil state creation failed";
+      return false;
+    }
+    depth_stencil_by_key.emplace(digest, created);
+    if (out) *out = created;
+    if (cache_hit) *cache_hit = false;
     return true;
   }
 
@@ -1550,21 +1606,37 @@ struct DeviceHal::Impl {
   // returns through `error` exactly like the built-in path: a clean submit-
   // time failure, never a crash or a silent fallback to the built-in shader
   // (docs/START.md invariant 10).
-  bool ensure_raster_pipeline(core::PixelFormat format, uint32_t sample_count,
-                              id<MTLRenderPipelineState>* out, std::string* error,
+  bool ensure_raster_pipeline(core::PixelFormat format, core::PixelFormat depth_format, bool has_depth,
+                              uint32_t sample_count, bool depth_test_enable,
+                              bool depth_write_enable, core::DepthCompareOp depth_compare_op,
+                              id<MTLRenderPipelineState>* out, id<MTLDepthStencilState>* depth_out,
+                              bool* depth_cache_hit, std::string* error,
                               const ir::UserRasterShaderContract* user_shader = nullptr) {
     const std::string source =
         user_shader != nullptr ? user_shader->source : compiler::raster_facet_metal_source();
     const std::string vertex_entry = user_shader != nullptr ? user_shader->vertex_entry : "vg_raster_vertex";
     const std::string fragment_entry = user_shader != nullptr ? user_shader->fragment_entry : "vg_raster_fragment";
-    const compiler::PipelineKey key = make_pipeline_key({source, fragment_entry}, {},
-                                                        {static_cast<uint32_t>(format)}, sample_count);
-    return acquire_render_pipeline(pipeline_cache, render_pipeline_by_key, source, key, vertex_entry,
-                                   to_mtl_pixel_format(format),
-                                   user_shader != nullptr
-                                       ? "restricted-import user MSL raster shader (ADR-043 Decision #4)"
-                                       : "basic raster attachment store (05 §9 region.attachment.store)",
-                                   out, nullptr, error);
+    const compiler::PipelineKey key = make_pipeline_key(
+        {source, fragment_entry}, {},
+        has_depth ? std::vector<uint32_t>{static_cast<uint32_t>(format), static_cast<uint32_t>(depth_format)}
+                  : std::vector<uint32_t>{static_cast<uint32_t>(format)}, sample_count);
+    // These are immutable MTLDepthStencilState choices.  They intentionally
+    // participate in the classified key even though the state object is
+    // distinct from MTLRenderPipelineState.
+    compiler::PipelineKey keyed = key;
+    keyed.raster_state = {{"depth_test_enable", depth_test_enable ? 1u : 0u},
+                          {"depth_write_enable", depth_write_enable ? 1u : 0u},
+                          {"depth_compare_op", static_cast<uint64_t>(depth_compare_op)}};
+    if (!acquire_render_pipeline(pipeline_cache, render_pipeline_by_key, source, keyed, vertex_entry,
+                                 to_mtl_pixel_format(format),
+                                 has_depth ? to_mtl_pixel_format(depth_format) : MTLPixelFormatInvalid,
+                                 user_shader != nullptr
+                                     ? "restricted-import user MSL raster shader (ADR-043 Decision #4)"
+                                     : "F4 depth raster attachment store",
+                                 out, nullptr, error))
+      return false;
+    return !has_depth || ensure_depth_stencil_state(keyed, depth_test_enable, depth_write_enable, depth_compare_op,
+                                                    depth_out, depth_cache_hit, error);
   }
 
   // 1x1 stand-in bound on the path where the checked-profile guard is expected
@@ -1760,6 +1832,15 @@ struct DeviceHal::Impl {
     if (!source_use.begin(arena, error)) return false;
     FacetUseGuard target_use(pool, facets.target);
     if (!target_use.begin(arena, error)) return false;
+    // A facet at slot zero is valid. Match core/reference's presence test so
+    // a malformed `{nonzero index, zero generation}` never silently disables
+    // depth on Metal while other backends reject it as a stale capability.
+    const bool has_depth = desc.depth_attachment_ref.index != 0 || desc.depth_attachment_ref.generation != 0;
+    std::unique_ptr<FacetUseGuard> depth_use;
+    if (has_depth) {
+      depth_use = std::make_unique<FacetUseGuard>(pool, desc.depth_attachment_ref);
+      if (!depth_use->begin(arena, error)) return false;
+    }
 
     const core::FacetSlot* source_slot =
         resolve_facet(arena, pool, facets.source, core::FacetKind::Sample, error);
@@ -1767,9 +1848,43 @@ struct DeviceHal::Impl {
     const core::FacetSlot* target_slot =
         resolve_facet(arena, pool, facets.target, core::FacetKind::Attachment, error);
     if (target_slot == nullptr) return false;
+    const core::FacetSlot* depth_slot = nullptr;
+    if (has_depth) {
+      depth_slot = resolve_facet(arena, pool, desc.depth_attachment_ref, core::FacetKind::Attachment, error);
+      if (depth_slot == nullptr) return false;
+    }
     const core::CanonicalView& source_view = source_slot->view;
     const core::CanonicalView& target_view = target_slot->view;
-    if (!subresource_in_range(target_view, desc.attachment.subresource, error)) return false;
+    const core::CanonicalView* depth_view = has_depth ? &depth_slot->view : nullptr;
+    // F4's fixed fragment contract samples an RGBA8 source into one RGBA8
+    // color attachment. Keep this aligned with the Reference oracle instead
+    // of letting Metal's texture2d<float> accept R32Float as a divergent
+    // one-channel interpretation.
+    if (source_view.format != core::PixelFormat::RGBA8Unorm) {
+      if (error) *error = "raster source must use PixelFormat::RGBA8Unorm";
+      return false;
+    }
+    if (has_depth && depth_view->format != core::PixelFormat::Depth32Float) {
+      if (error) *error = "raster depth attachment must use PixelFormat::Depth32Float";
+      return false;
+    }
+    if (target_view.format != core::PixelFormat::RGBA8Unorm) {
+      if (error) *error = "F4 raster color attachment must use PixelFormat::RGBA8Unorm";
+      return false;
+    }
+    if (has_depth && (target_view.width != depth_view->width || target_view.height != depth_view->height ||
+        target_view.array_layers != depth_view->array_layers || target_view.mip_levels != depth_view->mip_levels ||
+        target_view.dimension != depth_view->dimension)) {
+      if (error) *error = "raster color and depth attachment views must have identical dimensions, layers, and mips";
+      return false;
+    }
+    if (has_depth && desc.attachment.sample_count != 1) {
+      if (error) *error = "F4 depth raster supports only single-sample attachments";
+      return false;
+    }
+    if (!subresource_in_range(target_view, desc.attachment.subresource, error) ||
+        (has_depth && !subresource_in_range(*depth_view, desc.attachment.subresource, error)))
+      return false;
     if (desc.source_array_slice >= source_view.array_layers) {
       if (error)
         *error = "raster source names array slice " + std::to_string(desc.source_array_slice) +
@@ -1835,13 +1950,30 @@ struct DeviceHal::Impl {
       if (error) *error = tex_error.empty() ? "Metal raster target texture creation failed" : tex_error;
       return false;
     }
+    bool depth_cache_hit = false;
+    id<MTLTexture> depth_texture = nil;
+    if (has_depth)
+      depth_texture = ensure_facet_texture(arena, pool, desc.depth_attachment_ref,
+                                           core::FacetKind::Attachment,
+                                           &depth_cache_hit, nullptr, &tex_error);
+    if (has_depth && depth_texture == nil) {
+      if (error) *error = tex_error.empty() ? "Metal raster depth texture creation failed" : tex_error;
+      return false;
+    }
 
     // Attachment format and sample count are compiled into the pipeline and are
     // therefore key state (06 §7); the viewport set below and the tint bound at
     // fragment buffer(0) are not, and must not enlarge the key.
     std::string pipeline_error;
     id<MTLRenderPipelineState> pipeline_state = nil;
-    if (!ensure_raster_pipeline(target_view.format, desc.attachment.sample_count, &pipeline_state,
+    id<MTLDepthStencilState> depth_state = nil;
+    bool depth_state_cache_hit = false;
+    if (!ensure_raster_pipeline(target_view.format,
+                                has_depth ? depth_view->format : core::PixelFormat::RGBA8Unorm,
+                                has_depth,
+                                desc.attachment.sample_count,
+                                desc.depth_test_enable, desc.depth_write_enable, desc.depth_compare_op,
+                                &pipeline_state, &depth_state, &depth_state_cache_hit,
                                 &pipeline_error, user_shader)) {
       if (error) *error = "Metal raster pipeline compile failed: " + pipeline_error;
       return false;
@@ -1854,12 +1986,25 @@ struct DeviceHal::Impl {
     MTLRenderPassDescriptor* rp = make_render_pass(target_texture, desc.attachment, target_view,
                                                    &store_traffic_avoided, error);
     if (rp == nil) return false;
+    // F4 has a deliberately fixed depth attachment policy: no load of old
+    // depth, clear every task to the far plane, and preserve the resulting
+    // depth texture for subsequent inspection/use.
+    if (has_depth) {
+      MTLRenderPassDepthAttachmentDescriptor* depth = rp.depthAttachment;
+      depth.texture = depth_texture;
+      depth.level = level;
+      depth.slice = desc.attachment.subresource.layer;
+      depth.loadAction = MTLLoadActionClear;
+      depth.storeAction = MTLStoreActionStore;
+      depth.clearDepth = 1.0;
+    }
 
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) { if (error) *error = "failed to create Metal command buffer"; return false; }
     id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:rp];
     if (encoder == nil) { if (error) *error = "failed to create Metal render encoder"; return false; }
     [encoder setRenderPipelineState:pipeline_state];
+    if (has_depth) [encoder setDepthStencilState:depth_state];
     // Dynamic state, deliberately: a viewport change must not compile a second
     // pipeline (06 §7's "小的动态状态不应无故扩大 key").
     [encoder setViewport:(MTLViewport){0.0, 0.0, static_cast<double>(width), static_cast<double>(height),
@@ -1898,7 +2043,7 @@ struct DeviceHal::Impl {
     // leaves memory untouched; in both cases the contract does not define what a
     // reader sees, so the values returned must not be used as an expectation.
     result->contents_defined = stored && desc.attachment.load != AttachmentLoadAction::DontCare;
-    result->facet_cache_hit = source_cache_hit && target_cache_hit;
+    result->facet_cache_hit = source_cache_hit && target_cache_hit && (!has_depth || depth_cache_hit);
     result->encoder_count = 1;
     result->report = make_facet_report();
     result->report.encoder_count = 1;
@@ -1916,6 +2061,10 @@ struct DeviceHal::Impl {
     result->report.add(multisampled ? "raster_resolve" : "raster_store", hal::LoweringClass::Direct, 1, 0,
                        store_traffic_avoided ? "attachment samples never reached device memory"
                                              : "attachment contents written to device memory");
+    if (has_depth)
+      result->report.add("raster_depth_state",
+                         depth_state_cache_hit ? hal::LoweringClass::CachedObject : hal::LoweringClass::DevicePass,
+                         1, 0, "real MTLDepthStencilState bound with F4 depth compare/write policy");
     return true;
   }
 
@@ -2574,6 +2723,18 @@ struct DeviceHal::SubmitOps {
       }
       const uint32_t vertex_count =
           static_cast<uint32_t>(vertex_allocation->bytes.size() / sizeof(RasterVertex));
+      // Metal clips in homogeneous coordinates, but F4's public contract is
+      // normalized window depth. Validate before upload so an old F3 four-float
+      // vertex stream cannot be silently reinterpreted as z/u/v data.
+      for (uint32_t i = 0; i < vertex_count; ++i) {
+        RasterVertex vertex{};
+        std::memcpy(&vertex, vertex_allocation->bytes.data() + i * sizeof(RasterVertex), sizeof(vertex));
+        if (!std::isfinite(vertex.z) || vertex.z < 0.0f || vertex.z > 1.0f) {
+          if (out_message)
+            *out_message = "raster task vertex z must be finite and normalized to [0,1] (F4 vertex ABI)";
+          return false;
+        }
+      }
 
       id<MTLBuffer> tint_buffer = [metal.impl_->device newBufferWithLength:sizeof(float) * 4
                                                                   options:MTLResourceStorageModeShared];
@@ -2590,6 +2751,10 @@ struct DeviceHal::SubmitOps {
       desc.filter = task.raster_filter;
       desc.wrap = task.raster_wrap;
       desc.tint = task.raster_tint;
+      desc.depth_attachment_ref = task.depth_attachment_ref;
+      desc.depth_test_enable = task.depth_test_enable;
+      desc.depth_write_enable = task.depth_write_enable;
+      desc.depth_compare_op = task.depth_compare_op;
 
       RasterResult result;
       const ir::UserRasterShaderContract* user_shader =
@@ -3703,6 +3868,12 @@ bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& 
                                      core::RasterFacetPair facets,
                                      const RasterDesc& desc, const std::vector<RasterVertex>& vertices,
                                      RasterResult* result, std::string* error) const {
+  for (const RasterVertex& vertex : vertices) {
+    if (!std::isfinite(vertex.z) || vertex.z < 0.0f || vertex.z > 1.0f) {
+      if (error) *error = "raster vertex z must be finite and normalized to [0,1]";
+      return false;
+    }
+  }
   // Step 3 only ("moved, not rewritten" -- ADR-043 Decision #3, F2): building
   // the host-supplied vertex/tint buffers is the one piece of
   // run_raster_triangles() that a plan-driven raster TaskRecord cannot share,
@@ -3719,9 +3890,9 @@ bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& 
     if (error) *error = "Metal raster buffer allocation failed";
     return false;
   }
-  // RasterVertex is {x, y, u, v} and the MSL side is
-  // `struct VgRasterVertex { float2 position; float2 uv; }`: the same 16 bytes
-  // in the same order, so the host array uploads without a repack.
+  // F4 RasterVertex is {x,y,z,u,v}; the MSL side declares
+  // `packed_float3 position; packed_float2 uv`, the same 20-byte layout. Do not use
+  // float3 here: its Metal alignment would silently change the public stride.
   std::memcpy([vertex_buffer contents], vertices.data(), vertices.size() * sizeof(RasterVertex));
   std::memcpy([tint_buffer contents], desc.tint.data(), sizeof(float) * 4);
 
@@ -3921,6 +4092,7 @@ bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, s
           }
           if (!impl_->acquire_render_pipeline(cache, render_objects, raster_source, classification.key,
                                               raster_vertex_entry, to_mtl_pixel_format(format),
+                                              MTLPixelFormatInvalid,
                                               "E013 classified raster permutation", nullptr, nullptr,
                                               error)) {
             release_classified();

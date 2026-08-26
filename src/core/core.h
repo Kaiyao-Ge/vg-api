@@ -163,7 +163,7 @@ enum class FacetKind : uint32_t { Address, Sample, Storage, Attachment, Transfer
 
 // Format/dimension inputs that Metal Sample/Storage/Attachment facets need
 // (06-backend-macos-metal.md §6.1–6.3). Extend only when a real path requires it.
-enum class PixelFormat : uint32_t { RGBA8Unorm, R32Float };
+enum class PixelFormat : uint32_t { RGBA8Unorm, R32Float, Depth32Float };
 enum class ViewDimension : uint32_t { Texture2D, Texture2DArray };
 
 // Both formats this milestone models are 4 bytes wide, but the two reach that
@@ -242,6 +242,20 @@ struct FacetRef {
 struct RasterFacetPair {
   FacetRef source{};
   FacetRef target{};
+};
+
+// F4's depth comparison is intentionally a core task property: Reference and
+// Metal must make the same per-fragment decision, while their state objects
+// remain backend-private.
+enum class DepthCompareOp : uint32_t {
+  Never,
+  Less,
+  Equal,
+  LessEqual,
+  Greater,
+  NotEqual,
+  GreaterEqual,
+  Always,
 };
 
 // F2 (ADR-043 Decision #3, ADR-046): discriminates the shape a TaskRecord
@@ -423,6 +437,12 @@ struct TaskRecord {
   TaskKind kind{TaskKind::Compute};
   Topology topology{Topology::TriangleList};
   RasterFacetPair raster_facets{};
+  // F4: an Attachment-kind facet over a Depth32Float CanonicalView. A zero
+  // ref means this remains the F3 depth-free raster task.
+  FacetRef depth_attachment_ref{};
+  bool depth_test_enable{};
+  bool depth_write_enable{};
+  DepthCompareOp depth_compare_op{DepthCompareOp::Always};
   // Address-kind facet whose backing bytes are a tightly packed
   // RasterVertex array; vertex count is derived from its byte length
   // (Allocation::bytes.size() / sizeof(RasterVertex)), not stored here.

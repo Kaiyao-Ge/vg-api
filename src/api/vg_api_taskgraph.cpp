@@ -120,6 +120,66 @@ VgResult VG_CALL task_graph_append(VgTaskGraphBuilder builder, const VgTaskRecor
   return VG_SUCCESS;
 }
 
+VgResult VG_CALL task_graph_append_v2(VgTaskGraphBuilder builder, const VgTaskRecordV2* tasks,
+                                       uint32_t task_count, VgTaskId* out_ids) {
+  if (!g_builders.contains(builder)) {
+    set_diagnostic("task graph builder handle is stale or invalid");
+    return VG_ERROR_STALE_HANDLE;
+  }
+  if (tasks == nullptr && task_count != 0) {
+    set_diagnostic("task records are required when task_count is non-zero");
+    return VG_ERROR_INVALID_ARGUMENT;
+  }
+  if (!is_valid_code_object(builder->code_object)) {
+    set_diagnostic("task graph builder's code object handle is stale or invalid");
+    return VG_ERROR_STALE_HANDLE;
+  }
+
+  std::string error;
+  for (uint32_t i = 0; i < task_count; ++i) {
+    const vg::core::NodeTable::Ref node_ref{tasks[i].node.index, tasks[i].node.generation};
+    if (builder->code_object->nodes.lookup(node_ref) == nullptr) {
+      set_diagnostic("task record references an unknown or stale node");
+      return VG_ERROR_INVALID_ARGUMENT;
+    }
+    vg::core::TaskRecord record;
+    record.node_index = tasks[i].node.index;
+    record.node_generation = tasks[i].node.generation;
+    record.root_allocation = tasks[i].root;
+    record.root_generation = tasks[i].root_generation;
+    record.x = tasks[i].shape.x;
+    record.y = tasks[i].shape.y;
+    record.z = tasks[i].shape.z;
+    record.flags = tasks[i].shape.flags;
+    record.contract_index = tasks[i].contract_index;
+    record.payload_size = tasks[i].payload_size;
+    record.payload_or_offset = tasks[i].payload_or_offset;
+    record.kind = static_cast<vg::core::TaskKind>(tasks[i].kind);
+    record.topology = static_cast<vg::core::Topology>(tasks[i].topology);
+    record.raster_facets.source = {tasks[i].raster_facets.source.index, tasks[i].raster_facets.source.generation};
+    record.raster_facets.target = {tasks[i].raster_facets.target.index, tasks[i].raster_facets.target.generation};
+    record.vertex_buffer_ref = {tasks[i].vertex_buffer_ref.index, tasks[i].vertex_buffer_ref.generation};
+    record.index_buffer_ref = {tasks[i].index_buffer_ref.index, tasks[i].index_buffer_ref.generation};
+    record.index_count = tasks[i].index_count;
+    record.raster_filter = static_cast<vg::core::FilterMode>(tasks[i].raster_filter);
+    record.raster_wrap = static_cast<vg::core::WrapMode>(tasks[i].raster_wrap);
+    record.raster_tint = {tasks[i].raster_tint[0], tasks[i].raster_tint[1], tasks[i].raster_tint[2],
+                          tasks[i].raster_tint[3]};
+    record.depth_attachment_ref = {tasks[i].depth_attachment_ref.index,
+                                   tasks[i].depth_attachment_ref.generation};
+    record.depth_test_enable = tasks[i].depth_test_enable != VG_FALSE;
+    record.depth_write_enable = tasks[i].depth_write_enable != VG_FALSE;
+    record.depth_compare_op = static_cast<vg::core::DepthCompareOp>(tasks[i].depth_compare_op);
+    if (!builder->builder.append(record, &error)) {
+      set_diagnostic(error.c_str());
+      return VG_ERROR_INVALID_ARGUMENT;
+    }
+    if (out_ids != nullptr) out_ids[i] = builder->next_task_id;
+    builder->next_task_id += 1;
+  }
+  return VG_SUCCESS;
+}
+
 VgResult VG_CALL task_graph_add_dependency(VgTaskGraphBuilder builder, VgTaskId before, VgTaskId after) {
   if (!g_builders.contains(builder)) {
     set_diagnostic("task graph builder handle is stale or invalid");

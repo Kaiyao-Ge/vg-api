@@ -290,6 +290,10 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         desc.filter = task.raster_filter;
         desc.wrap = task.raster_wrap;
         desc.tint = task.raster_tint;
+        desc.depth_attachment_ref = task.depth_attachment_ref;
+        desc.depth_test_enable = task.depth_test_enable;
+        desc.depth_write_enable = task.depth_write_enable;
+        desc.depth_compare_op = task.depth_compare_op;
         const RasterResult raster_result = raster_triangles(arena, facet_pool(), task.raster_facets, desc, vertices);
         if (!raster_result.ok) {
           submission->result.ok = false;

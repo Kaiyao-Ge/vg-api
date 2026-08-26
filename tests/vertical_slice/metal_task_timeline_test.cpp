@@ -1405,7 +1405,7 @@ std::vector<vg::reference::RasterVertex> to_reference_vertices(
   std::vector<vg::reference::RasterVertex> out;
   out.reserve(vertices.size());
   for (const auto& vertex : vertices)
-    out.push_back({vertex.x, vertex.y, vertex.u, vertex.v});
+    out.push_back({vertex.x, vertex.y, vertex.z, vertex.u, vertex.v});
   return out;
 }
 
@@ -1449,14 +1449,20 @@ vg::core::CanonicalView make_rgba8_view(const vg::core::Allocation& allocation, 
   return view;
 }
 
+vg::core::CanonicalView make_depth32_view(const vg::core::Allocation& allocation, Extent2 extent) {
+  auto view = make_rgba8_view(allocation, extent);
+  view.format = vg::core::PixelFormat::Depth32Float;
+  return view;
+}
+
 // Metal Y-up clip space, uv (0,0) at the top-left of the source -- the same
 // full-target quad the reference raster oracle uses, so the two backends
 // receive identical vertices.
 std::vector<vg::metal::RasterVertex> metal_fullscreen_quad() {
-  const vg::metal::RasterVertex top_left{-1.0f, 1.0f, 0.0f, 0.0f};
-  const vg::metal::RasterVertex top_right{1.0f, 1.0f, 1.0f, 0.0f};
-  const vg::metal::RasterVertex bottom_left{-1.0f, -1.0f, 0.0f, 1.0f};
-  const vg::metal::RasterVertex bottom_right{1.0f, -1.0f, 1.0f, 1.0f};
+  const vg::metal::RasterVertex top_left{-1.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+  const vg::metal::RasterVertex top_right{1.0f, 1.0f, 0.0f, 1.0f, 0.0f};
+  const vg::metal::RasterVertex bottom_left{-1.0f, -1.0f, 0.0f, 0.0f, 1.0f};
+  const vg::metal::RasterVertex bottom_right{1.0f, -1.0f, 0.0f, 1.0f, 1.0f};
   return {top_left, top_right, bottom_left, top_right, bottom_right, bottom_left};
 }
 
@@ -1478,15 +1484,15 @@ std::string user_raster_msl_source(const std::string& vertex_entry, const std::s
   std::ostringstream out;
   out << "#include <metal_stdlib>\n"
       << "using namespace metal;\n\n"
-      << "struct VgRasterVertex { float2 position; float2 uv; };\n"
+      << "struct VgRasterVertex { packed_float3 position; packed_float2 uv; };\n"
       << "struct VgRasterVaryings { float4 position [[position]]; float2 uv; };\n"
       << "struct VgRasterFragment { float4 color [[color(0)]]; };\n\n"
       << "vertex VgRasterVaryings " << vertex_entry
       << "(device const VgRasterVertex* vertices [[buffer(" << vg::compiler::kRasterVertexBufferIndex << ")]],\n"
       << "                                         uint vid [[vertex_id]]) {\n"
       << "  VgRasterVaryings varyings;\n"
-      << "  varyings.position = float4(vertices[vid].position, 0.0f, 1.0f);\n"
-      << "  varyings.uv = vertices[vid].uv;\n"
+      << "  varyings.position = float4(float3(vertices[vid].position), 1.0f);\n"
+      << "  varyings.uv = float2(vertices[vid].uv);\n"
       << "  return varyings;\n"
       << "}\n\n"
       << "fragment VgRasterFragment " << fragment_entry
@@ -2137,6 +2143,114 @@ bool run_task_graph_raster(const std::string& root) {
   return true;
 }
 
+// F4: one public-task-shaped raster submission with two fully overlapping
+// triangles in one triangle list. The first samples the red source texel at
+// z=.75; the second samples green at z=.25. Less+write therefore makes the
+// center green. Keeping both triangles in one task deliberately exercises the
+// per-task clear=1.0 rule rather than assuming depth carries across tasks.
+bool run_task_graph_raster_depth(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "task-graph-raster-depth: no Metal device available on this host\n";
+    return false;
+  }
+  constexpr uint32_t kExtent = 4;
+  vg::core::Arena arena;
+  auto& source_alloc = arena.allocate(2 * 4);
+  source_alloc.bytes = {255, 0, 0, 255, 0, 255, 0, 255};
+  auto& target_alloc = arena.allocate(kExtent * kExtent * 4);
+  auto& depth_alloc = arena.allocate(kExtent * kExtent * 4);
+  const auto source_view = make_rgba8_view(source_alloc, {.width = 2, .height = 1});
+  const auto target_view = make_rgba8_view(target_alloc, {.width = kExtent, .height = kExtent});
+  const auto depth_view = make_depth32_view(depth_alloc, {.width = kExtent, .height = kExtent});
+
+  vg::core::FacetRef source_ref, target_ref, depth_ref;
+  std::string error;
+  if (!metal_device->facet_pool().acquire(arena, source_view, vg::core::FacetKind::Sample, &source_ref, &error) ||
+      !metal_device->facet_pool().acquire(arena, target_view, vg::core::FacetKind::Attachment, &target_ref, &error) ||
+      !metal_device->facet_pool().acquire(arena, depth_view, vg::core::FacetKind::Attachment, &depth_ref, &error)) {
+    std::cerr << "task-graph-raster-depth: facet acquire failed: " << error << "\n";
+    return false;
+  }
+  const auto tri = [](float z, float u) {
+    return std::array<vg::metal::RasterVertex, 3>{{
+        {-1.0f, 1.0f, z, u, 0.5f}, {3.0f, 1.0f, z, u, 0.5f}, {-1.0f, -3.0f, z, u, 0.5f}}};
+  };
+  std::vector<vg::metal::RasterVertex> vertices;
+  const auto far = tri(0.75f, 0.25f);
+  const auto near = tri(0.25f, 0.75f);
+  vertices.insert(vertices.end(), far.begin(), far.end());
+  vertices.insert(vertices.end(), near.begin(), near.end());
+  auto& vertex_alloc = arena.allocate(vertices.size() * sizeof(vg::metal::RasterVertex));
+  std::memcpy(vertex_alloc.bytes.data(), vertices.data(), vertex_alloc.bytes.size());
+  const auto vertex_view = make_rgba8_view(
+      vertex_alloc, {.width = static_cast<uint32_t>(vertex_alloc.bytes.size() / 4), .height = 1});
+  vg::core::FacetRef vertex_ref;
+  if (!metal_device->facet_pool().acquire(arena, vertex_view, vg::core::FacetKind::Address, &vertex_ref, &error)) {
+    std::cerr << "task-graph-raster-depth: vertex facet acquire failed: " << error << "\n";
+    return false;
+  }
+  TaskRecord task{};
+  task.kind = vg::core::TaskKind::Raster;
+  task.raster_facets = {.source = source_ref, .target = target_ref};
+  task.depth_attachment_ref = depth_ref;
+  task.depth_test_enable = true;
+  task.depth_write_enable = true;
+  task.depth_compare_op = vg::core::DepthCompareOp::Less;
+  task.vertex_buffer_ref = vertex_ref;
+  task.raster_filter = vg::core::FilterMode::Nearest;
+  task.raster_wrap = vg::core::WrapMode::Clamp;
+  TaskGraphBuilder builder;
+  TaskGraph graph;
+  if (!builder.append(task) || !builder.seal(&graph) || !graph.publish()) {
+    std::cerr << "task-graph-raster-depth: failed to publish task graph\n";
+    return false;
+  }
+  vg::hal::ExecutionPlan plan;
+  plan.capabilities = metal_device->capabilities();
+  plan.module = make_probe_module(arena);
+  plan.published = true;
+  plan.task_graph = graph;
+  plan.graph_epoch = arena.topology_epoch();
+  vg::hal::CompiledPlan compiled;
+  if (!metal_device->compile(plan, &compiled, &error)) {
+    std::cerr << "task-graph-raster-depth: Metal compile failed: " << error << "\n";
+    return false;
+  }
+  vg::hal::Submission submission;
+  if (!metal_device->submit(compiled, arena, &submission, &error) || !submission.result.ok ||
+      submission.raster_results.size() != 1) {
+    std::cerr << "task-graph-raster-depth: submit failed: "
+              << (error.empty() ? submission.result.message : error) << "\n";
+    return false;
+  }
+  const auto& center = submission.raster_results[0].resolved_rgba[(kExtent / 2) * kExtent + kExtent / 2];
+  if (!channels_close(center, {0.0f, 1.0f, 0.0f, 1.0f}, kNearestTol,
+                      "task-graph-raster-depth", "near triangle wins Less test"))
+    return false;
+
+  // An RGBA attachment may not masquerade as depth. Validation can happen in
+  // compile or submit; either route is acceptable, but it must not succeed.
+  TaskRecord invalid = task;
+  invalid.depth_attachment_ref = target_ref;
+  TaskGraphBuilder invalid_builder;
+  TaskGraph invalid_graph;
+  if (!invalid_builder.append(invalid) || !invalid_builder.seal(&invalid_graph) || !invalid_graph.publish()) return false;
+  plan.task_graph = invalid_graph;
+  plan.graph_epoch = arena.topology_epoch();
+  vg::hal::CompiledPlan invalid_compiled;
+  if (metal_device->compile(plan, &invalid_compiled, &error)) {
+    vg::hal::Submission invalid_submission;
+    if (!metal_device->submit(invalid_compiled, arena, &invalid_submission, &error) || invalid_submission.result.ok) {
+      std::cerr << "task-graph-raster-depth: RGBA depth attachment was accepted\n";
+      return false;
+    }
+  }
+  std::cout << "task-graph-raster-depth: ok\n";
+  return true;
+}
+
 // F3 (ADR-043 Decision #4): restricted-import "vg.msl.raster/v1" shaders --
 // plan.user_raster_shader set, plan.module left default (validate() skips
 // ir::verify(module) whenever user_raster_shader is set, mirroring
@@ -2240,6 +2354,7 @@ bool run_task_graph_raster_user_shader(const std::string& root) {
   plan.capabilities = metal_device->capabilities();
   plan.user_raster_shader = vg::ir::UserRasterShaderContract{
       "vg.test.raster/v1", "vg_user_raster_vertex", "vg_user_raster_fragment",
+      vg::ir::kRasterVertexAbiXyzuvPackedV1,
       user_raster_msl_source("vg_user_raster_vertex", "vg_user_raster_fragment")};
   plan.published = true;
   plan.task_graph = graph;
@@ -2299,6 +2414,7 @@ bool run_task_graph_raster_user_shader(const std::string& root) {
   bad_plan.capabilities = metal_device->capabilities();
   bad_plan.user_raster_shader = vg::ir::UserRasterShaderContract{
       "vg.test.raster/v1", "vg_user_raster_vertex", "vg_does_not_exist_in_source",
+      vg::ir::kRasterVertexAbiXyzuvPackedV1,
       user_raster_msl_source("vg_user_raster_vertex", "vg_user_raster_fragment")};
   bad_plan.published = true;
   bad_plan.task_graph = graph;
@@ -3108,7 +3224,7 @@ int main(int argc, char** argv) {
     std::cerr << "usage: vg_metal_task_timeline_test "
                  "<task-tier0|timeline|access-certificate|tier1-indirect|cull-compact|cull-compact-1m|effect-dag|pointer-graph|"
                  "indexed-binding|representation-layer|sample-facet|checked-facet-generation|basic-raster|"
-                 "task-graph-raster|task-graph-raster-user-shader|pipeline-classification|consume-input|"
+                 "task-graph-raster|task-graph-raster-depth|task-graph-raster-user-shader|pipeline-classification|consume-input|"
                  "representation-churn> "
                  "<repo_root>\n";
     return 2;
@@ -3144,6 +3260,8 @@ int main(int argc, char** argv) {
     ok = run_basic_raster(root);
   } else if (mode == "task-graph-raster") {
     ok = run_task_graph_raster(root);
+  } else if (mode == "task-graph-raster-depth") {
+    ok = run_task_graph_raster_depth(root);
   } else if (mode == "task-graph-raster-user-shader") {
     ok = run_task_graph_raster_user_shader(root);
   } else if (mode == "pipeline-classification") {

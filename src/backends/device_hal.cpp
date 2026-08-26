@@ -106,6 +106,10 @@ bool ExecutionPlan::validate(std::string* error) const {
     // F3 (ADR-043 Decision #4) v1 scope cut: a restricted-import MSL
     // submission carries no linear IR to verify (module stays default), and
     // may only contain raster tasks -- no mixed compute+raster.
+    if (user_raster_shader->vertex_abi != ir::kRasterVertexAbiXyzuvPackedV1) {
+      if (error) *error = "a user_raster_shader submission requires vertex_abi vg.raster.vertex.xyzuv-packed/v1";
+      return false;
+    }
     for (const auto& task : task_graph.tasks()) {
       if (task.kind != core::TaskKind::Raster) {
         if (error) *error = "a user_raster_shader submission may only contain raster tasks";

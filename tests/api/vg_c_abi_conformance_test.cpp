@@ -546,9 +546,9 @@ int main() {
   {
     VgApi raster_api{};
     raster_api.size = sizeof(raster_api);
-    if (!check(vgGetApi(VG_API_VERSION_1_3, &raster_api) == VG_SUCCESS, "vgGetApi v1.3")) return 1;
-    check(raster_api.version == VG_API_VERSION_1_3, "raster_api.version == v1.3");
-    check(raster_api.size == sizeof(VgApi), "raster_api.size == sizeof(VgApi) at v1.3");
+    if (!check(vgGetApi(VG_API_VERSION_1_4, &raster_api) == VG_SUCCESS, "vgGetApi v1.4")) return 1;
+    check(raster_api.version == VG_API_VERSION_1_4, "raster_api.version == v1.4");
+    check(raster_api.size == sizeof(VgApi), "raster_api.size matches the v1.4 table");
 
     VgRuntimeDesc raster_runtime_desc{};
     raster_runtime_desc.header.type = VG_STRUCTURE_RUNTIME_DESC;
@@ -624,7 +624,7 @@ int main() {
     // (tests/vertical_slice/metal_task_timeline_test.cpp).
     constexpr uint32_t kRasterExtent = 4;
     constexpr uint64_t kRasterTexelBytes = static_cast<uint64_t>(kRasterExtent) * kRasterExtent * 4;
-    constexpr uint64_t kRasterVertexBytes = 6ull * 4ull * sizeof(float);  // 6 vertices * {x,y,u,v}
+    constexpr uint64_t kRasterVertexBytes = 6ull * 5ull * sizeof(float);  // 6 vertices * {x,y,z,u,v}
 
     VgAllocation raster_source_allocation = nullptr;
     check(raster_api.arenaAllocate(raster_arena, kRasterTexelBytes, &raster_source_allocation) == VG_SUCCESS,
@@ -643,6 +643,14 @@ int main() {
     check(raster_api.getAllocationRef(raster_target_allocation, &raster_target_id, &raster_target_gen) ==
               VG_SUCCESS,
           "raster: getAllocationRef target");
+
+    VgAllocation raster_depth_allocation = nullptr;
+    check(raster_api.arenaAllocate(raster_arena, kRasterTexelBytes, &raster_depth_allocation) == VG_SUCCESS,
+          "raster: arenaAllocate depth");
+    uint64_t raster_depth_id = 0;
+    uint32_t raster_depth_gen = 0;
+    check(raster_api.getAllocationRef(raster_depth_allocation, &raster_depth_id, &raster_depth_gen) == VG_SUCCESS,
+          "raster: getAllocationRef depth");
 
     VgAllocation raster_vertex_allocation = nullptr;
     check(raster_api.arenaAllocate(raster_arena, kRasterVertexBytes, &raster_vertex_allocation) == VG_SUCCESS,
@@ -691,6 +699,15 @@ int main() {
                                    &raster_target_facet) == VG_SUCCESS,
           "raster: acquireFacet target");
 
+    VgCanonicalViewDesc raster_depth_view = raster_target_view;
+    raster_depth_view.allocation = raster_depth_id;
+    raster_depth_view.allocation_generation = raster_depth_gen;
+    raster_depth_view.format = VG_PIXEL_FORMAT_DEPTH32_FLOAT;
+    VgFacetRef raster_depth_facet{};
+    check(raster_api.acquireFacet(raster_device, raster_arena, &raster_depth_view, VG_FACET_KIND_ATTACHMENT,
+                                   &raster_depth_facet) == VG_SUCCESS,
+          "raster: acquireFacet depth");
+
     VgCanonicalViewDesc raster_vertex_view{};
     raster_vertex_view.header.type = VG_STRUCTURE_CANONICAL_VIEW_DESC;
     raster_vertex_view.header.size = sizeof(raster_vertex_view);
@@ -726,7 +743,7 @@ int main() {
       return std::string(
                  "#include <metal_stdlib>\n"
                  "using namespace metal;\n\n"
-                 "struct VgRasterVertex { float2 position; float2 uv; };\n"
+                 "struct VgRasterVertex { packed_float3 position; packed_float2 uv; };\n"
                  "struct VgRasterVaryings { float4 position [[position]]; float2 uv; };\n"
                  "struct VgRasterFragment { float4 color [[color(0)]]; };\n\n"
                  "vertex VgRasterVaryings ") +
@@ -734,8 +751,8 @@ int main() {
              "(device const VgRasterVertex* vertices [[buffer(0)]],\n"
              "                                         uint vid [[vertex_id]]) {\n"
              "  VgRasterVaryings varyings;\n"
-             "  varyings.position = float4(vertices[vid].position, 0.0f, 1.0f);\n"
-             "  varyings.uv = vertices[vid].uv;\n"
+             "  varyings.position = float4(float3(vertices[vid].position), 1.0f);\n"
+             "  varyings.uv = float2(vertices[vid].uv);\n"
              "  return varyings;\n"
              "}\n\n"
              "fragment VgRasterFragment " +
@@ -782,8 +799,8 @@ int main() {
       return out;
     };
 
-    // The 4-field "vg.msl.raster/v1" envelope vg::ir::parse_msl_raster_envelope
-    // requires: root_schema, vertex_entry, fragment_entry, source.
+    // The F4 "vg.msl.raster/v1" envelope requires an exact vertex_abi as
+    // well as root_schema, vertex_entry, fragment_entry, and source.
     //
     // declared_fragment_entry is the envelope's fragment_entry field (the
     // name Metal looks up via newFunctionWithName: at ensure_raster_pipeline
@@ -797,7 +814,8 @@ int main() {
     const auto make_raster_envelope_json = [&](const std::string& declared_fragment_entry,
                                                 const std::string& source_fragment_entry) {
       return "{\"root_schema\":\"vg.c-abi-conformance.raster/v1\",\"vertex_entry\":\"" + raster_vertex_entry +
-             "\",\"fragment_entry\":\"" + declared_fragment_entry + "\",\"source\":\"" +
+             "\",\"fragment_entry\":\"" + declared_fragment_entry +
+             "\",\"vertex_abi\":\"vg.raster.vertex.xyzuv-packed/v1\",\"source\":\"" +
              json_escape(make_raster_msl_source(source_fragment_entry)) + "\"}";
     };
 
@@ -838,7 +856,7 @@ int main() {
     check(raster_api.createTaskGraphBuilder(raster_device, &raster_builder_desc, &raster_builder) == VG_SUCCESS,
           "raster: createTaskGraphBuilder");
 
-    VgTaskRecord raster_task{};
+    VgTaskRecordV2 raster_task{};
     raster_task.node = raster_node_ref;
     raster_task.root = 0;
     raster_task.root_generation = 1;  // Non-zero; unused by a raster task, but
@@ -857,10 +875,14 @@ int main() {
     raster_task.raster_tint[1] = 1.0f;
     raster_task.raster_tint[2] = 1.0f;
     raster_task.raster_tint[3] = 1.0f;
+    raster_task.depth_attachment_ref = raster_depth_facet;
+    raster_task.depth_test_enable = VG_TRUE;
+    raster_task.depth_write_enable = VG_TRUE;
+    raster_task.depth_compare_op = VG_DEPTH_COMPARE_LESS;
 
     VgTaskId raster_task_id{};
-    check(raster_api.taskGraphAppend(raster_builder, &raster_task, 1, &raster_task_id) == VG_SUCCESS,
-          "raster: taskGraphAppend VG_TASK_KIND_RASTER");
+    check(raster_api.taskGraphAppendV2(raster_builder, &raster_task, 1, &raster_task_id) == VG_SUCCESS,
+          "raster: taskGraphAppendV2 depth-enabled VG_TASK_KIND_RASTER");
 
     VgSealDesc raster_seal_desc{};
     raster_seal_desc.header.type = VG_STRUCTURE_SEAL_DESC;
@@ -1163,6 +1185,18 @@ int main() {
     uint32_t count = 0;
     check(v12_api.enumerateAdapters(rt, &count, nullptr) == VG_SUCCESS, "v1.2 enumerateAdapters");
     v12_api.destroyRuntime(rt);
+  }
+
+  // v1.4 appends only the V2 raw-record entry point. Its v1.3 predecessor
+  // must remain a complete, correctly sized table rather than receiving a
+  // pointer beyond its negotiated boundary.
+  {
+    VgApi v14_api{};
+    v14_api.size = sizeof(v14_api);
+    check(vgGetApi(VG_API_VERSION_1_4, &v14_api) == VG_SUCCESS, "vgGetApi v1.4");
+    check(v14_api.version == VG_API_VERSION_1_4, "v1.4 api.version");
+    check(v14_api.size == sizeof(VgApi), "v1.4 api.size == sizeof(VgApi)");
+    check(v14_api.taskGraphAppendV2 != nullptr, "v1.4 taskGraphAppendV2 is populated");
   }
 
   return g_ok ? 0 : 1;

@@ -348,6 +348,7 @@ bool run_raster_msl_rejected(const std::string& root) {
   // validate() so the two paths compose (see device_hal.cpp).
   plan.user_raster_shader = vg::ir::UserRasterShaderContract{
       "vg.test.raster/v1", "vg_test_vertex", "vg_test_fragment",
+      vg::ir::kRasterVertexAbiXyzuvPackedV1,
       "#version 450\nvoid main() {}\n"};
   plan.published = true;
   plan.task_graph = graph;

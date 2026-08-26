@@ -65,6 +65,23 @@ int main() {
   assert(payload_quota_builder.set_quota(2, 3));
   auto payload_task = first; payload_task.payload_size = 4;
   assert(!payload_quota_builder.append(payload_task, &error) && error == "task payload quota overflow");
+
+  // F4: slot zero is a valid FacetRef index, but a non-zero index with a
+  // zero generation is never an issued capability token. Reject it before a
+  // backend can disagree on whether depth was requested.
+  vg::core::TaskRecord malformed_depth{};
+  malformed_depth.kind = vg::core::TaskKind::Raster;
+  malformed_depth.depth_attachment_ref = {7, 0};
+  malformed_depth.depth_test_enable = true;
+  vg::core::TaskGraphBuilder malformed_depth_builder;
+  assert(!malformed_depth_builder.append(malformed_depth, &error) &&
+         error == "raster depth attachment facet generation must be non-zero");
+  vg::core::TaskRecord slot_zero_depth{};
+  slot_zero_depth.kind = vg::core::TaskKind::Raster;
+  slot_zero_depth.depth_attachment_ref = {0, 1};
+  slot_zero_depth.depth_test_enable = true;
+  vg::core::TaskGraphBuilder slot_zero_depth_builder;
+  assert(slot_zero_depth_builder.append(slot_zero_depth));
   VgSchema_TaskRecord schema_task{};
   schema_task.node.index = 7; schema_task.node.generation = 3; schema_task.root = 11;
   schema_task.shape.x = 2; schema_task.shape.y = 3; schema_task.shape.z = 4;
@@ -81,6 +98,24 @@ int main() {
   assert(effects_builder.seal(&effects_graph));
   assert(effects_graph.effect_graph().edges().size() == 1);
   assert(effects_graph.effect_graph().edges().front().kind == vg::core::EffectEdgeKind::InferredConflict);
+
+  // F4: TaskGraphBuilder has no FacetPool to resolve depth attachment backing
+  // allocations. It therefore derives a deterministic capability-token write
+  // effect; identical depth refs must serialize as a WAW conflict at seal.
+  vg::core::TaskRecord depth_writer_a{};
+  depth_writer_a.kind = vg::core::TaskKind::Raster;
+  depth_writer_a.depth_attachment_ref = {42, 7};
+  depth_writer_a.depth_write_enable = true;
+  vg::core::TaskRecord depth_writer_b = depth_writer_a;
+  vg::core::TaskGraphBuilder depth_effect_builder;
+  assert(depth_effect_builder.append(depth_writer_a));
+  assert(depth_effect_builder.append(depth_writer_b));
+  vg::core::TaskGraph depth_effect_graph;
+  assert(depth_effect_builder.seal(&depth_effect_graph));
+  assert(depth_effect_graph.effect_graph().edges().size() == 1);
+  const auto& depth_edge = depth_effect_graph.effect_graph().edges().front();
+  assert(depth_edge.before == 0 && depth_edge.after == 1);
+  assert(depth_edge.kind == vg::core::EffectEdgeKind::InferredConflict);
 
   vg::core::TaskGraphBuilder reads_builder;
   assert(reads_builder.append(first)); assert(reads_builder.append(second));

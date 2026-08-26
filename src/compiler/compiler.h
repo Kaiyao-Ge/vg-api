@@ -175,8 +175,8 @@ constexpr uint32_t kRasterSamplerIndex = 0;
 // (06 §6.3), giving the software-rasterizer oracle a GPU counterpart to be
 // compared against instead of a semantics-only reference.
 // Vertex stage `vg_raster_vertex` reads an interleaved
-// `struct { float2 position; float2 uv; }` array (clip-space position in
-// [-1,1], uv in [0,1]) from a `device` buffer at vertex buffer(0), indexed
+// `struct { packed_float3 position; packed_float2 uv; }` array (clip-space
+// x/y, normalized z, uv in [0,1]) from a `device` buffer at vertex buffer(0), indexed
 // by [[vertex_id]]. Deliberately no [[stage_in]] / MTLVertexDescriptor on
 // the vertex *input* side: pointer-indexed root data is this project's
 // addressing philosophy (04 §8, 06 §5), it keeps vertex layout out of the

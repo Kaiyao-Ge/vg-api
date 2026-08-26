@@ -399,6 +399,7 @@ uint32_t bytes_per_texel(PixelFormat format) {
   switch (format) {
     case PixelFormat::RGBA8Unorm: return 4;
     case PixelFormat::R32Float: return 4;
+    case PixelFormat::Depth32Float: return 4;
   }
   return 0;
 }
@@ -471,6 +472,10 @@ bool FacetPool::acquire(const Arena& arena, const CanonicalView& view, FacetKind
                         std::string* error) {
   if (out == nullptr) { if (error) *error = "facet ref output is required"; return false; }
   if (!view.valid(error)) return false;
+  if (view.format == PixelFormat::Depth32Float && kind != FacetKind::Attachment) {
+    if (error) *error = "Depth32Float canonical views may only acquire Attachment facets";
+    return false;
+  }
   const auto* allocation = arena.lookup(PointerRef{view.allocation, view.allocation_generation});
   if (allocation == nullptr) { if (error) *error = "canonical view allocation is not active in arena"; return false; }
   if (allocation->size < view.byte_size()) {
@@ -603,10 +608,46 @@ void FacetPool::retire_slot(uint32_t index) {
 bool TaskGraphBuilder::append(const TaskRecord& task, std::string* error) {
   if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
   if (task.node_generation == 0 || task.root_generation == 0) { if (error) *error = "task generation must be non-zero"; return false; }
+  if (task.kind == TaskKind::Raster &&
+      static_cast<uint32_t>(task.depth_compare_op) > static_cast<uint32_t>(DepthCompareOp::Always)) {
+    if (error) *error = "raster depth compare op is invalid";
+    return false;
+  }
+  const bool has_depth_attachment = task.depth_attachment_ref.index != 0 || task.depth_attachment_ref.generation != 0;
+  // Facet slot zero is valid, so `{0, nonzero}` is a legitimate token.  The
+  // converse `{nonzero, 0}` can never be one: every issued FacetRef has a
+  // non-zero generation. Reject it here rather than letting one backend
+  // mistake the malformed token for an omitted depth attachment.
+  if (task.kind == TaskKind::Raster && task.depth_attachment_ref.index != 0 &&
+      task.depth_attachment_ref.generation == 0) {
+    if (error) *error = "raster depth attachment facet generation must be non-zero";
+    return false;
+  }
+  if (task.kind == TaskKind::Raster && !has_depth_attachment &&
+      (task.depth_test_enable || task.depth_write_enable || task.depth_compare_op != DepthCompareOp::Always)) {
+    if (error) *error = "raster depth state requires a depth attachment facet";
+    return false;
+  }
   if (tasks_.size() >= max_tasks_) { if (error) *error = "task graph quota overflow"; return false; }
   if (task.payload_size > max_payload_bytes_ - payload_bytes_) { if (error) *error = "task payload quota overflow"; return false; }
   tasks_.push_back(task);
   effects_.emplace_back();
+  if (task.kind == TaskKind::Raster && has_depth_attachment) {
+    // TaskGraphBuilder deliberately has no Arena/FacetPool, so it cannot
+    // resolve a depth facet to its backing allocation here. Encode the full
+    // capability token instead: generation occupies the high 32 bits and
+    // slot index the low 32 bits. This is deterministic and injective for
+    // FacetRef, hence two tasks using the same live depth capability receive
+    // the same synthetic write effect and seal() infers a WAW edge. This is a
+    // conservative capability-token-level identity (it can only add an
+    // extra dependency if it collides with a caller-supplied allocation id),
+    // until a future builder owns enough context to resolve actual backing
+    // allocation ranges.
+    const uint64_t synthetic_depth_identity =
+        (static_cast<uint64_t>(task.depth_attachment_ref.generation) << 32) |
+        static_cast<uint64_t>(task.depth_attachment_ref.index);
+    effects_.back().push_back({synthetic_depth_identity, 0, 1, ir::Access::Write, 0});
+  }
   payload_bytes_ += task.payload_size;
   return true;
 }

@@ -5,6 +5,7 @@
 
 #include <array>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace vg::reference {
@@ -223,16 +224,18 @@ AttachmentFacetResult attachment_facet(core::Arena& arena, const core::Canonical
 AttachmentFacetResult attachment_facet(core::Arena& arena, const core::FacetPool& pool, core::FacetRef ref,
                                        const AttachmentFacetDesc& desc);
 
-// A rasterizer input vertex: clip-space position in [-1,1] and source uv in
-// [0,1]. Position is 2D because this rasterizer is deliberately depth-free
-// (see raster_triangles) -- carrying a z that nothing tests would suggest a
-// depth semantics the oracle does not have.
+// A rasterizer input vertex: compact {x,y,z,u,v}, where x/y are clip-space,
+// z is normalized depth in [0,1], and uv is in [0,1]. This exactly matches
+// F4's public vertex-memory contract (and the packed MSL layout).
 struct RasterVertex {
   float x{};
   float y{};
+  float z{};
   float u{};
   float v{};
 };
+static_assert(std::is_standard_layout_v<RasterVertex>);
+static_assert(sizeof(RasterVertex) == 5 * sizeof(float));
 
 // Per-use parameters of one textured-triangle pass: where it renders (the
 // attachment description), how it reads the source view, and the constant tint
@@ -244,6 +247,13 @@ struct RasterDesc {
   float source_lod{};
   uint32_t source_array_slice{};
   std::array<float, 4> tint{1.0f, 1.0f, 1.0f, 1.0f};
+  // An absent depth view is the F3 depth-free path. When supplied, it must be
+  // a matching Depth32Float attachment and is cleared to 1.0 for this task.
+  const core::CanonicalView* depth_attachment{};
+  core::FacetRef depth_attachment_ref{};
+  bool depth_test_enable{};
+  bool depth_write_enable{};
+  core::DepthCompareOp depth_compare_op{core::DepthCompareOp::Always};
 };
 
 // `covered_fragment_count` counts shaded pixel-sample pairs, not pixels: this
@@ -260,6 +270,7 @@ struct RasterResult {
   uint32_t height{};
   uint32_t sample_count{1};
   uint64_t covered_fragment_count{};
+  uint64_t depth_passed_fragment_count{};
   bool stored{};
   bool contents_defined{true};
 };
@@ -294,11 +305,11 @@ struct RasterResult {
 //     coverage-only workloads, and agree within the registered sampling
 //     tolerance (10 §6) on edge pixels of a varying signal.
 //
-// Deliberately excluded: depth/stencil test, blending, clipping against the
-// near/far planes, face culling and per-triangle state. Later triangles simply
-// overwrite earlier ones at the same sample, which is what a depth-free pass
-// with default blend state does; anything more would be modelling pipeline
-// state this milestone's attachment lowering does not have.
+// F4 supplies an optional Depth32Float attachment with fixed clear=1.0/store,
+// eight compare ops, and optional testing/writing. Deliberately excluded:
+// stencil, blending, clipping against the near/far planes, face culling and
+// per-triangle state. Without a depth attachment, later triangles overwrite
+// earlier ones at the same sample as in the F3 depth-free path.
 //
 // `ok` is false only for a malformed call: a vertex count that is not a
 // multiple of 3, an invalid source or target view, an unknown allocation, an

@@ -32,8 +32,18 @@ bool effect_covers(const Effect& declared, const Effect& actual);
 // one names the shader's declared root schema, not an IR module's) and must
 // never be cross-assigned with it. The compiler validates only this
 // caller-declared shape, never the MSL source's logic (source is carried
-// through untouched).
-struct UserRasterShaderContract { std::string root_schema; std::string vertex_entry; std::string fragment_entry; std::string source; };
+// through untouched). vertex_abi is a required, exact declaration of the
+// vertex-buffer bytes consumed by both the fixed Metal binding and the F4
+// producer contract; it prevents an F3 xyuv producer from being silently
+// interpreted as F4 xyzuv-packed data.
+inline constexpr const char kRasterVertexAbiXyzuvPackedV1[] = "vg.raster.vertex.xyzuv-packed/v1";
+struct UserRasterShaderContract {
+  std::string root_schema;
+  std::string vertex_entry;
+  std::string fragment_entry;
+  std::string vertex_abi;
+  std::string source;
+};
 UserRasterShaderContract parse_msl_raster_envelope(const std::string& text);
 }
 #endif

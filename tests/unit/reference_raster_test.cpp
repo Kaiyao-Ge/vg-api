@@ -123,10 +123,10 @@ vg::core::CanonicalView plain_view(uint64_t allocation, Extent2 extent) {
 // TR->BL diagonal, clip space (-1,-1)..(1,1) with uv (0,0) at the top-left,
 // matching reference_executor.h's y-down target convention.
 std::vector<vg::reference::RasterVertex> full_target_quad() {
-  const vg::reference::RasterVertex top_left{-1.0f, 1.0f, 0.0f, 0.0f};
-  const vg::reference::RasterVertex top_right{1.0f, 1.0f, 1.0f, 0.0f};
-  const vg::reference::RasterVertex bottom_left{-1.0f, -1.0f, 0.0f, 1.0f};
-  const vg::reference::RasterVertex bottom_right{1.0f, -1.0f, 1.0f, 1.0f};
+  const vg::reference::RasterVertex top_left{-1.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+  const vg::reference::RasterVertex top_right{1.0f, 1.0f, 0.0f, 1.0f, 0.0f};
+  const vg::reference::RasterVertex bottom_left{-1.0f, -1.0f, 0.0f, 0.0f, 1.0f};
+  const vg::reference::RasterVertex bottom_right{1.0f, -1.0f, 0.0f, 1.0f, 1.0f};
   return {top_left, top_right, bottom_left, top_right, bottom_right, bottom_left};
 }
 
@@ -863,14 +863,15 @@ int main() {
     // ir::verify(module) whenever user_raster_shader is set.
     plan.user_raster_shader = vg::ir::UserRasterShaderContract{
         "vg.test.raster/v1", "vg_test_vertex", "vg_test_fragment",
+        vg::ir::kRasterVertexAbiXyzuvPackedV1,
         "#include <metal_stdlib>\n"
         "using namespace metal;\n"
-        "struct VgRasterVertex { float2 position; float2 uv; };\n"
+        "struct VgRasterVertex { packed_float3 position; float2 uv; };\n"
         "struct VgRasterVaryings { float4 position [[position]]; float2 uv; };\n"
         "vertex VgRasterVaryings vg_test_vertex(device const VgRasterVertex* vertices [[buffer(0)]],\n"
         "                                       uint vid [[vertex_id]]) {\n"
         "  VgRasterVaryings varyings;\n"
-        "  varyings.position = float4(vertices[vid].position, 0.0f, 1.0f);\n"
+        "  varyings.position = float4(vertices[vid].position, 1.0f);\n"
         "  varyings.uv = vertices[vid].uv;\n"
         "  return varyings;\n"
         "}\n"
@@ -880,6 +881,15 @@ int main() {
     plan.published = true;
     plan.task_graph = graph;
     plan.graph_epoch = arena.topology_epoch();
+
+    // Direct ExecutionPlan construction is an internal test path that does
+    // not pass through JSON parsing. Keep its contract gate explicit too, so
+    // an F3 xyuv declaration cannot bypass the envelope parser.
+    auto stale_vertex_abi_plan = plan;
+    stale_vertex_abi_plan.user_raster_shader->vertex_abi = "vg.raster.vertex.xyuv-packed/v1";
+    assert(!stale_vertex_abi_plan.validate(&error));
+    assert(error == "a user_raster_shader submission requires vertex_abi vg.raster.vertex.xyzuv-packed/v1");
+    error.clear();
 
     vg::hal::CompiledPlan compiled;
     assert(device->compile(plan, &compiled, &error));
@@ -915,6 +925,59 @@ int main() {
     assert(task_result.resolved_rgba.size() == oracle.resolved_rgba.size());
     for (size_t i = 0; i < oracle.resolved_rgba.size(); ++i)
       assert(exact_match(task_result.resolved_rgba[i], oracle.resolved_rgba[i]));
+  }
+
+  // F4: Depth32Float is attachment-only and the reference rasterizer applies
+  // the complete compare-op table against its fixed 1.0 clear value.
+  {
+    vg::core::Arena arena;
+    constexpr uint32_t kExtent = 4;
+    auto& source_alloc = arena.allocate(kExtent * kExtent * 4);
+    auto& color_alloc = arena.allocate(kExtent * kExtent * 4);
+    auto& depth_alloc = arena.allocate(kExtent * kExtent * 4);
+    const auto source = plain_view(source_alloc.id, {.width = kExtent, .height = kExtent});
+    const auto color = plain_view(color_alloc.id, {.width = kExtent, .height = kExtent});
+    auto depth = plain_view(depth_alloc.id, {.width = kExtent, .height = kExtent});
+    depth.format = vg::core::PixelFormat::Depth32Float;
+    fill_subresource(source_alloc, source, 0, 0, {255, 0, 0, 255});
+    const auto quad = full_target_quad();
+    std::string error;
+    vg::core::FacetPool pool;
+    vg::core::FacetRef rejected_depth_sample;
+    assert(!pool.acquire(arena, depth, vg::core::FacetKind::Sample, &rejected_depth_sample, &error));
+    vg::reference::RasterDesc desc;
+    desc.attachment = vg::hal::f2_default_raster_attachment_config<vg::reference::AttachmentFacetDesc>();
+    desc.filter = vg::core::FilterMode::Nearest;
+    desc.depth_attachment = &depth;
+    desc.depth_test_enable = true;
+    desc.depth_write_enable = true;
+    const std::array<std::pair<vg::core::DepthCompareOp, bool>, 8> table{{
+        {vg::core::DepthCompareOp::Never, false}, {vg::core::DepthCompareOp::Less, true},
+        {vg::core::DepthCompareOp::Equal, false}, {vg::core::DepthCompareOp::LessEqual, true},
+        {vg::core::DepthCompareOp::Greater, false}, {vg::core::DepthCompareOp::NotEqual, true},
+        {vg::core::DepthCompareOp::GreaterEqual, false}, {vg::core::DepthCompareOp::Always, true}}};
+    for (const auto& [op, should_pass] : table) {
+      desc.depth_compare_op = op;
+      const auto rendered = vg::reference::raster_triangles(arena, source, color, desc, quad);
+      assert(rendered.ok);
+      assert((rendered.depth_passed_fragment_count != 0) == should_pass);
+      float stored_depth{};
+      std::memcpy(&stored_depth, depth_alloc.bytes.data(), sizeof(stored_depth));
+      assert(stored_depth == (should_pass ? 0.0f : 1.0f));
+    }
+    // A disabled test accepts fragments irrespective of compare op; a disabled
+    // write still leaves the task's 1.0 clear value observable.
+    desc.depth_compare_op = vg::core::DepthCompareOp::Never;
+    desc.depth_test_enable = false;
+    desc.depth_write_enable = false;
+    const auto no_test_no_write = vg::reference::raster_triangles(arena, source, color, desc, quad);
+    assert(no_test_no_write.ok && no_test_no_write.depth_passed_fragment_count != 0);
+    float unchanged_depth{};
+    std::memcpy(&unchanged_depth, depth_alloc.bytes.data(), sizeof(unchanged_depth));
+    assert(unchanged_depth == 1.0f);
+    auto invalid_z = quad;
+    invalid_z[0].z = 1.01f;
+    assert(!vg::reference::raster_triangles(arena, source, color, desc, invalid_z).ok);
   }
 
   return 0;

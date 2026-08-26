@@ -172,6 +172,7 @@ enum {
     VG_WRAP_REPEAT = 1u,
     VG_PIXEL_FORMAT_RGBA8_UNORM = 0u,
     VG_PIXEL_FORMAT_R32_FLOAT = 1u,
+    VG_PIXEL_FORMAT_DEPTH32_FLOAT = 2u,
     VG_VIEW_DIMENSION_TEXTURE_2D = 0u,
     VG_VIEW_DIMENSION_TEXTURE_2D_ARRAY = 1u,
     VG_SWIZZLE_RED = 0u,
@@ -179,7 +180,17 @@ enum {
     VG_SWIZZLE_BLUE = 2u,
     VG_SWIZZLE_ALPHA = 3u,
     VG_SWIZZLE_ZERO = 4u,
-    VG_SWIZZLE_ONE = 5u
+    VG_SWIZZLE_ONE = 5u,
+    /* v1.4 additions (F4/ADR-049). Ordinal-matched to
+     * core::DepthCompareOp. */
+    VG_DEPTH_COMPARE_NEVER = 0u,
+    VG_DEPTH_COMPARE_LESS = 1u,
+    VG_DEPTH_COMPARE_EQUAL = 2u,
+    VG_DEPTH_COMPARE_LESS_EQUAL = 3u,
+    VG_DEPTH_COMPARE_GREATER = 4u,
+    VG_DEPTH_COMPARE_NOT_EQUAL = 5u,
+    VG_DEPTH_COMPARE_GREATER_EQUAL = 6u,
+    VG_DEPTH_COMPARE_ALWAYS = 7u
 };
 
 typedef void* (VG_CALL *VgAllocateFn)(void* user, size_t size, size_t alignment);
@@ -366,6 +377,38 @@ typedef struct VgTaskRecord {
     float raster_tint[4];
 } VgTaskRecord;
 
+/* F4's fixed-layout depth-capable task record. This is deliberately a
+ * distinct type and is accepted only by taskGraphAppendV2: VgTaskRecord and
+ * taskGraphAppend retain their v1.3 layout and semantics indefinitely.
+ * Future extensions MUST introduce another explicitly versioned record and
+ * append entry point (or an explicit element-stride contract), never grow
+ * either raw-array record in place. */
+typedef struct VgTaskRecordV2 {
+    VgNodeRef node;
+    uint64_t root;
+    uint32_t root_generation;
+    VgExecutionShape shape;
+    uint32_t contract_index;
+    uint32_t payload_size;
+    uint64_t payload_or_offset;
+    uint32_t kind;                     /* VG_TASK_KIND_* */
+    uint32_t topology;                 /* VG_TOPOLOGY_* */
+    VgRasterFacetPair raster_facets;
+    VgFacetRef vertex_buffer_ref;
+    VgFacetRef index_buffer_ref;
+    uint32_t index_count;
+    uint32_t raster_filter;            /* VG_FILTER_* */
+    uint32_t raster_wrap;              /* VG_WRAP_* */
+    float raster_tint[4];
+    /* F4 depth state. depth_attachment_ref must identify a Depth32Float
+     * Attachment facet whenever depth_test_enable or depth_write_enable is
+     * true. Clear is fixed to 1.0 and store is fixed to Store in F4. */
+    VgFacetRef depth_attachment_ref;
+    VgBool32 depth_test_enable;
+    VgBool32 depth_write_enable;
+    uint32_t depth_compare_op;         /* VG_DEPTH_COMPARE_* */
+} VgTaskRecordV2;
+
 typedef struct VgSealDesc {
     VgStructHeader header;
     uint32_t reserved;
@@ -486,6 +529,11 @@ typedef struct VgApi {
      * raster_facets/vertex_buffer_ref/index_buffer_ref fields require. */
     VgResult (VG_CALL *acquireFacet)(VgDevice device, VgArena arena, const VgCanonicalViewDesc* view,
                                       uint32_t facet_kind, VgFacetRef* out_facet);
+    /* ---- v1.4 (F4/ADR-049); populated only when the caller requests
+     * VG_API_VERSION_1_4 or later. This separate entry point permanently
+     * preserves VgTaskRecord's v1.3 raw-array stride. ---- */
+    VgResult (VG_CALL *taskGraphAppendV2)(VgTaskGraphBuilder builder, const VgTaskRecordV2* tasks,
+                                           uint32_t task_count, VgTaskId* out_ids);
 } VgApi;
 
 #define VG_INIT_STRUCT(struct_type, structure_type) \

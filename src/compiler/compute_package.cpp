@@ -481,15 +481,21 @@ std::string raster_facet_metal_source() {
   std::ostringstream out;
   out << "#include <metal_stdlib>\n"
       << "using namespace metal;\n\n"
-      << "struct VgRasterVertex { float2 position; float2 uv; };\n"
+      // F4's public raster vertex ABI is the tightly packed five-float tuple
+      // {x,y,z,u,v}.  `packed_float3`, rather than `float3`, is required here:
+      // Metal aligns float3 and float2 to 16/8 bytes whereas the C++ ABI intentionally has
+      // no padding between z and u. Both members must therefore be packed.
+      // This is an intentional F3 contract break;
+      // old four-float user MSL vertex declarations must be rebuilt.
+      << "struct VgRasterVertex { packed_float3 position; packed_float2 uv; };\n"
       << "struct VgRasterVaryings { float4 position [[position]]; float2 uv; };\n"
       << "struct VgRasterFragment { float4 color [[color(0)]]; };\n\n"
       << "vertex VgRasterVaryings vg_raster_vertex(device const VgRasterVertex* vertices [[buffer("
       << kRasterVertexBufferIndex << ")]],\n"
       << "                                         uint vid [[vertex_id]]) {\n"
       << "  VgRasterVaryings varyings;\n"
-      << "  varyings.position = float4(vertices[vid].position, 0.0f, 1.0f);\n"
-      << "  varyings.uv = vertices[vid].uv;\n"
+      << "  varyings.position = float4(float3(vertices[vid].position), 1.0f);\n"
+      << "  varyings.uv = float2(vertices[vid].uv);\n"
       << "  return varyings;\n"
       << "}\n\n"
       << "fragment VgRasterFragment vg_raster_fragment(VgRasterVaryings varyings [[stage_in]],\n"

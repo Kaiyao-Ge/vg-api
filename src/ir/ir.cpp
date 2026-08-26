@@ -44,6 +44,8 @@ UserRasterShaderContract parse_msl_raster_envelope(const std::string& text) {
   contract.root_schema=require(o,"root_schema").string(); if(contract.root_schema.empty()) throw std::runtime_error("MSL raster envelope missing field: root_schema");
   contract.vertex_entry=require(o,"vertex_entry").string(); if(contract.vertex_entry.empty()) throw std::runtime_error("MSL raster envelope missing field: vertex_entry");
   contract.fragment_entry=require(o,"fragment_entry").string(); if(contract.fragment_entry.empty()) throw std::runtime_error("MSL raster envelope missing field: fragment_entry");
+  contract.vertex_abi=require(o,"vertex_abi").string(); if(contract.vertex_abi.empty()) throw std::runtime_error("MSL raster envelope missing field: vertex_abi");
+  if(contract.vertex_abi != kRasterVertexAbiXyzuvPackedV1) throw std::runtime_error("MSL raster envelope has unsupported vertex_abi: "+contract.vertex_abi);
   contract.source=require(o,"source").string(); if(contract.source.empty()) throw std::runtime_error("MSL raster envelope missing field: source");
   return contract;
 }

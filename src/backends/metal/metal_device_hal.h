@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace vg::metal {
@@ -162,15 +163,18 @@ struct AttachmentFacetResult {
 
 // A rasterizer input vertex: clip-space position in [-1,1] and source uv in
 // [0,1]. Mirrors reference::RasterVertex, and matches the MSL
-// `struct VgRasterVertex { float2 position; float2 uv; }` that
+// `struct VgRasterVertex { packed_float3 position; packed_float2 uv; }` that
 // compiler::raster_facet_metal_source() reads from vertex buffer(0) byte for
 // byte, so the host array is uploaded without a repack.
 struct RasterVertex {
   float x{};
   float y{};
+  float z{};
   float u{};
   float v{};
 };
+static_assert(std::is_standard_layout_v<RasterVertex>);
+static_assert(sizeof(RasterVertex) == 5 * sizeof(float));
 
 // Per-use parameters of one textured-triangle pass. Mirrors
 // reference::RasterDesc so a differential against reference::raster_triangles
@@ -189,6 +193,13 @@ struct RasterDesc {
   float source_lod{};
   uint32_t source_array_slice{};
   std::array<float, 4> tint{1.0f, 1.0f, 1.0f, 1.0f};
+  // F4: a Depth32Float AttachmentFacet.  It is deliberately separate from
+  // RasterFacetPair's source/color target because it is an additional write
+  // capability, not another color attachment.
+  core::FacetRef depth_attachment_ref{};
+  bool depth_test_enable{};
+  bool depth_write_enable{};
+  core::DepthCompareOp depth_compare_op{core::DepthCompareOp::Always};
 };
 
 struct RasterResult {
@@ -335,9 +346,9 @@ class DeviceHal final : public hal::DeviceHal {
   // SampleFacet and `target_ref` an AttachmentFacet; both are resolved through
   // FacetPool::lookup and bracketed in begin_gpu_use/end_gpu_use.
   //
-  // Deliberately out of scope, matching the reference oracle so the two are
-  // comparable: depth/stencil test, blending, face culling and perspective
-  // divide. Later triangles simply overwrite earlier ones.
+  // F4 adds a single Depth32Float attachment with clear=1.0/store and Metal's
+  // eight compare operations. Stencil, blending, face culling and perspective
+  // divide remain out of scope.
   bool run_raster_triangles(const core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
                            const RasterDesc& desc,
                            const std::vector<RasterVertex>& vertices, RasterResult* result,

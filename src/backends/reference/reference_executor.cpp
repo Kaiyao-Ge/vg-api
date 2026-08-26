@@ -563,12 +563,26 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
                      std::to_string(vertices.size());
     return result;
   }
+  for (const RasterVertex& vertex : vertices) {
+    if (!std::isfinite(vertex.z) || vertex.z < 0.0f || vertex.z > 1.0f) {
+      result.message = "raster: vertex z must be finite normalized depth in [0,1]";
+      return result;
+    }
+  }
   const auto* source_allocation = resolve_view(arena, source, "raster source", &result.message);
   if (source_allocation == nullptr) return result;
+  if (source.format != core::PixelFormat::RGBA8Unorm) {
+    result.message = "raster source must use RGBA8Unorm";
+    return result;
+  }
   if (!check_sample_subresource(source, SampleCoord{.lod = desc.source_lod, .array_slice = desc.source_array_slice},
                                 "raster source: RasterDesc", &result.message))
     return result;
   if (resolve_view(arena, target, "raster target", &result.message) == nullptr) return result;
+  if (target.format != core::PixelFormat::RGBA8Unorm) {
+    result.message = "raster color attachment must use RGBA8Unorm";
+    return result;
+  }
   if (raster_reads_its_target(source, target, desc)) {
     result.message =
         "raster: the source subresource the pass samples is the attachment subresource it renders into; a pass "
@@ -577,22 +591,68 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
     return result;
   }
   auto* target_allocation = arena.lookup(core::PointerRef{target.allocation, target.allocation_generation});
+  core::Allocation* depth_allocation = nullptr;
+  const core::CanonicalView* depth_view = desc.depth_attachment;
+  const uint32_t depth_layer = desc.attachment.subresource.layer;
+  const uint32_t depth_level = desc.attachment.subresource.level;
+  if (depth_view != nullptr) {
+    if (depth_view->format != core::PixelFormat::Depth32Float) {
+      result.message = "raster depth attachment must use Depth32Float";
+      return result;
+    }
+    if (depth_view->width != target.width || depth_view->height != target.height ||
+        depth_view->array_layers != target.array_layers || depth_view->mip_levels != target.mip_levels) {
+      result.message = "raster depth attachment view must match color attachment dimensions, layers, and mip levels";
+      return result;
+    }
+    if (resolve_view(arena, *depth_view, "raster depth attachment", &result.message) == nullptr) return result;
+    if (!check_subresource(*depth_view, depth_layer, depth_level, "raster depth attachment", &result.message)) return result;
+    depth_allocation = arena.lookup(core::PointerRef{depth_view->allocation, depth_view->allocation_generation});
+  }
   AttachmentPass pass;
   if (!begin_attachment_pass(*target_allocation, target, desc.attachment, "raster target", &pass,
                              &result.message))
     return result;
+
+  // F4's intentionally fixed depth attachment policy is clear=1.0/store.
+  // It is separate from AttachmentPass because depth is never a color facet.
+  if (depth_view != nullptr) {
+    for (uint32_t y = 0; y < pass.height; ++y) {
+      for (uint32_t x = 0; x < pass.width; ++x) {
+        const size_t offset = texel_byte_offset(*depth_view, depth_layer, depth_level, x, y);
+        const float clear = 1.0f;
+        std::memcpy(depth_allocation->bytes.data() + offset, &clear, sizeof(clear));
+      }
+    }
+  }
+
+  const auto depth_compare_passes = [](core::DepthCompareOp op, float incoming, float stored) {
+    switch (op) {
+      case core::DepthCompareOp::Never: return false;
+      case core::DepthCompareOp::Less: return incoming < stored;
+      case core::DepthCompareOp::Equal: return incoming == stored;
+      case core::DepthCompareOp::LessEqual: return incoming <= stored;
+      case core::DepthCompareOp::Greater: return incoming > stored;
+      case core::DepthCompareOp::NotEqual: return incoming != stored;
+      case core::DepthCompareOp::GreaterEqual: return incoming >= stored;
+      case core::DepthCompareOp::Always: return true;
+    }
+    return false;
+  };
 
   const auto width = static_cast<float>(pass.width);
   const auto height = static_cast<float>(pass.height);
   for (size_t base = 0; base < vertices.size(); base += 3) {
     std::array<float, 3> x{};
     std::array<float, 3> y{};
+    std::array<float, 3> z{};
     std::array<float, 3> u{};
     std::array<float, 3> v{};
     for (size_t i = 0; i < 3; ++i) {
       const RasterVertex& vertex = vertices[base + i];
       x[i] = (vertex.x * 0.5f + 0.5f) * width;
       y[i] = (0.5f - vertex.y * 0.5f) * height;
+      z[i] = vertex.z;
       u[i] = vertex.u;
       v[i] = vertex.v;
     }
@@ -601,6 +661,7 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
     if (area < 0.0f) {
       std::swap(x[1], x[2]);
       std::swap(y[1], y[2]);
+      std::swap(z[1], z[2]);
       std::swap(u[1], u[2]);
       std::swap(v[1], v[2]);
       area = -area;
@@ -630,6 +691,17 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
           const float w0 = e12 / area;
           const float w1 = e20 / area;
           const float w2 = e01 / area;
+          const float fragment_depth = w0 * z[0] + w1 * z[1] + w2 * z[2];
+          if (depth_view != nullptr) {
+            const size_t depth_offset = texel_byte_offset(*depth_view, depth_layer, depth_level,
+                                                          static_cast<uint32_t>(ix), static_cast<uint32_t>(iy));
+            float stored_depth{};
+            std::memcpy(&stored_depth, depth_allocation->bytes.data() + depth_offset, sizeof(stored_depth));
+            if (desc.depth_test_enable && !depth_compare_passes(desc.depth_compare_op, fragment_depth, stored_depth))
+              continue;
+            if (desc.depth_write_enable)
+              std::memcpy(depth_allocation->bytes.data() + depth_offset, &fragment_depth, sizeof(fragment_depth));
+          }
           const SampleCoord coord{w0 * u[0] + w1 * u[1] + w2 * u[2], w0 * v[0] + w1 * v[1] + w2 * v[2],
                                   desc.source_lod, desc.source_array_slice};
           const auto sampled = sample_view(*source_allocation, source, desc.filter, desc.wrap, coord);
@@ -638,6 +710,7 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
             destination[static_cast<size_t>(c)] =
                 sampled[static_cast<size_t>(c)] * desc.tint[static_cast<size_t>(c)];
           ++result.covered_fragment_count;
+          ++result.depth_passed_fragment_count;
         }
       }
     }
@@ -666,6 +739,13 @@ RasterResult raster_triangles(core::Arena& arena, const core::FacetPool& pool, c
   if (target_slot == nullptr) { result.message = std::string("raster target: ") + core::to_string(status); return result; }
   if (target_slot->kind != core::FacetKind::Attachment) { result.message = "raster target: facet kind mismatch"; return result; }
   const core::CanonicalView target = target_slot->view;
-  return raster_triangles(arena, source, target, desc, vertices);
+  RasterDesc resolved_desc = desc;
+  if (resolved_desc.depth_attachment_ref.generation != 0 || resolved_desc.depth_attachment_ref.index != 0) {
+    const core::FacetSlot* depth_slot = pool.lookup(arena, resolved_desc.depth_attachment_ref, &status);
+    if (depth_slot == nullptr) { result.message = std::string("raster depth attachment: ") + core::to_string(status); return result; }
+    if (depth_slot->kind != core::FacetKind::Attachment) { result.message = "raster depth attachment: facet kind mismatch"; return result; }
+    resolved_desc.depth_attachment = &depth_slot->view;
+  }
+  return raster_triangles(arena, source, target, resolved_desc, vertices);
 }
 }

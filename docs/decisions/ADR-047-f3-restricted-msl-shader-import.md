@@ -45,11 +45,13 @@ linear IR to verify in that submission, and instead requires every task in
 `task_graph` to be `TaskKind::Raster` — no mixed compute+raster in v1 (see
 Decision #3 below).
 
-**2. The envelope is a fixed four-field contract, not shader logic
+**2. The envelope is a fixed five-field contract, not shader logic
 inference.** `ir::UserRasterShaderContract` (`src/ir/ir.h`) is `{
 std::string root_schema; std::string vertex_entry; std::string
-fragment_entry; std::string source; }`. `ir::parse_msl_raster_envelope`
-(`src/ir/ir.cpp`) requires all four fields present and non-empty, throwing
+fragment_entry; std::string vertex_abi; std::string source; }`. F4 requires
+the exact `vertex_abi` value `"vg.raster.vertex.xyzuv-packed/v1"`.
+`ir::parse_msl_raster_envelope` (`src/ir/ir.cpp`) requires all five fields
+present and non-empty, rejects other ABI values, and throws
 `std::runtime_error` with two distinct messages depending on which
 malformation occurred: `"IR missing field: <name>"` (the existing `require()`
 helper's message, reused verbatim, for a key absent from the JSON object) or
@@ -63,7 +65,7 @@ shader logic."
 **3. The binding contract is fixed, not declared per-shader.** Every
 restricted-import MSL vertex/fragment pair must match the exact struct
 layout and buffer/texture/sampler indices the built-in shader uses:
-`VgRasterVertex{float2 position; float2 uv;}`, `VgRasterVaryings{float4
+`VgRasterVertex{packed_float3 position; packed_float2 uv;}`, `VgRasterVaryings{float4
 position [[position]]; float2 uv;}`, `VgRasterFragment{float4 color
 [[color(0)]];}`, and the fixed indices `vg::compiler::kRasterVertexBufferIndex`
 / `kRasterTintBufferIndex` / `kRasterTextureIndex` / `kRasterSamplerIndex`
@@ -238,7 +240,7 @@ exists to prevent a future refactor from conflating them.
   that genuinely needs them revisits Decision #6.
 - Full effect inference (§6's nine-step `ExecutionContract` derivation in
   `05-compiler-language-ir.md`) is not run against restricted-import MSL —
-  the caller-declared four-field envelope stands in its place, disclosed as
+  the caller-declared five-field envelope stands in its place, disclosed as
   `HostAssisted` rather than silently treated as equivalent to a
   fully-inferred contract.
 - **Stale doc comment flagged, not fixed (out of this task's edit scope)**:

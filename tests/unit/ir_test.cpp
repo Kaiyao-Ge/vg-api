@@ -49,45 +49,55 @@ int main() {
   assert(!invalid.ok);
 
   // F3 (ADR-043 Decision #4): ir::parse_msl_raster_envelope round-trips the
-  // 4-field envelope a "vg.msl.raster/v1" CodeObject carries -- root_schema
+  // 5-field envelope a "vg.msl.raster/v1" CodeObject carries -- root_schema
   // here is the shader's own declared root schema, an unrelated concept from
   // Module::root_schema above despite the shared field name (ir.h's
   // UserRasterShaderContract comment).
   {
     const std::string envelope_json =
         R"({"root_schema":"vg.test.raster/v1","vertex_entry":"vg_test_vertex",)"
-        R"("fragment_entry":"vg_test_fragment","source":"#include <metal_stdlib>\nusing namespace metal;\n"})";
+        R"("fragment_entry":"vg_test_fragment","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1",)"
+        R"("source":"#include <metal_stdlib>\nusing namespace metal;\n"})";
     const auto contract = vg::ir::parse_msl_raster_envelope(envelope_json);
     assert(contract.root_schema == "vg.test.raster/v1");
     assert(contract.vertex_entry == "vg_test_vertex");
     assert(contract.fragment_entry == "vg_test_fragment");
+    assert(contract.vertex_abi == vg::ir::kRasterVertexAbiXyzuvPackedV1);
     assert(contract.source == "#include <metal_stdlib>\nusing namespace metal;\n");
   }
 
   // One rejection per field: the key entirely absent from the JSON object.
   expect_msl_envelope_throw(
-      R"({"vertex_entry":"v","fragment_entry":"f","source":"s"})", "IR missing field: root_schema");
+      R"({"vertex_entry":"v","fragment_entry":"f","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1","source":"s"})", "IR missing field: root_schema");
   expect_msl_envelope_throw(
-      R"({"root_schema":"r","fragment_entry":"f","source":"s"})", "IR missing field: vertex_entry");
+      R"({"root_schema":"r","fragment_entry":"f","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1","source":"s"})", "IR missing field: vertex_entry");
   expect_msl_envelope_throw(
-      R"({"root_schema":"r","vertex_entry":"v","source":"s"})", "IR missing field: fragment_entry");
+      R"({"root_schema":"r","vertex_entry":"v","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1","source":"s"})", "IR missing field: fragment_entry");
   expect_msl_envelope_throw(
-      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"f"})", "IR missing field: source");
+      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"f","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1"})", "IR missing field: source");
+  expect_msl_envelope_throw(
+      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"f","source":"s"})", "IR missing field: vertex_abi");
 
   // ...and separately, the key present but an empty string -- the
   // implementation distinguishes this case with its own message.
   expect_msl_envelope_throw(
-      R"({"root_schema":"","vertex_entry":"v","fragment_entry":"f","source":"s"})",
+      R"({"root_schema":"","vertex_entry":"v","fragment_entry":"f","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1","source":"s"})",
       "MSL raster envelope missing field: root_schema");
   expect_msl_envelope_throw(
-      R"({"root_schema":"r","vertex_entry":"","fragment_entry":"f","source":"s"})",
+      R"({"root_schema":"r","vertex_entry":"","fragment_entry":"f","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1","source":"s"})",
       "MSL raster envelope missing field: vertex_entry");
   expect_msl_envelope_throw(
-      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"","source":"s"})",
+      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1","source":"s"})",
       "MSL raster envelope missing field: fragment_entry");
   expect_msl_envelope_throw(
-      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"f","source":""})",
+      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"f","vertex_abi":"vg.raster.vertex.xyzuv-packed/v1","source":""})",
       "MSL raster envelope missing field: source");
+  expect_msl_envelope_throw(
+      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"f","vertex_abi":"","source":"s"})",
+      "MSL raster envelope missing field: vertex_abi");
+  expect_msl_envelope_throw(
+      R"({"root_schema":"r","vertex_entry":"v","fragment_entry":"f","vertex_abi":"vg.raster.vertex.xyuv-packed/v1","source":"s"})",
+      "MSL raster envelope has unsupported vertex_abi: vg.raster.vertex.xyuv-packed/v1");
 
   return 0;
 }

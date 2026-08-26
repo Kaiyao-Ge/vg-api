@@ -161,6 +161,8 @@ VgResult VG_CALL create_task_graph_builder(VgDevice device, const VgTaskGraphBui
 void VG_CALL destroy_task_graph_builder(VgTaskGraphBuilder builder);
 VgResult VG_CALL task_graph_append(VgTaskGraphBuilder builder, const VgTaskRecord* tasks,
                                     uint32_t task_count, VgTaskId* out_ids);
+VgResult VG_CALL task_graph_append_v2(VgTaskGraphBuilder builder, const VgTaskRecordV2* tasks,
+                                       uint32_t task_count, VgTaskId* out_ids);
 VgResult VG_CALL task_graph_add_dependency(VgTaskGraphBuilder builder, VgTaskId before, VgTaskId after);
 VgResult VG_CALL seal_task_graph(VgTaskGraphBuilder builder, const VgSealDesc* desc, VgTaskGraph* out_graph);
 void VG_CALL destroy_task_graph(VgTaskGraph graph);
