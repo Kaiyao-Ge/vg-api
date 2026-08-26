@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace vg::reference {
@@ -122,21 +123,6 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
             "ConsumeInput is not available on the reference backend: its representation transform is "
             "the identity, so no backing is superseded and nothing can be released early";
         compiled->report.add("consume_input", hal::LoweringClass::Unsupported, 1, 0,
-                             compiled->report.diagnostic);
-        if (error) *error = compiled->report.diagnostic;
-        return false;
-      }
-    }
-    // F2 (ADR-043 Decision #3): an indexed raster draw asks this backend to
-    // consume task.index_buffer_ref, which is not implemented until F5.
-    // Rejected here the same way ConsumeInput is above -- an explicit
-    // Unsupported LoweringEvent with the reason, not a silently accepted
-    // request that submit() would later have to ignore or misinterpret.
-    for (const auto& task : plan.task_graph.tasks()) {
-      if (task.kind == core::TaskKind::Raster && task.index_count > 0) {
-        compiled->report.supported = false;
-        compiled->report.diagnostic = "indexed raster draws deferred to F5";
-        compiled->report.add("raster_task", hal::LoweringClass::Unsupported, 1, 0,
                              compiled->report.diagnostic);
         if (error) *error = compiled->report.diagnostic;
         return false;
@@ -285,6 +271,53 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         if (vertex_count > 0) {
           std::memcpy(vertices.data(), vertex_allocation->bytes.data(), vertex_count * sizeof(RasterVertex));
         }
+        if (task.index_count != 0) {
+          core::FacetStatus index_status = core::FacetStatus::Ok;
+          const core::FacetSlot* index_slot = facet_pool().lookup(arena, task.index_buffer_ref, &index_status);
+          if (index_slot == nullptr || index_slot->kind != core::FacetKind::Address) {
+            submission->result.ok = false;
+            submission->result.message = index_slot == nullptr
+                ? std::string("raster task index buffer: ") + core::to_string(index_status)
+                : "raster task index buffer: facet kind mismatch";
+            return true;
+          }
+          const core::PixelFormat format = index_slot->view.format;
+          const size_t element_size = format == core::PixelFormat::R16Uint ? sizeof(uint16_t) :
+                                      format == core::PixelFormat::R32Uint ? sizeof(uint32_t) : 0;
+          if (element_size == 0 || task.index_count % 3 != 0 ||
+              task.index_count > std::numeric_limits<size_t>::max() / element_size) {
+            submission->result.ok = false;
+            submission->result.message = "raster task index buffer requires R16Uint/R32Uint and a triangle-list count";
+            return true;
+          }
+          auto* index_allocation = arena.lookup(
+              core::PointerRef{index_slot->view.allocation, index_slot->view.allocation_generation});
+          const size_t byte_count = static_cast<size_t>(task.index_count) * element_size;
+          if (index_allocation == nullptr || index_allocation->bytes.size() < byte_count) {
+            submission->result.ok = false;
+            submission->result.message = "raster task index buffer is shorter than index_count";
+            return true;
+          }
+          std::vector<RasterVertex> indexed;
+          indexed.reserve(task.index_count);
+          for (uint32_t i = 0; i < task.index_count; ++i) {
+            uint32_t index = 0;
+            if (element_size == sizeof(uint16_t)) {
+              uint16_t value{};
+              std::memcpy(&value, index_allocation->bytes.data() + i * element_size, sizeof(value));
+              index = value;
+            } else {
+              std::memcpy(&index, index_allocation->bytes.data() + i * element_size, sizeof(index));
+            }
+            if (index >= vertices.size()) {
+              submission->result.ok = false;
+              submission->result.message = "raster task index references a vertex outside the vertex buffer";
+              return true;
+            }
+            indexed.push_back(vertices[index]);
+          }
+          vertices = std::move(indexed);
+        }
         RasterDesc desc;
         desc.attachment = hal::f2_default_raster_attachment_config<AttachmentFacetDesc>();
         desc.filter = task.raster_filter;
@@ -306,6 +339,7 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         hal::RasterTaskResult task_result;
         task_result.task_index = task_index;
         task_result.resolved_rgba = raster_result.resolved_rgba;
+        task_result.resolved_depth = raster_result.resolved_depth;
         task_result.width = raster_result.width;
         task_result.height = raster_result.height;
         task_result.stored = raster_result.stored;

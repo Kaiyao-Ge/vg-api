@@ -241,6 +241,9 @@ MTLPixelFormat to_mtl_pixel_format(core::PixelFormat format) {
     case core::PixelFormat::RGBA8Unorm: return MTLPixelFormatRGBA8Unorm;
     case core::PixelFormat::R32Float: return MTLPixelFormatR32Float;
     case core::PixelFormat::Depth32Float: return MTLPixelFormatDepth32Float;
+    // Index formats are byte-addressed MTLBuffers, never textures.
+    case core::PixelFormat::R16Uint:
+    case core::PixelFormat::R32Uint: return MTLPixelFormatInvalid;
   }
   return MTLPixelFormatInvalid;
 }
@@ -1808,10 +1811,12 @@ struct DeviceHal::Impl {
   // MTLBuffer alone carries no length.
   bool run_raster_pass(const core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
                        const RasterDesc& desc, id<MTLBuffer> vertex_buffer, id<MTLBuffer> tint_buffer,
-                       uint32_t vertex_count, RasterResult* result, std::string* error,
+                       uint32_t vertex_count, id<MTLBuffer> index_buffer, MTLIndexType index_type,
+                       uint32_t index_count, RasterResult* result, std::string* error,
                        const ir::UserRasterShaderContract* user_shader = nullptr) {
     if (result == nullptr) { if (error) *error = "raster result output is required"; return false; }
-    if (vertex_count == 0 || vertex_count % 3 != 0) {
+    const uint32_t primitive_count = index_buffer != nil ? index_count : vertex_count;
+    if (vertex_count == 0 || primitive_count == 0 || primitive_count % 3 != 0) {
       if (error) *error = "raster vertex count must be a non-zero multiple of 3 (triangle list)";
       return false;
     }
@@ -2013,7 +2018,12 @@ struct DeviceHal::Impl {
     [encoder setFragmentTexture:source_texture atIndex:compiler::kRasterTextureIndex];
     [encoder setFragmentSamplerState:sampler atIndex:compiler::kRasterSamplerIndex];
     [encoder setFragmentBuffer:tint_buffer offset:0 atIndex:compiler::kRasterTintBufferIndex];
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertex_count];
+    if (index_buffer != nil) {
+      [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:index_count indexType:index_type
+                         indexBuffer:index_buffer indexBufferOffset:0];
+    } else {
+      [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertex_count];
+    }
     [encoder endEncoding];
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
@@ -2033,6 +2043,13 @@ struct DeviceHal::Impl {
     if (!read_texture_region(target_texture, desc.attachment.subresource.layer, level, 0, 0, width,
                              height, &result->resolved_rgba, error))
       return false;
+    if (has_depth) {
+      std::vector<std::array<float, 4>> depth_rgba;
+      if (!read_texture_region(depth_texture, desc.attachment.subresource.layer, level, 0, 0, width,
+                               height, &depth_rgba, error)) return false;
+      result->resolved_depth.reserve(depth_rgba.size());
+      for (const auto& value : depth_rgba) result->resolved_depth.push_back(value[0]);
+    }
 
     result->width = width;
     result->height = height;
@@ -2332,15 +2349,6 @@ struct DeviceHal::CompileOps {
       return fail(compiled, "compute_package",
                   "indexed binding combined with effect DAG passes or a task graph is out of scope (TASK-B16)",
                   error);
-    }
-    // F2 (ADR-043 Decision #3): indexed raster draws are real hardware work
-    // deferred to F5, not a shape this backend silently reinterprets as
-    // non-indexed (START.md §4 invariant 10).
-    for (const auto& task : plan.task_graph.tasks()) {
-      if (task.kind == core::TaskKind::Raster && task.index_count > 0) {
-        init(compiled, plan);
-        return fail(compiled, "raster_task", "indexed raster draws deferred to F5", error);
-      }
     }
     return true;
   }
@@ -2693,6 +2701,14 @@ struct DeviceHal::SubmitOps {
       if (task.kind != core::TaskKind::Raster) continue;
 
       std::string task_error;
+      // Address facets are just as much GPU-visible capabilities as sample
+      // and attachment facets. Hold vertex (and, below, index) slots until
+      // run_raster_pass has committed and waited for the command buffer.
+      FacetUseGuard vertex_use(metal.facet_pool(), task.vertex_buffer_ref);
+      if (!vertex_use.begin(arena, &task_error)) {
+        if (out_message) *out_message = task_error;
+        return false;
+      }
       id<MTLBuffer> vertex_buffer = metal.impl_->ensure_facet_buffer(
           arena, metal.facet_pool(), task.vertex_buffer_ref, core::FacetKind::Address, &task_error);
       if (vertex_buffer == nil) {
@@ -2736,6 +2752,41 @@ struct DeviceHal::SubmitOps {
         }
       }
 
+      id<MTLBuffer> index_buffer = nil;
+      MTLIndexType index_type = MTLIndexTypeUInt16;
+      std::unique_ptr<FacetUseGuard> index_use;
+      if (task.index_count != 0) {
+        index_use = std::make_unique<FacetUseGuard>(metal.facet_pool(), task.index_buffer_ref);
+        if (!index_use->begin(arena, &task_error)) { if (out_message) *out_message = task_error; return false; }
+        const core::FacetSlot* index_slot = metal.impl_->resolve_facet(
+            arena, metal.facet_pool(), task.index_buffer_ref, core::FacetKind::Address, &task_error);
+        if (index_slot == nullptr) { if (out_message) *out_message = task_error; return false; }
+        const size_t index_stride = index_slot->view.format == core::PixelFormat::R16Uint ? sizeof(uint16_t) :
+                                    index_slot->view.format == core::PixelFormat::R32Uint ? sizeof(uint32_t) : 0;
+        if (index_stride == 0 || task.index_count % 3 != 0 ||
+            task.index_count > std::numeric_limits<size_t>::max() / index_stride) {
+          if (out_message) *out_message = "raster task index buffer requires R16Uint/R32Uint and a triangle-list count";
+          return false;
+        }
+        const core::Allocation* index_allocation = arena.lookup(
+            core::PointerRef{index_slot->view.allocation, index_slot->view.allocation_generation});
+        if (index_allocation == nullptr || index_allocation->bytes.size() < task.index_count * index_stride) {
+          if (out_message) *out_message = "raster task index buffer is shorter than index_count";
+          return false;
+        }
+        const uint8_t* indices = index_allocation->bytes.data();
+        for (uint32_t i = 0; i < task.index_count; ++i) {
+          uint32_t index = 0;
+          if (index_stride == sizeof(uint16_t)) { uint16_t value{}; std::memcpy(&value, indices + i * index_stride, sizeof(value)); index = value; }
+          else std::memcpy(&index, indices + i * index_stride, sizeof(index));
+          if (index >= vertex_count) { if (out_message) *out_message = "raster task index references a vertex outside the vertex buffer"; return false; }
+        }
+        index_buffer = metal.impl_->ensure_facet_buffer(arena, metal.facet_pool(), task.index_buffer_ref,
+                                                          core::FacetKind::Address, &task_error);
+        if (index_buffer == nil) { if (out_message) *out_message = task_error; return false; }
+        index_type = index_stride == sizeof(uint16_t) ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+      }
+
       id<MTLBuffer> tint_buffer = [metal.impl_->device newBufferWithLength:sizeof(float) * 4
                                                                   options:MTLResourceStorageModeShared];
       if (tint_buffer == nil) {
@@ -2760,7 +2811,8 @@ struct DeviceHal::SubmitOps {
       const ir::UserRasterShaderContract* user_shader =
           compiled.plan.user_raster_shader.has_value() ? &*compiled.plan.user_raster_shader : nullptr;
       if (!metal.impl_->run_raster_pass(arena, metal.facet_pool(), task.raster_facets, desc, vertex_buffer,
-                                        tint_buffer, vertex_count, &result, &task_error, user_shader)) {
+                                        tint_buffer, vertex_count, index_buffer, index_type, task.index_count,
+                                        &result, &task_error, user_shader)) {
         if (out_message) *out_message = task_error;
         return false;
       }
@@ -2768,6 +2820,7 @@ struct DeviceHal::SubmitOps {
       submission->raster_results.push_back(hal::RasterTaskResult{
           .task_index = static_cast<uint32_t>(task_index),
           .resolved_rgba = result.resolved_rgba,
+          .resolved_depth = result.resolved_depth,
           .width = result.width,
           .height = result.height,
           .stored = result.stored,
@@ -3897,7 +3950,8 @@ bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& 
   std::memcpy([tint_buffer contents], desc.tint.data(), sizeof(float) * 4);
 
   return impl_->run_raster_pass(arena, pool, facets, desc, vertex_buffer, tint_buffer,
-                                static_cast<uint32_t>(vertices.size()), result, error);
+                                static_cast<uint32_t>(vertices.size()), nil, MTLIndexTypeUInt16, 0,
+                                result, error);
 }
 
 bool DeviceHal::run_pipeline_classification(PipelineClassificationRun* result, std::string* error) const {

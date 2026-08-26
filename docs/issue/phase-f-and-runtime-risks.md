@@ -185,6 +185,36 @@ oracle，但尚未形成完整的 Metal compare/write 矩阵、PSO/depth-state c
 - 公共 ABI 应补齐哪些无效 enum、stale/wrong-kind facet、尺寸/层/mip 不匹配与旧 envelope
   的负向 conformance 用例？
 
+## 5. F5 index facet 的非索引语义与负向覆盖
+
+### 现状
+
+F5 以 `VgTaskRecordV2` 既有的 `index_buffer_ref`/`index_count` 交付真实 u16/u32
+indexed draw；index 元素类型由 Address facet 的 `R16Uint` 或 `R32Uint` canonical view
+format 表示。Reference 与实机 Metal 已对非平凡四顶点索引 `{0,1,2,2,1,3}` 做完整颜色、
+深度 oracle 对照，且 Metal 在提交期间保护 vertex/index facets 的 GPU 生命周期。
+
+但当前执行路径仅在 `index_count != 0` 时解析 index facet。因此一个非 indexed task 若仍
+携带非空 `index_buffer_ref`，该 capability 会被忽略，而不是得到明确诊断。另有短 buffer、
+错误 format/错误 facet kind、越界 index 等实现级校验，但并非每一种都由纯公共 C ABI 和实机
+Metal 的负向矩阵覆盖。
+
+### 潜在影响
+
+1. 调用方拼装 task 时多带了 index ref，可能误以为它参与了提交；这会掩盖 host 侧 record
+   初始化错误。
+2. 后端的校验虽已存在，负向回归不完整时，后续重构可能使 Reference/Metal 的诊断或拒绝时机
+   漂移。
+3. 与 F4 相同，不同 facet token 指向同一 allocation 的精确 alias/effect 关系仍未在 builder
+   层表达；跨 task 的 producer-consumer 目前应显式声明 dependency。
+
+### 需要后续回答的问题
+
+- 是否将非 indexed task 的非空 `index_buffer_ref` 规定为 API 级 invalid argument，而非忽略？
+- 是否将 index short-buffer、wrong-kind/format、out-of-range 和 stale facet 组合纳入 Metal 与
+  纯 C ABI 的持续负向 conformance？
+- raster resource effects 应何时从 capability-token 级跟踪升级为实际 allocation/range 级？
+
 ## 处理原则
 
 在问题解决前：

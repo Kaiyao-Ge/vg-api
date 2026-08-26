@@ -283,6 +283,9 @@ struct CompiledPlan {
 struct RasterTaskResult {
   uint32_t task_index{};
   std::vector<std::array<float, 4>> resolved_rgba;
+  // F5 vertical-slice evidence also compares the F4 depth result. This is
+  // internal execution evidence, not a new public C ABI readback API.
+  std::vector<float> resolved_depth;
   uint32_t width{};
   uint32_t height{};
   bool stored{};

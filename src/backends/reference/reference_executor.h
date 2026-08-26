@@ -266,6 +266,7 @@ struct RasterResult {
   bool ok{};
   std::string message;
   std::vector<std::array<float, 4>> resolved_rgba;
+  std::vector<float> resolved_depth;
   uint32_t width{};
   uint32_t height{};
   uint32_t sample_count{1};

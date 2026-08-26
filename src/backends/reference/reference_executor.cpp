@@ -717,6 +717,14 @@ RasterResult raster_triangles(core::Arena& arena, const core::CanonicalView& sou
   }
 
   end_attachment_pass(*target_allocation, target, desc.attachment, pass, &result.resolved_rgba, &result.stored);
+  if (depth_view != nullptr) {
+    result.resolved_depth.resize(static_cast<size_t>(pass.width) * pass.height);
+    for (uint32_t y = 0; y < pass.height; ++y) for (uint32_t x = 0; x < pass.width; ++x) {
+      const size_t offset = texel_byte_offset(*depth_view, depth_layer, depth_level, x, y);
+      std::memcpy(&result.resolved_depth[static_cast<size_t>(y) * pass.width + x],
+                  depth_allocation->bytes.data() + offset, sizeof(float));
+    }
+  }
   result.width = pass.width;
   result.height = pass.height;
   result.sample_count = pass.sample_count;

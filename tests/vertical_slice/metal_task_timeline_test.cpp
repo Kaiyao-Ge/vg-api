@@ -1421,6 +1421,10 @@ vg::reference::RasterDesc to_reference_desc(const vg::metal::RasterDesc& desc) {
   out.source_lod = desc.source_lod;
   out.source_array_slice = desc.source_array_slice;
   out.tint = desc.tint;
+  out.depth_attachment_ref = desc.depth_attachment_ref;
+  out.depth_test_enable = desc.depth_test_enable;
+  out.depth_write_enable = desc.depth_write_enable;
+  out.depth_compare_op = desc.depth_compare_op;
   return out;
 }
 
@@ -1792,6 +1796,7 @@ bool run_basic_raster(const std::string& root) {
   vg::core::Arena arena;
   auto& source_alloc = arena.allocate(kBytes);
   auto& target_alloc = arena.allocate(kBytes);
+  auto& depth_alloc = arena.allocate(kBytes);
   for (uint32_t y = 0; y < kExtent; ++y) {
     for (uint32_t x = 0; x < kExtent; ++x) {
       const uint64_t texel = (static_cast<uint64_t>(y) * kExtent + x) * 4;
@@ -1804,10 +1809,12 @@ bool run_basic_raster(const std::string& root) {
 
   const vg::core::CanonicalView source_view = make_rgba8_view(source_alloc, {.width = kExtent, .height = kExtent});
   const vg::core::CanonicalView target_view = make_rgba8_view(target_alloc, {.width = kExtent, .height = kExtent});
+  const vg::core::CanonicalView depth_view = make_depth32_view(depth_alloc, {.width = kExtent, .height = kExtent});
 
   vg::core::FacetPool pool;
   vg::core::FacetRef source_ref;
   vg::core::FacetRef target_ref;
+  vg::core::FacetRef depth_ref;
   std::string error;
   if (!pool.acquire(arena, source_view, vg::core::FacetKind::Sample, &source_ref, &error) ||
       !pool.acquire(arena, target_view, vg::core::FacetKind::Attachment, &target_ref, &error)) {
@@ -1922,6 +1929,7 @@ bool run_task_graph_raster(const std::string& root) {
   vg::core::Arena arena;
   auto& source_alloc = arena.allocate(kBytes);
   auto& target_alloc = arena.allocate(kBytes);
+  auto& depth_alloc = arena.allocate(kBytes);
   for (uint32_t y = 0; y < kExtent; ++y) {
     for (uint32_t x = 0; x < kExtent; ++x) {
       const uint64_t texel = (static_cast<uint64_t>(y) * kExtent + x) * 4;
@@ -1934,13 +1942,15 @@ bool run_task_graph_raster(const std::string& root) {
 
   const vg::core::CanonicalView source_view = make_rgba8_view(source_alloc, {.width = kExtent, .height = kExtent});
   const vg::core::CanonicalView target_view = make_rgba8_view(target_alloc, {.width = kExtent, .height = kExtent});
+  const vg::core::CanonicalView depth_view = make_depth32_view(depth_alloc, {.width = kExtent, .height = kExtent});
 
   vg::core::FacetRef source_ref;
   vg::core::FacetRef target_ref;
+  vg::core::FacetRef depth_ref;
   std::string error;
   if (!metal_device->facet_pool().acquire(arena, source_view, vg::core::FacetKind::Sample, &source_ref, &error) ||
-      !metal_device->facet_pool().acquire(arena, target_view, vg::core::FacetKind::Attachment, &target_ref,
-                                          &error)) {
+      !metal_device->facet_pool().acquire(arena, target_view, vg::core::FacetKind::Attachment, &target_ref, &error) ||
+      !metal_device->facet_pool().acquire(arena, depth_view, vg::core::FacetKind::Attachment, &depth_ref, &error)) {
     std::cerr << "task-graph-raster: acquire failed: " << error << "\n";
     return false;
   }
@@ -1961,6 +1971,10 @@ bool run_task_graph_raster(const std::string& root) {
   raster_task.kind = vg::core::TaskKind::Raster;
   raster_task.raster_facets = {.source = source_ref, .target = target_ref};
   raster_task.vertex_buffer_ref = vertex_ref;
+  raster_task.depth_attachment_ref = depth_ref;
+  raster_task.depth_test_enable = true;
+  raster_task.depth_write_enable = true;
+  raster_task.depth_compare_op = vg::core::DepthCompareOp::Less;
   raster_task.raster_filter = vg::core::FilterMode::Nearest;
   raster_task.raster_wrap = vg::core::WrapMode::Clamp;
 
@@ -2008,6 +2022,10 @@ bool run_task_graph_raster(const std::string& root) {
     std::cerr << "task-graph-raster: raster_results[0] shape mismatch\n";
     return false;
   }
+  if (raster_result.resolved_depth.size() != static_cast<size_t>(kExtent) * kExtent) {
+    std::cerr << "task-graph-raster: depth readback missing\n";
+    return false;
+  }
 
   // F2's fixed attachment defaults (load=Clear, store=Store, clear_rgba
   // {0,0,0,1}, sample_count=1, subresource {0,0}) are hard-coded inside
@@ -2017,6 +2035,10 @@ bool run_task_graph_raster(const std::string& root) {
   oracle_desc.filter = raster_task.raster_filter;
   oracle_desc.wrap = raster_task.raster_wrap;
   oracle_desc.attachment = vg::hal::f2_default_raster_attachment_config<vg::metal::AttachmentFacetDesc>();
+  oracle_desc.depth_attachment_ref = depth_ref;
+  oracle_desc.depth_test_enable = true;
+  oracle_desc.depth_write_enable = true;
+  oracle_desc.depth_compare_op = vg::core::DepthCompareOp::Less;
   auto oracle = vg::reference::raster_triangles(arena, metal_device->facet_pool(),
                                                 {.source = source_ref, .target = target_ref},
                                                 to_reference_desc(oracle_desc), to_reference_vertices(quad));
@@ -2024,6 +2046,16 @@ bool run_task_graph_raster(const std::string& root) {
     std::cerr << "task-graph-raster: reference oracle failed: " << oracle.message << "\n";
     return false;
   }
+  if (raster_result.resolved_depth.size() != oracle.resolved_depth.size()) {
+    std::cerr << "task-graph-raster: depth size mismatch\n";
+    return false;
+  }
+  for (size_t i = 0; i < raster_result.resolved_depth.size(); ++i)
+    if (std::fabs(raster_result.resolved_depth[i] - oracle.resolved_depth[i]) > kNearestTol) {
+      std::cerr << "task-graph-raster: depth mismatch " << raster_result.resolved_depth[i] << " vs "
+                << oracle.resolved_depth[i] << "\n";
+      return false;
+    }
   if (raster_result.resolved_rgba.size() != oracle.resolved_rgba.size()) {
     std::cerr << "task-graph-raster: resolved image size mismatch\n";
     return false;
@@ -2037,37 +2069,64 @@ bool run_task_graph_raster(const std::string& root) {
     }
   }
 
-  // Second sub-case: an indexed raster draw is deferred to F5 and must be
-  // rejected at compile() time (Unsupported), not silently accepted
-  // (START.md Sec.4 invariant 10). TaskGraph::validate_execution() -- run
-  // inside plan.validate() ahead of the index_count check -- only requires
-  // the graph to be sealed/published with non-zero node/root generation; it
-  // never inspects FacetRef contents, so an otherwise-default TaskRecord
-  // (whose node_generation/root_generation both default to 1) is already
-  // enough to reach the index_count>0 rejection.
-  TaskRecord indexed_task{};
-  indexed_task.kind = vg::core::TaskKind::Raster;
-  indexed_task.index_count = 3;
-  TaskGraphBuilder indexed_builder;
-  if (!indexed_builder.append(indexed_task)) {
-    std::cerr << "task-graph-raster: failed to append indexed raster task\n";
-    return false;
-  }
-  TaskGraph indexed_graph;
-  if (!indexed_builder.seal(&indexed_graph) || !indexed_graph.publish()) {
-    std::cerr << "task-graph-raster: failed to seal/publish indexed task graph\n";
-    return false;
-  }
-  vg::hal::ExecutionPlan indexed_plan;
-  indexed_plan.capabilities = metal_device->capabilities();
-  indexed_plan.module = module;
-  indexed_plan.published = true;
-  indexed_plan.task_graph = indexed_graph;
-  indexed_plan.graph_epoch = arena.topology_epoch();
-  vg::hal::CompiledPlan indexed_compiled;
-  std::string indexed_error;
-  if (metal_device->compile(indexed_plan, &indexed_compiled, &indexed_error)) {
-    std::cerr << "task-graph-raster: indexed raster draw must be rejected at compile()\n";
+  // F5: four vertices plus six indices prove Metal did not silently retain
+  // drawPrimitives. Both element widths must match the Reference oracle.
+  const std::vector<vg::metal::RasterVertex> indexed_vertices{quad[0], quad[1], quad[2], quad[4]};
+  auto& indexed_vertex_alloc = arena.allocate(indexed_vertices.size() * sizeof(vg::metal::RasterVertex));
+  std::memcpy(indexed_vertex_alloc.bytes.data(), indexed_vertices.data(), indexed_vertex_alloc.bytes.size());
+  const auto indexed_vertex_view = make_rgba8_view(
+      indexed_vertex_alloc, {.width = static_cast<uint32_t>(indexed_vertex_alloc.bytes.size() / 4), .height = 1});
+  vg::core::FacetRef indexed_vertex_ref;
+  if (!metal_device->facet_pool().acquire(arena, indexed_vertex_view, vg::core::FacetKind::Address,
+                                          &indexed_vertex_ref, &error)) return false;
+  const auto run_indexed = [&](const void* bytes, size_t byte_count, vg::core::PixelFormat format,
+                               const char* label) {
+    auto& index_alloc = arena.allocate(byte_count);
+    std::memcpy(index_alloc.bytes.data(), bytes, byte_count);
+    auto index_view = make_rgba8_view(index_alloc, {.width = 6, .height = 1});
+    index_view.format = format;
+    vg::core::FacetRef index_ref;
+    if (!metal_device->facet_pool().acquire(arena, index_view, vg::core::FacetKind::Address, &index_ref, &error)) return false;
+    vg::core::FacetRef indexed_depth_ref;
+    if (!metal_device->facet_pool().acquire(arena, depth_view, vg::core::FacetKind::Attachment,
+                                            &indexed_depth_ref, &error)) return false;
+    TaskRecord indexed_task = raster_task;
+    indexed_task.vertex_buffer_ref = indexed_vertex_ref;
+    indexed_task.index_buffer_ref = index_ref;
+    indexed_task.index_count = 6;
+    indexed_task.depth_attachment_ref = indexed_depth_ref;
+    TaskGraphBuilder indexed_builder;
+    TaskGraph indexed_graph;
+    if (!indexed_builder.append(indexed_task) || !indexed_builder.seal(&indexed_graph) || !indexed_graph.publish()) return false;
+    vg::hal::ExecutionPlan indexed_plan;
+    indexed_plan.capabilities = metal_device->capabilities();
+    indexed_plan.module = module;
+    indexed_plan.published = true;
+    indexed_plan.task_graph = indexed_graph;
+    indexed_plan.graph_epoch = arena.topology_epoch();
+    vg::hal::CompiledPlan indexed_compiled;
+    vg::hal::Submission indexed_submission;
+    if (!metal_device->compile(indexed_plan, &indexed_compiled, &error) ||
+        !metal_device->submit(indexed_compiled, arena, &indexed_submission, &error) || !indexed_submission.result.ok ||
+        indexed_submission.raster_results.size() != 1) return false;
+    const auto& actual = indexed_submission.raster_results[0].resolved_rgba;
+    if (actual.size() != oracle.resolved_rgba.size()) { error = std::string(label) + ": color size"; return false; }
+    for (size_t i = 0; i < actual.size(); ++i)
+      if (!channels_close(actual[i], oracle.resolved_rgba[i], kNearestTol, label, "full indexed image")) return false;
+    const auto& actual_depth = indexed_submission.raster_results[0].resolved_depth;
+    if (actual_depth.size() != oracle.resolved_depth.size()) { error = std::string(label) + ": depth size"; return false; }
+    for (size_t i = 0; i < actual_depth.size(); ++i)
+      if (std::fabs(actual_depth[i] - oracle.resolved_depth[i]) > kNearestTol) {
+        error = std::string(label) + ": depth mismatch";
+        return false;
+      }
+    return true;
+  };
+  const std::array<uint16_t, 6> indices16{0, 1, 2, 2, 1, 3};
+  const std::array<uint32_t, 6> indices32{0, 1, 2, 2, 1, 3};
+  if (!run_indexed(indices16.data(), sizeof(indices16), vg::core::PixelFormat::R16Uint, "indexed-u16") ||
+      !run_indexed(indices32.data(), sizeof(indices32), vg::core::PixelFormat::R32Uint, "indexed-u32")) {
+    std::cerr << "task-graph-raster: indexed Metal/reference differential failed: " << error << "\n";
     return false;
   }
 

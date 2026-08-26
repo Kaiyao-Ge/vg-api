@@ -9,6 +9,27 @@ namespace vg_api {
 namespace {
 HandleRegistry<VgTaskGraphBuilder_T> g_builders;
 HandleRegistry<VgTaskGraph_T> g_task_graphs;
+
+// ABI-versioned raw records are decoded by their thin wrappers below, but all
+// handle validation, builder append, diagnostics, and task-ID publication live
+// here. Keep new task semantics on this one latest path rather than allowing
+// V1/V2 entry points to become duplicate implementations.
+VgResult append_normalized_task(VgTaskGraphBuilder builder, const vg::core::TaskRecord& record,
+                                VgTaskId* out_id) {
+  const vg::core::NodeTable::Ref node_ref{record.node_index, record.node_generation};
+  if (builder->code_object->nodes.lookup(node_ref) == nullptr) {
+    set_diagnostic("task record references an unknown or stale node");
+    return VG_ERROR_INVALID_ARGUMENT;
+  }
+  std::string error;
+  if (!builder->builder.append(record, &error)) {
+    set_diagnostic(error.c_str());
+    return VG_ERROR_INVALID_ARGUMENT;
+  }
+  if (out_id != nullptr) *out_id = builder->next_task_id;
+  builder->next_task_id += 1;
+  return VG_SUCCESS;
+}
 }  // namespace
 
 bool is_valid_task_graph_builder(VgTaskGraphBuilder builder) { return g_builders.contains(builder); }
@@ -70,17 +91,7 @@ VgResult VG_CALL task_graph_append(VgTaskGraphBuilder builder, const VgTaskRecor
     set_diagnostic("task graph builder's code object handle is stale or invalid");
     return VG_ERROR_STALE_HANDLE;
   }
-  std::string error;
   for (uint32_t i = 0; i < task_count; ++i) {
-    // ADR-044: validate the caller-supplied node ref as a real, live entry
-    // (capability-token semantics) before it enters the builder. Without
-    // this, a stale or fabricated {index, generation} pair would silently
-    // flow through to submit()/execute() unchecked.
-    const vg::core::NodeTable::Ref node_ref{tasks[i].node.index, tasks[i].node.generation};
-    if (builder->code_object->nodes.lookup(node_ref) == nullptr) {
-      set_diagnostic("task record references an unknown or stale node");
-      return VG_ERROR_INVALID_ARGUMENT;
-    }
     vg::core::TaskRecord record;
     record.node_index = tasks[i].node.index;
     record.node_generation = tasks[i].node.generation;
@@ -110,12 +121,8 @@ VgResult VG_CALL task_graph_append(VgTaskGraphBuilder builder, const VgTaskRecor
     record.raster_wrap = static_cast<vg::core::WrapMode>(tasks[i].raster_wrap);
     record.raster_tint = {tasks[i].raster_tint[0], tasks[i].raster_tint[1], tasks[i].raster_tint[2],
                            tasks[i].raster_tint[3]};
-    if (!builder->builder.append(record, &error)) {
-      set_diagnostic(error.c_str());
-      return VG_ERROR_INVALID_ARGUMENT;
-    }
-    if (out_ids != nullptr) out_ids[i] = builder->next_task_id;
-    builder->next_task_id += 1;
+    const VgResult result = append_normalized_task(builder, record, out_ids != nullptr ? &out_ids[i] : nullptr);
+    if (result != VG_SUCCESS) return result;
   }
   return VG_SUCCESS;
 }
@@ -135,13 +142,7 @@ VgResult VG_CALL task_graph_append_v2(VgTaskGraphBuilder builder, const VgTaskRe
     return VG_ERROR_STALE_HANDLE;
   }
 
-  std::string error;
   for (uint32_t i = 0; i < task_count; ++i) {
-    const vg::core::NodeTable::Ref node_ref{tasks[i].node.index, tasks[i].node.generation};
-    if (builder->code_object->nodes.lookup(node_ref) == nullptr) {
-      set_diagnostic("task record references an unknown or stale node");
-      return VG_ERROR_INVALID_ARGUMENT;
-    }
     vg::core::TaskRecord record;
     record.node_index = tasks[i].node.index;
     record.node_generation = tasks[i].node.generation;
@@ -170,12 +171,8 @@ VgResult VG_CALL task_graph_append_v2(VgTaskGraphBuilder builder, const VgTaskRe
     record.depth_test_enable = tasks[i].depth_test_enable != VG_FALSE;
     record.depth_write_enable = tasks[i].depth_write_enable != VG_FALSE;
     record.depth_compare_op = static_cast<vg::core::DepthCompareOp>(tasks[i].depth_compare_op);
-    if (!builder->builder.append(record, &error)) {
-      set_diagnostic(error.c_str());
-      return VG_ERROR_INVALID_ARGUMENT;
-    }
-    if (out_ids != nullptr) out_ids[i] = builder->next_task_id;
-    builder->next_task_id += 1;
+    const VgResult result = append_normalized_task(builder, record, out_ids != nullptr ? &out_ids[i] : nullptr);
+    if (result != VG_SUCCESS) return result;
   }
   return VG_SUCCESS;
 }

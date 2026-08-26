@@ -400,6 +400,8 @@ uint32_t bytes_per_texel(PixelFormat format) {
     case PixelFormat::RGBA8Unorm: return 4;
     case PixelFormat::R32Float: return 4;
     case PixelFormat::Depth32Float: return 4;
+    case PixelFormat::R16Uint: return 2;
+    case PixelFormat::R32Uint: return 4;
   }
   return 0;
 }
@@ -474,6 +476,11 @@ bool FacetPool::acquire(const Arena& arena, const CanonicalView& view, FacetKind
   if (!view.valid(error)) return false;
   if (view.format == PixelFormat::Depth32Float && kind != FacetKind::Attachment) {
     if (error) *error = "Depth32Float canonical views may only acquire Attachment facets";
+    return false;
+  }
+  if ((view.format == PixelFormat::R16Uint || view.format == PixelFormat::R32Uint) &&
+      kind != FacetKind::Address) {
+    if (error) *error = "R16Uint/R32Uint canonical views may only acquire Address facets";
     return false;
   }
   const auto* allocation = arena.lookup(PointerRef{view.allocation, view.allocation_generation});

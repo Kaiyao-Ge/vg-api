@@ -546,9 +546,9 @@ int main() {
   {
     VgApi raster_api{};
     raster_api.size = sizeof(raster_api);
-    if (!check(vgGetApi(VG_API_VERSION_1_4, &raster_api) == VG_SUCCESS, "vgGetApi v1.4")) return 1;
-    check(raster_api.version == VG_API_VERSION_1_4, "raster_api.version == v1.4");
-    check(raster_api.size == sizeof(VgApi), "raster_api.size matches the v1.4 table");
+    if (!check(vgGetApi(VG_API_VERSION_1_5, &raster_api) == VG_SUCCESS, "vgGetApi v1.5")) return 1;
+    check(raster_api.version == VG_API_VERSION_1_5, "raster_api.version == v1.5");
+    check(raster_api.size == sizeof(VgApi), "raster_api.size matches the v1.5 table");
 
     VgRuntimeDesc raster_runtime_desc{};
     raster_runtime_desc.header.type = VG_STRUCTURE_RUNTIME_DESC;
@@ -661,6 +661,19 @@ int main() {
               VG_SUCCESS,
           "raster: getAllocationRef vertex buffer");
 
+    VgAllocation raster_index16_allocation = nullptr;
+    VgAllocation raster_index32_allocation = nullptr;
+    check(raster_api.arenaAllocate(raster_arena, 6 * sizeof(uint16_t), &raster_index16_allocation) == VG_SUCCESS,
+          "raster: arenaAllocate u16 index buffer");
+    check(raster_api.arenaAllocate(raster_arena, 6 * sizeof(uint32_t), &raster_index32_allocation) == VG_SUCCESS,
+          "raster: arenaAllocate u32 index buffer");
+    uint64_t raster_index16_id = 0, raster_index32_id = 0;
+    uint32_t raster_index16_gen = 0, raster_index32_gen = 0;
+    check(raster_api.getAllocationRef(raster_index16_allocation, &raster_index16_id, &raster_index16_gen) == VG_SUCCESS,
+          "raster: getAllocationRef u16 index buffer");
+    check(raster_api.getAllocationRef(raster_index32_allocation, &raster_index32_id, &raster_index32_gen) == VG_SUCCESS,
+          "raster: getAllocationRef u32 index buffer");
+
     // acquireFacet (the new v1.3 entry point): source is Sample-kind, target
     // is Attachment-kind, the vertex buffer is Address-kind -- mirroring
     // run_task_graph_raster_user_shader's internal-API precedent
@@ -727,6 +740,30 @@ int main() {
     check(raster_api.acquireFacet(raster_device, raster_arena, &raster_vertex_view, VG_FACET_KIND_ADDRESS,
                                    &raster_vertex_facet) == VG_SUCCESS,
           "raster: acquireFacet vertex buffer");
+
+    VgCanonicalViewDesc raster_index16_view = raster_vertex_view;
+    raster_index16_view.allocation = raster_index16_id;
+    raster_index16_view.allocation_generation = raster_index16_gen;
+    raster_index16_view.format = VG_PIXEL_FORMAT_R16_UINT;
+    raster_index16_view.width = 6;
+    VgCanonicalViewDesc raster_index32_view = raster_index16_view;
+    raster_index32_view.allocation = raster_index32_id;
+    raster_index32_view.allocation_generation = raster_index32_gen;
+    raster_index32_view.format = VG_PIXEL_FORMAT_R32_UINT;
+    VgFacetRef raster_index16_facet{}, raster_index32_facet{};
+    check(raster_api.acquireFacet(raster_device, raster_arena, &raster_index16_view, VG_FACET_KIND_ADDRESS,
+                                  &raster_index16_facet) == VG_SUCCESS,
+          "raster: acquireFacet u16 index Address");
+    check(raster_api.acquireFacet(raster_device, raster_arena, &raster_index32_view, VG_FACET_KIND_ADDRESS,
+                                  &raster_index32_facet) == VG_SUCCESS,
+          "raster: acquireFacet u32 index Address");
+    VgFacetRef rejected_index_facet{};
+    check(raster_api.acquireFacet(raster_device, raster_arena, &raster_index16_view, VG_FACET_KIND_SAMPLE,
+                                  &rejected_index_facet) == VG_ERROR_INVALID_ARGUMENT,
+          "raster: R16Uint rejects Sample facet");
+    check(raster_api.acquireFacet(raster_device, raster_arena, &raster_index32_view, VG_FACET_KIND_ATTACHMENT,
+                                  &rejected_index_facet) == VG_ERROR_INVALID_ARGUMENT,
+          "raster: R32Uint rejects Attachment facet");
 
     // A restricted-import MSL raster shader, structurally matching the fixed
     // binding contract the encoder unconditionally uses -- buffer/texture/
@@ -869,6 +906,8 @@ int main() {
     raster_task.raster_facets.source = raster_source_facet;
     raster_task.raster_facets.target = raster_target_facet;
     raster_task.vertex_buffer_ref = raster_vertex_facet;
+    raster_task.index_buffer_ref = raster_index16_facet;
+    raster_task.index_count = 6;
     raster_task.raster_filter = VG_FILTER_BILINEAR;
     raster_task.raster_wrap = VG_WRAP_CLAMP;
     raster_task.raster_tint[0] = 1.0f;
@@ -1197,6 +1236,17 @@ int main() {
     check(v14_api.version == VG_API_VERSION_1_4, "v1.4 api.version");
     check(v14_api.size == sizeof(VgApi), "v1.4 api.size == sizeof(VgApi)");
     check(v14_api.taskGraphAppendV2 != nullptr, "v1.4 taskGraphAppendV2 is populated");
+  }
+
+  // F5 activates indexed raster through the existing V2 record and API-table
+  // member. v1.5 therefore negotiates the same table boundary as v1.4.
+  {
+    VgApi v15_api{};
+    v15_api.size = sizeof(v15_api);
+    check(vgGetApi(VG_API_VERSION_1_5, &v15_api) == VG_SUCCESS, "vgGetApi v1.5");
+    check(v15_api.version == VG_API_VERSION_1_5, "v1.5 api.version");
+    check(v15_api.size == sizeof(VgApi), "v1.5 api.size == sizeof(VgApi)");
+    check(v15_api.taskGraphAppendV2 != nullptr, "v1.5 reuses taskGraphAppendV2");
   }
 
   return g_ok ? 0 : 1;

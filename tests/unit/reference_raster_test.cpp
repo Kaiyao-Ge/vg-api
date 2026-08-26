@@ -775,16 +775,19 @@ int main() {
     assert(task_result.contents_defined == oracle.contents_defined);
     for (size_t i = 0; i < oracle.resolved_rgba.size(); ++i) assert(exact_match(task_result.resolved_rgba[i], oracle.resolved_rgba[i]));
 
-    // Second sub-case: an indexed raster draw is deferred to F5 and must be
-    // rejected at compile() time. TaskGraph::validate_execution() -- run
-    // ahead of the index_count check inside compile() -- only requires the
-    // graph to be sealed/published with non-zero node/root generation; it
-    // never inspects FacetRef contents, so an otherwise-default TaskRecord
-    // (node_generation/root_generation both default to 1) already reaches
-    // that rejection.
-    vg::core::TaskRecord indexed_task{};
-    indexed_task.kind = vg::core::TaskKind::Raster;
-    indexed_task.index_count = 3;
+    // F5: a u16 Address facet selects indexed draw without a public vertex
+    // descriptor. Reordering the quad indices exercises vertex-id indirection
+    // while the Reference oracle remains the same raster implementation.
+    const std::array<uint16_t, 6> indices{0, 1, 2, 3, 4, 5};
+    auto& index_alloc = arena.allocate(sizeof(indices));
+    std::memcpy(index_alloc.bytes.data(), indices.data(), sizeof(indices));
+    auto index_view = plain_view(index_alloc.id, {.width = static_cast<uint32_t>(indices.size()), .height = 1});
+    index_view.format = vg::core::PixelFormat::R16Uint;
+    vg::core::FacetRef index_ref;
+    assert(device->facet_pool().acquire(arena, index_view, vg::core::FacetKind::Address, &index_ref, &error));
+    vg::core::TaskRecord indexed_task = raster_task;
+    indexed_task.index_buffer_ref = index_ref;
+    indexed_task.index_count = static_cast<uint32_t>(indices.size());
     vg::core::TaskGraphBuilder indexed_builder;
     assert(indexed_builder.append(indexed_task));
     vg::core::TaskGraph indexed_graph;
@@ -798,8 +801,48 @@ int main() {
     indexed_plan.graph_epoch = arena.topology_epoch();
     vg::hal::CompiledPlan indexed_compiled;
     std::string indexed_error;
-    assert(!device->compile(indexed_plan, &indexed_compiled, &indexed_error));
-    assert(indexed_error == "indexed raster draws deferred to F5");
+    assert(device->compile(indexed_plan, &indexed_compiled, &indexed_error));
+    vg::hal::Submission indexed_submission;
+    assert(device->submit(indexed_compiled, arena, &indexed_submission, &indexed_error));
+    assert(indexed_submission.result.ok);
+    assert(indexed_submission.raster_results.size() == 1);
+
+    // The identical stream encoded as u32 takes the other F5 decode path.
+    const std::array<uint32_t, 6> wide_indices{0, 1, 2, 3, 4, 5};
+    auto& wide_index_alloc = arena.allocate(sizeof(wide_indices));
+    std::memcpy(wide_index_alloc.bytes.data(), wide_indices.data(), sizeof(wide_indices));
+    auto wide_index_view = plain_view(wide_index_alloc.id,
+                                      {.width = static_cast<uint32_t>(wide_indices.size()), .height = 1});
+    wide_index_view.format = vg::core::PixelFormat::R32Uint;
+    vg::core::FacetRef wide_index_ref;
+    assert(device->facet_pool().acquire(arena, wide_index_view, vg::core::FacetKind::Address, &wide_index_ref, &error));
+    indexed_task.index_buffer_ref = wide_index_ref;
+    vg::core::TaskGraphBuilder wide_index_builder;
+    assert(wide_index_builder.append(indexed_task));
+    vg::core::TaskGraph wide_index_graph;
+    assert(wide_index_builder.seal(&wide_index_graph) && wide_index_graph.publish());
+    indexed_plan.task_graph = wide_index_graph;
+    indexed_plan.graph_epoch = arena.topology_epoch();
+    vg::hal::CompiledPlan wide_index_compiled;
+    assert(device->compile(indexed_plan, &wide_index_compiled, &indexed_error));
+    vg::hal::Submission wide_index_submission;
+    assert(device->submit(wide_index_compiled, arena, &wide_index_submission, &indexed_error));
+    assert(wide_index_submission.result.ok && wide_index_submission.raster_results.size() == 1);
+
+    // Malformed counts are rejected as TriangleList input rather than being
+    // truncated to a partial primitive.
+    indexed_task.index_count = 4;
+    vg::core::TaskGraphBuilder malformed_index_builder;
+    assert(malformed_index_builder.append(indexed_task));
+    vg::core::TaskGraph malformed_index_graph;
+    assert(malformed_index_builder.seal(&malformed_index_graph) && malformed_index_graph.publish());
+    indexed_plan.task_graph = malformed_index_graph;
+    indexed_plan.graph_epoch = arena.topology_epoch();
+    vg::hal::CompiledPlan malformed_index_compiled;
+    assert(device->compile(indexed_plan, &malformed_index_compiled, &indexed_error));
+    vg::hal::Submission malformed_index_submission;
+    assert(device->submit(malformed_index_compiled, arena, &malformed_index_submission, &indexed_error));
+    assert(!malformed_index_submission.result.ok);
   }
 
   // --- F3 (ADR-043 Decision #4): a restricted-import "vg.msl.raster/v1"

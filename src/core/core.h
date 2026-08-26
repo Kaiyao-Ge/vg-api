@@ -163,7 +163,7 @@ enum class FacetKind : uint32_t { Address, Sample, Storage, Attachment, Transfer
 
 // Format/dimension inputs that Metal Sample/Storage/Attachment facets need
 // (06-backend-macos-metal.md §6.1–6.3). Extend only when a real path requires it.
-enum class PixelFormat : uint32_t { RGBA8Unorm, R32Float, Depth32Float };
+enum class PixelFormat : uint32_t { RGBA8Unorm, R32Float, Depth32Float, R16Uint, R32Uint };
 enum class ViewDimension : uint32_t { Texture2D, Texture2DArray };
 
 // Both formats this milestone models are 4 bytes wide, but the two reach that
@@ -448,8 +448,9 @@ struct TaskRecord {
   // (Allocation::bytes.size() / sizeof(RasterVertex)), not stored here.
   FacetRef vertex_buffer_ref{};
   FacetRef index_buffer_ref{};
-  // >0 signals an indexed draw is requested. F2 rejects this at compile()
-  // time (Unsupported) -- real indexed draws land in F5.
+  // >0 selects F5 indexed TriangleList draw. index_buffer_ref must name an
+  // Address facet over R16Uint or R32Uint; that format supplies the element
+  // type without extending this frozen task layout.
   uint32_t index_count{};
   FilterMode raster_filter{FilterMode::Bilinear};
   WrapMode raster_wrap{WrapMode::Clamp};

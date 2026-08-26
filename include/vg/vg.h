@@ -173,6 +173,10 @@ enum {
     VG_PIXEL_FORMAT_RGBA8_UNORM = 0u,
     VG_PIXEL_FORMAT_R32_FLOAT = 1u,
     VG_PIXEL_FORMAT_DEPTH32_FLOAT = 2u,
+    /* v1.5 (F5): index-buffer element formats. These formats may acquire
+     * Address facets only; they are not texture or attachment formats. */
+    VG_PIXEL_FORMAT_R16_UINT = 3u,
+    VG_PIXEL_FORMAT_R32_UINT = 4u,
     VG_VIEW_DIMENSION_TEXTURE_2D = 0u,
     VG_VIEW_DIMENSION_TEXTURE_2D_ARRAY = 1u,
     VG_SWIZZLE_RED = 0u,

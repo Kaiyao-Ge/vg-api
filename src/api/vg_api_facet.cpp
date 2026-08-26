@@ -36,7 +36,7 @@ VgResult VG_CALL acquire_facet(VgDevice device, VgArena arena, const VgCanonical
   // ordinals 1:1 (see the v1.3 additions comment in vg.h), so no translation
   // table is needed -- but an out-of-range ordinal must be rejected here
   // rather than cast into an enum value that doesn't exist.
-  if (view->format > static_cast<uint32_t>(vg::core::PixelFormat::Depth32Float) ||
+  if (view->format > static_cast<uint32_t>(vg::core::PixelFormat::R32Uint) ||
       view->dimension > static_cast<uint32_t>(vg::core::ViewDimension::Texture2DArray) ||
       view->swizzle_red > static_cast<uint32_t>(vg::core::Swizzle::One) ||
       view->swizzle_green > static_cast<uint32_t>(vg::core::Swizzle::One) ||

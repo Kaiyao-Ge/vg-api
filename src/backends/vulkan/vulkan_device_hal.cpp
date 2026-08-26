@@ -2150,8 +2150,8 @@ bool DeviceHal::compile(const vg::hal::ExecutionPlan& plan,
   // §7). Without this check a Raster-kind task would fall through this
   // file's task-graph publication path -- pack_task_record/unpack_task_record
   // above never read task.kind -- and be silently republished as a default
-  // x=y=z=1 compute dispatch. Rejected here instead, the same way reference/
-  // Metal reject index_count > 0 (START.md §4, invariant 10: "任何无法在当前
+  // x=y=z=1 compute dispatch. Rejected here for every raster shape, including
+  // F5 indexed draws (START.md §4, invariant 10: "任何无法在当前
   // 硬件表达的语义必须返回 Unsupported...不允许静默伪装").
   for (const auto& task : plan.task_graph.tasks()) {
     if (task.kind == vg::core::TaskKind::Raster) {
