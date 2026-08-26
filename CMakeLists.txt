@@ -189,6 +189,9 @@ if(BUILD_TESTING)
   target_link_libraries(vg_c_abi_conformance_test PRIVATE vg_api)
   target_compile_features(vg_c_abi_conformance_test PRIVATE cxx_std_17)
   add_test(NAME api.c-abi-conformance COMMAND vg_c_abi_conformance_test)
+  add_executable(vg_f7_checkpoint_a_test tests/api/vg_f7_checkpoint_a.c)
+  target_link_libraries(vg_f7_checkpoint_a_test PRIVATE vg_api)
+  add_test(NAME api.f7-checkpoint-a-c COMMAND vg_f7_checkpoint_a_test)
 
   if(VG_ENABLE_METAL)
     # Reruns E002 (ADR-028/TASK-B15 typed pointer graph) through the public

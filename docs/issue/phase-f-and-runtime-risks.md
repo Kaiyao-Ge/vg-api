@@ -223,3 +223,27 @@ Metal 的负向矩阵覆盖。
 - 不支持旧 `VgTaskRecord` 头文件/二进制与新 `libvg` 的混用；发布与示例应显式要求重编译。
 - 不以移除 effect/happens-before 验证或隐式降级来换取 `submit`/`seal` 的性能。
 - 任何候选方案应补充 ADR、跨后端 conformance、负向测试与可重复的性能证据。
+
+## 6. F7 content epoch 的 compute-to-texture freshness 覆盖
+
+### 现状
+
+F7 为 allocation 引入独立于 representation epoch 的 content epoch。公共 host write、
+Metal raster 的 color/depth 回写，以及 Metal linear/indexed/effect-DAG compute 的实际 write
+都会推进它；Metal 的 cached facet texture 记录自身镜像 epoch，不匹配时重新上传 canonical
+bytes。因此 host I/O、buffer compute 输出和缓存 texture 不再共享一个可能陈旧的内容版本。
+
+纯 C Checkpoint A 已证明 public upload → raster submit → public readback 的端到端路径，也有
+Metal 与 Reference 回归。但尚无一条单独的实机回归把 **compute 写 allocation**、随后把同一
+allocation 作为 Sample facet texture 读取并验证新像素的链路固定下来。
+
+### 潜在影响
+
+未来重构 compute commit 或 facet cache key 时，可能遗漏 content epoch 传播；此时 API readback
+仍可能正确，但下一次纹理采样会复用 compute 前的 cached texture，形成跨资源类型的陈旧读取。
+
+### 需要后续回答的问题
+
+- 是否在 F6 SceneRoot/material texture 使用前补一条 Metal compute→SampleFacet→raster 的
+  content-epoch freshness conformance？
+- 该测试应使用线性、indexed binding 还是 effect-DAG compute，或三者都覆盖？

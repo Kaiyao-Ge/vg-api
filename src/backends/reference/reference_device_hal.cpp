@@ -336,6 +336,21 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
                                           .count();
           return true;
         }
+        // raster_triangles writes canonical bytes directly; publish the same
+        // content transition Metal commits after its command buffer completes.
+        core::FacetStatus write_status = core::FacetStatus::Ok;
+        if (const auto* target_slot = facet_pool().lookup(arena, task.raster_facets.target, &write_status)) {
+          if (auto* target = arena.lookup(core::PointerRef{target_slot->view.allocation,
+                                                           target_slot->view.allocation_generation}))
+            arena.mark_content_modified(*target);
+        }
+        if (task.depth_attachment_ref.index != 0 || task.depth_attachment_ref.generation != 0) {
+          if (const auto* depth_slot = facet_pool().lookup(arena, task.depth_attachment_ref, &write_status)) {
+            if (auto* depth = arena.lookup(core::PointerRef{depth_slot->view.allocation,
+                                                            depth_slot->view.allocation_generation}))
+              arena.mark_content_modified(*depth);
+          }
+        }
         hal::RasterTaskResult task_result;
         task_result.task_index = task_index;
         task_result.resolved_rgba = raster_result.resolved_rgba;

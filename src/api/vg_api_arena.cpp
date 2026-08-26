@@ -2,6 +2,7 @@
 #include "api/vg_api_handle_registry.h"
 
 #include <atomic>
+#include <limits>
 #include <memory>
 
 namespace vg_api {
@@ -75,8 +76,17 @@ VgResult VG_CALL arena_allocate(VgArena arena, uint64_t size, VgAllocation* out_
     set_diagnostic("output allocation handle is required");
     return VG_ERROR_INVALID_ARGUMENT;
   }
-  vg::core::Allocation& allocation = arena->arena.allocate(size);
-  *out_allocation = reinterpret_cast<VgAllocation>(&allocation);
+  if (size > std::numeric_limits<size_t>::max() || size > std::vector<uint8_t>().max_size()) {
+    set_diagnostic("allocation size is not representable on this host");
+    return VG_ERROR_INVALID_ARGUMENT;
+  }
+  try {
+    vg::core::Allocation& allocation = arena->arena.allocate(size);
+    *out_allocation = reinterpret_cast<VgAllocation>(&allocation);
+  } catch (const std::bad_alloc&) {
+    set_diagnostic("allocation failed");
+    return VG_ERROR_OUT_OF_HOST_MEMORY;
+  }
   return VG_SUCCESS;
 }
 
@@ -88,6 +98,30 @@ VgResult VG_CALL get_allocation_ref(VgAllocation allocation, uint64_t* out_id, u
   const auto* real = reinterpret_cast<const vg::core::Allocation*>(allocation);
   *out_id = real->id;
   *out_generation = real->generation;
+  return VG_SUCCESS;
+}
+
+VgResult VG_CALL write_allocation(VgArena arena, VgAllocation allocation, uint64_t byte_offset,
+                                  const void* source, uint64_t byte_size) {
+  if (!g_arenas.contains(arena)) { set_diagnostic("arena handle is stale or invalid"); return VG_ERROR_STALE_HANDLE; }
+  auto* real = reinterpret_cast<vg::core::Allocation*>(allocation);
+  std::string error;
+  if (!arena->arena.copy_into(real, byte_offset, source, byte_size, &error)) {
+    set_diagnostic(error.c_str());
+    return arena->arena.is_live_allocation(real) ? VG_ERROR_INVALID_ARGUMENT : VG_ERROR_STALE_HANDLE;
+  }
+  return VG_SUCCESS;
+}
+
+VgResult VG_CALL read_allocation(VgArena arena, VgAllocation allocation, uint64_t byte_offset,
+                                 void* destination, uint64_t byte_size) {
+  if (!g_arenas.contains(arena)) { set_diagnostic("arena handle is stale or invalid"); return VG_ERROR_STALE_HANDLE; }
+  const auto* real = reinterpret_cast<const vg::core::Allocation*>(allocation);
+  std::string error;
+  if (!arena->arena.copy_out(real, byte_offset, destination, byte_size, &error)) {
+    set_diagnostic(error.c_str());
+    return arena->arena.is_live_allocation(real) ? VG_ERROR_INVALID_ARGUMENT : VG_ERROR_STALE_HANDLE;
+  }
   return VG_SUCCESS;
 }
 

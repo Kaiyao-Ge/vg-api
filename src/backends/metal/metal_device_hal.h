@@ -350,7 +350,7 @@ class DeviceHal final : public hal::DeviceHal {
   // F4 adds a single Depth32Float attachment with clear=1.0/store and Metal's
   // eight compare operations. Stencil, blending, face culling and perspective
   // divide remain out of scope.
-  bool run_raster_triangles(const core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
+  bool run_raster_triangles(core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
                            const RasterDesc& desc,
                            const std::vector<RasterVertex>& vertices, RasterResult* result,
                            std::string* error = nullptr) const;

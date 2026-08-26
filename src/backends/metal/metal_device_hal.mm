@@ -16,6 +16,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -185,6 +186,7 @@ struct MetalAllocationRecord {
   uint64_t allocation_id{};
   uint32_t generation{};
   size_t byte_size{};
+  uint64_t content_epoch{};
 };
 
 // Keyed by FacetRef index+generation (06 §6.4). Invalidated when the live
@@ -210,6 +212,7 @@ struct MetalFacetRecord {
   uint32_t mip_levels{};
   core::PixelFormat format{};
   core::SwizzleChannels swizzle{};
+  uint64_t content_epoch{};
 };
 
 bool same_swizzle(const core::SwizzleChannels& lhs, const core::SwizzleChannels& rhs) {
@@ -722,11 +725,26 @@ struct DeviceHal::Impl {
     if (it == allocation_map.end()) {
       id<MTLBuffer> buffer = [device newBufferWithLength:needed options:MTLResourceStorageModeShared];
       if (buffer == nil) return nil;
-      MetalAllocationRecord record{buffer, allocation.id, allocation.generation, needed};
+      // Start stale so the common copy below seeds a newly created buffer.
+      MetalAllocationRecord record{buffer, allocation.id, allocation.generation, needed, 0};
       it = allocation_map.emplace(allocation.id, record).first;
     }
-    std::memcpy([it->second.buffer contents], allocation.bytes.data(), allocation.bytes.size());
+    if (it->second.content_epoch != allocation.content_epoch) {
+      std::memcpy([it->second.buffer contents], allocation.bytes.data(), allocation.bytes.size());
+      it->second.content_epoch = allocation.content_epoch;
+    }
     return it->second.buffer;
+  }
+
+  // Commit a completed GPU buffer write to the canonical F7 byte store and
+  // stamp the retained Shared mirror at the same content revision.
+  void commit_buffer_write(core::Allocation& allocation, id<MTLBuffer> buffer) {
+    if (buffer == nil || allocation.bytes.empty()) return;
+    std::memcpy(allocation.bytes.data(), [buffer contents], allocation.bytes.size());
+    ++allocation.content_epoch;
+    auto it = allocation_map.find(allocation.id);
+    if (it != allocation_map.end() && it->second.generation == allocation.generation)
+      it->second.content_epoch = allocation.content_epoch;
   }
 
 
@@ -942,6 +960,12 @@ struct DeviceHal::Impl {
         it->second.kind == slot->kind && same_shape(it->second, view) &&
         it->second.facet_index == ref.index &&
         it->second.facet_generation == ref.generation) {
+      // A host write changes bytes, not the facet contract. Refresh the
+      // existing Shared texture rather than invalidating the capability.
+      if (!allocation->bytes.empty() && it->second.content_epoch != allocation->content_epoch) {
+        upload_view_subresources(it->second.storage_texture, view, *allocation);
+        it->second.content_epoch = allocation->content_epoch;
+      }
       if (cache_hit) *cache_hit = true;
       if (out_storage) *out_storage = it->second.storage_texture;
       return it->second.texture;
@@ -977,6 +1001,8 @@ struct DeviceHal::Impl {
     id<MTLTexture> shader_texture = install_facet_record(ref, view, slot->kind, slot->representation_epoch,
                                                          storage_texture, error);
     if (shader_texture == nil) return nil;
+    auto fresh = facet_map.find(key);
+    if (fresh != facet_map.end()) fresh->second.content_epoch = allocation->content_epoch;
     if (cache_hit) *cache_hit = false;
     if (out_storage) *out_storage = storage_texture;
     return shader_texture;
@@ -1809,7 +1835,7 @@ struct DeviceHal::Impl {
   // pipeline / draw / readback code as the original hardware-verified path.
   // `vertex_count` stands in for `vertices.size()` since the caller-supplied
   // MTLBuffer alone carries no length.
-  bool run_raster_pass(const core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
+  bool run_raster_pass(core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
                        const RasterDesc& desc, id<MTLBuffer> vertex_buffer, id<MTLBuffer> tint_buffer,
                        uint32_t vertex_count, id<MTLBuffer> index_buffer, MTLIndexType index_type,
                        uint32_t index_count, RasterResult* result, std::string* error,
@@ -2049,6 +2075,37 @@ struct DeviceHal::Impl {
                                height, &depth_rgba, error)) return false;
       result->resolved_depth.reserve(depth_rgba.size());
       for (const auto& value : depth_rgba) result->resolved_depth.push_back(value[0]);
+    }
+
+    // F7 makes the canonical Arena bytes the public readback source. Commit
+    // the completed GPU attachment(s) there before submit returns; cached
+    // textures are then stamped with the same content epoch so a later use
+    // does not upload stale pre-draw bytes over the result.
+    auto commit_rgba = [&](core::FacetRef ref, const core::CanonicalView& view,
+                           const std::vector<std::array<float, 4>>& pixels) {
+      auto* allocation = arena.lookup(core::PointerRef{view.allocation, view.allocation_generation});
+      if (allocation == nullptr || view.format != core::PixelFormat::RGBA8Unorm) return;
+      const uint64_t base = view.subresource_byte_offset({desc.attachment.subresource.layer, level});
+      for (size_t i = 0; i < pixels.size(); ++i) {
+        uint8_t* out = allocation->bytes.data() + base + i * 4;
+        for (size_t c = 0; c < 4; ++c)
+          out[c] = static_cast<uint8_t>(std::clamp(pixels[i][c], 0.0f, 1.0f) * 255.0f + 0.5f);
+      }
+      arena.mark_content_modified(*allocation);
+      auto record = facet_map.find(facet_cache_key(ref));
+      if (record != facet_map.end()) record->second.content_epoch = allocation->content_epoch;
+    };
+    commit_rgba(facets.target, target_view, result->resolved_rgba);
+    if (has_depth) {
+      auto* allocation = arena.lookup(core::PointerRef{depth_view->allocation, depth_view->allocation_generation});
+      if (allocation != nullptr) {
+        const uint64_t base = depth_view->subresource_byte_offset({desc.attachment.subresource.layer, level});
+        for (size_t i = 0; i < result->resolved_depth.size(); ++i)
+          std::memcpy(allocation->bytes.data() + base + i * sizeof(float), &result->resolved_depth[i], sizeof(float));
+        arena.mark_content_modified(*allocation);
+        auto record = facet_map.find(facet_cache_key(desc.depth_attachment_ref));
+        if (record != facet_map.end()) record->second.content_epoch = allocation->content_epoch;
+      }
     }
 
     result->width = width;
@@ -2958,9 +3015,15 @@ struct DeviceHal::SubmitOps {
       return Flow::Finish;
     }
     submission->timeline_value = metal.impl_->timeline_event != nil ? metal.impl_->timeline_event.signaledValue : 0;
-    for (const auto& entry : touched_by_id) {
-      id<MTLBuffer> buffer = buffer_by_allocation_id[entry.first];
-      std::memcpy(entry.second->bytes.data(), [buffer contents], entry.second->bytes.size());
+    std::set<uint64_t> written_allocations;
+    for (const auto& pass_module : compiled.plan.effect_dag_passes)
+      for (const auto& instruction : pass_module.instructions)
+        if (ir::access_from_op(instruction.op, ir::Access::Publish) != ir::Access::Read)
+          written_allocations.insert(instruction.allocation);
+    for (uint64_t id : written_allocations) {
+      auto allocation = touched_by_id.find(id);
+      if (allocation != touched_by_id.end())
+        metal.impl_->commit_buffer_write(*allocation->second, buffer_by_allocation_id[id]);
     }
     uint32_t witness_index = 0;
     for (const auto& pass_module : compiled.plan.effect_dag_passes) {
@@ -3006,8 +3069,12 @@ struct DeviceHal::SubmitOps {
       return Flow::Finish;
     }
     submission->timeline_value = metal.impl_->timeline_event != nil ? metal.impl_->timeline_event.signaledValue : 0;
+    std::set<uint64_t> written_allocations;
+    for (const auto& instruction : compiled.plan.module.instructions)
+      if (instruction.op != "load") written_allocations.insert(instruction.allocation);
     for (size_t index = 0; index < touched.size(); ++index)
-      std::memcpy(touched[index]->bytes.data(), [object_buffers[index] contents], touched[index]->bytes.size());
+      if (written_allocations.contains(touched[index]->id))
+        metal.impl_->commit_buffer_write(*touched[index], object_buffers[index]);
     for (size_t index = 0; index < compiled.plan.module.instructions.size(); ++index) {
       const auto& instruction = compiled.plan.module.instructions[index];
       const ir::Access access = instruction.op == "load" ? ir::Access::Read : ir::Access::Write;
@@ -3172,8 +3239,13 @@ struct DeviceHal::SubmitOps {
       return true;
     }
     submission->timeline_value = metal.impl_->timeline_event != nil ? metal.impl_->timeline_event.signaledValue : 0;
+    std::set<uint64_t> written_allocations;
+    for (const auto& instruction : compiled.plan.module.instructions)
+      if (ir::access_from_op(instruction.op, ir::Access::Publish) != ir::Access::Read)
+        written_allocations.insert(instruction.allocation);
     for (size_t index = 0; index < touched.size(); ++index)
-      std::memcpy(touched[index]->bytes.data(), [buffers[index] contents], touched[index]->bytes.size());
+      if (written_allocations.contains(touched[index]->id))
+        metal.impl_->commit_buffer_write(*touched[index], buffers[index]);
     for (size_t index = 0; index < compiled.plan.module.instructions.size(); ++index) {
       const auto& instruction = compiled.plan.module.instructions[index];
       const ir::Access access = ir::access_from_op(instruction.op, ir::Access::Publish);
@@ -3917,7 +3989,7 @@ bool DeviceHal::run_representation_transform(core::Arena& arena, core::FacetPool
   return true;
 }
 
-bool DeviceHal::run_raster_triangles(const core::Arena& arena, core::FacetPool& pool,
+bool DeviceHal::run_raster_triangles(core::Arena& arena, core::FacetPool& pool,
                                      core::RasterFacetPair facets,
                                      const RasterDesc& desc, const std::vector<RasterVertex>& vertices,
                                      RasterResult* result, std::string* error) const {

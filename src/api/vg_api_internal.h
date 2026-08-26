@@ -148,6 +148,10 @@ VgResult VG_CALL create_arena(VgDevice device, const VgArenaDesc* desc, VgArena*
 void VG_CALL destroy_arena(VgArena arena);
 VgResult VG_CALL arena_allocate(VgArena arena, uint64_t size, VgAllocation* out_allocation);
 VgResult VG_CALL get_allocation_ref(VgAllocation allocation, uint64_t* out_id, uint32_t* out_generation);
+VgResult VG_CALL write_allocation(VgArena arena, VgAllocation allocation, uint64_t byte_offset,
+                                  const void* source, uint64_t byte_size);
+VgResult VG_CALL read_allocation(VgArena arena, VgAllocation allocation, uint64_t byte_offset,
+                                 void* destination, uint64_t byte_size);
 
 VgResult VG_CALL load_code_object(VgDevice device, const VgCodeObjectDesc* desc,
                                    VgCodeObject* out_code_object);

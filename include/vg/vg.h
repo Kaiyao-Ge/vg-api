@@ -538,6 +538,12 @@ typedef struct VgApi {
      * preserves VgTaskRecord's v1.3 raw-array stride. ---- */
     VgResult (VG_CALL *taskGraphAppendV2)(VgTaskGraphBuilder builder, const VgTaskRecordV2* tasks,
                                            uint32_t task_count, VgTaskId* out_ids);
+    /* ---- v1.6 (F7/ADR-051). Copy bytes to/from a live allocation owned by
+     * `arena`.  These are synchronous copies, not persistent mappings. ---- */
+    VgResult (VG_CALL *writeAllocation)(VgArena arena, VgAllocation allocation,
+                                         uint64_t byte_offset, const void* source, uint64_t byte_size);
+    VgResult (VG_CALL *readAllocation)(VgArena arena, VgAllocation allocation,
+                                        uint64_t byte_offset, void* destination, uint64_t byte_size);
 } VgApi;
 
 #define VG_INIT_STRUCT(struct_type, structure_type) \

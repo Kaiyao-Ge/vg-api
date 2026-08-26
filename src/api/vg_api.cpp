@@ -161,22 +161,25 @@ extern "C" VG_API VgResult VG_CALL vgGetApi(uint32_t requested_version, VgApi* o
   const size_t v1_1_size = offsetof(VgApi, getSubmissionExecutionResult);
   const size_t v1_2_size = offsetof(VgApi, acquireFacet);
   const size_t v1_3_size = offsetof(VgApi, taskGraphAppendV2);
+  const size_t v1_4_size = offsetof(VgApi, writeAllocation);
   if (out_api == nullptr ||
       (requested_version != VG_API_VERSION_1_0 && requested_version != VG_API_VERSION_1_1 &&
        requested_version != VG_API_VERSION_1_2 && requested_version != VG_API_VERSION_1_3 &&
-       requested_version != VG_API_VERSION_1_4 && requested_version != VG_API_VERSION_1_5)) {
+       requested_version != VG_API_VERSION_1_4 && requested_version != VG_API_VERSION_1_5 &&
+       requested_version != VG_API_VERSION_1_6)) {
     vg_api::set_diagnostic("requested API version is unsupported");
     return VG_ERROR_INVALID_ARGUMENT;
   }
   const bool at_least_v1_1 = requested_version == VG_API_VERSION_1_1 || requested_version == VG_API_VERSION_1_2 ||
-                              requested_version == VG_API_VERSION_1_3 || requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5;
+                              requested_version == VG_API_VERSION_1_3 || requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6;
   const bool at_least_v1_2 = requested_version == VG_API_VERSION_1_2 || requested_version == VG_API_VERSION_1_3 ||
-                              requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5;
-  const bool at_least_v1_3 = requested_version == VG_API_VERSION_1_3 || requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5;
-  const bool at_least_v1_4 = requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5;
+                              requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6;
+  const bool at_least_v1_3 = requested_version == VG_API_VERSION_1_3 || requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6;
+  const bool at_least_v1_4 = requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6;
+  const bool at_least_v1_6 = requested_version == VG_API_VERSION_1_6;
   const size_t full_size =
-      at_least_v1_4 ? sizeof(VgApi)
-                    : (at_least_v1_3 ? v1_3_size : (at_least_v1_2 ? v1_2_size : (at_least_v1_1 ? v1_1_size : v1_0_size)));
+      at_least_v1_6 ? sizeof(VgApi) : (at_least_v1_4 ? v1_4_size :
+                    (at_least_v1_3 ? v1_3_size : (at_least_v1_2 ? v1_2_size : (at_least_v1_1 ? v1_1_size : v1_0_size))));
   if (out_api->size < full_size) {
     vg_api::set_diagnostic("output API table is too small for the requested version");
     return VG_ERROR_INVALID_ARGUMENT;
@@ -227,6 +230,10 @@ extern "C" VG_API VgResult VG_CALL vgGetApi(uint32_t requested_version, VgApi* o
   }
   if (at_least_v1_4) {
     api.taskGraphAppendV2 = vg_api::task_graph_append_v2;
+  }
+  if (at_least_v1_6) {
+    api.writeAllocation = vg_api::write_allocation;
+    api.readAllocation = vg_api::read_allocation;
   }
   std::memcpy(out_api, &api, full_size);
   return VG_SUCCESS;

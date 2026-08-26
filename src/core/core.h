@@ -30,6 +30,9 @@ struct Allocation {
   uint64_t size{};
   ObjectState state{ObjectState::Active};
   uint32_t representation_epoch{0};
+  // Byte-content revision. Unlike representation_epoch this does not stale
+  // facets: it tells backend mirrors when canonical allocation bytes changed.
+  uint64_t content_epoch{1};
   uint32_t in_flight{};
   // How many representation versions of this allocation are still live. Starts
   // at 1 (the allocation's initial representation); transform() adds one and
@@ -133,6 +136,11 @@ class Arena {
     }
     return false;
   }
+  bool copy_into(Allocation* allocation, uint64_t offset, const void* source, uint64_t size,
+                 std::string* error = nullptr);
+  bool copy_out(const Allocation* allocation, uint64_t offset, void* destination, uint64_t size,
+                std::string* error = nullptr) const;
+  void mark_content_modified(Allocation& allocation) { ++allocation.content_epoch; }
   bool import_allocation(const RepresentationRef& ref, uint64_t size, ObjectState state,
                          const std::vector<uint8_t>& bytes, std::string* error = nullptr);
   [[nodiscard]] uint64_t id() const { return id_; }

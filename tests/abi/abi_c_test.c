@@ -34,6 +34,10 @@ int main(void) {
   VgApi api = {0};
   api.size = sizeof(api);
   if (vgGetApi(VG_API_VERSION_1_0, &api) != VG_SUCCESS || api.createRuntime == NULL) return 3;
+  VgApi io_api = {0};
+  io_api.size = sizeof(io_api);
+  if (vgGetApi(VG_API_VERSION_1_6, &io_api) != VG_SUCCESS ||
+      io_api.writeAllocation == NULL || io_api.readAllocation == NULL) return 10;
 
   VgRuntimeDesc bad = VG_INIT_STRUCT(VgRuntimeDesc, VG_STRUCTURE_RUNTIME_DESC);
   bad.allocate = (VgAllocateFn)log_callback;

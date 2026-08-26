@@ -10,6 +10,27 @@
 
 namespace vg::core {
 
+bool Arena::copy_into(Allocation* allocation, uint64_t offset, const void* source, uint64_t size,
+                      std::string* error) {
+  if (!is_live_allocation(allocation)) { if (error) *error = "allocation is not owned by arena"; return false; }
+  if (size != 0 && source == nullptr) { if (error) *error = "source is required for non-zero write"; return false; }
+  const uint64_t byte_count = allocation->bytes.size();
+  if (offset > byte_count || size > byte_count - offset) { if (error) *error = "allocation write range is out of bounds"; return false; }
+  if (size != 0) std::memcpy(allocation->bytes.data() + offset, source, static_cast<size_t>(size));
+  if (size != 0) mark_content_modified(*allocation);
+  return true;
+}
+
+bool Arena::copy_out(const Allocation* allocation, uint64_t offset, void* destination, uint64_t size,
+                     std::string* error) const {
+  if (!is_live_allocation(allocation)) { if (error) *error = "allocation is not owned by arena"; return false; }
+  if (size != 0 && destination == nullptr) { if (error) *error = "destination is required for non-zero read"; return false; }
+  const uint64_t byte_count = allocation->bytes.size();
+  if (offset > byte_count || size > byte_count - offset) { if (error) *error = "allocation read range is out of bounds"; return false; }
+  if (size != 0) std::memcpy(destination, allocation->bytes.data() + offset, static_cast<size_t>(size));
+  return true;
+}
+
 bool GraphEpoch::contains(PointerRef reference) const {
   return std::ranges::any_of(references_, [&](PointerRef candidate) {
     return candidate.allocation == reference.allocation && candidate.generation == reference.generation;

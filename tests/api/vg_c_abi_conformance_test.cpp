@@ -6,6 +6,8 @@
 #include "vg/vg.h"
 
 #include <cstddef>
+#include <cstring>
+#include <limits>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -101,6 +103,31 @@ int main() {
 
   VgAllocation allocation = nullptr;
   check(api.arenaAllocate(arena, 64, &allocation) == VG_SUCCESS, "arenaAllocate");
+  // F7 is deliberately a copy API over the same Arena allocation model, not
+  // a second upload/readback object family. Exercise its owner/range checks
+  // before the allocation participates in the existing public graph.
+  VgApi io_api{};
+  io_api.size = sizeof(io_api);
+  check(vgGetApi(VG_API_VERSION_1_6, &io_api) == VG_SUCCESS, "vgGetApi v1.6");
+  check(io_api.writeAllocation != nullptr && io_api.readAllocation != nullptr,
+        "v1.6 allocation I/O functions are populated");
+  const uint8_t host_bytes[] = {7, 9, 11, 13};
+  uint8_t copied_bytes[4]{};
+  check(io_api.writeAllocation(arena, allocation, 8, host_bytes, sizeof(host_bytes)) == VG_SUCCESS,
+        "writeAllocation round trip write");
+  check(io_api.readAllocation(arena, allocation, 8, copied_bytes, sizeof(copied_bytes)) == VG_SUCCESS &&
+            std::memcmp(host_bytes, copied_bytes, sizeof(host_bytes)) == 0,
+        "readAllocation round trip read");
+  check(io_api.writeAllocation(arena, allocation, 63, host_bytes, sizeof(host_bytes)) == VG_ERROR_INVALID_ARGUMENT,
+        "writeAllocation rejects out-of-range write");
+  check(io_api.readAllocation(arena, allocation, 0, nullptr, 1) == VG_ERROR_INVALID_ARGUMENT,
+        "readAllocation rejects null destination");
+  check(io_api.writeAllocation(arena, allocation, std::numeric_limits<uint64_t>::max(), host_bytes, 1) ==
+            VG_ERROR_INVALID_ARGUMENT,
+        "writeAllocation rejects uint64 overflow offset");
+  VgAllocation impossible_allocation = nullptr;
+  check(io_api.arenaAllocate(arena, std::numeric_limits<uint64_t>::max(), &impossible_allocation) != VG_SUCCESS,
+        "arenaAllocate rejects unrepresentable size");
   uint64_t allocation_id = 0;
   uint32_t allocation_generation = 0;
   check(api.getAllocationRef(allocation, &allocation_id, &allocation_generation) == VG_SUCCESS, "getAllocationRef");
@@ -546,9 +573,9 @@ int main() {
   {
     VgApi raster_api{};
     raster_api.size = sizeof(raster_api);
-    if (!check(vgGetApi(VG_API_VERSION_1_5, &raster_api) == VG_SUCCESS, "vgGetApi v1.5")) return 1;
-    check(raster_api.version == VG_API_VERSION_1_5, "raster_api.version == v1.5");
-    check(raster_api.size == sizeof(VgApi), "raster_api.size matches the v1.5 table");
+    if (!check(vgGetApi(VG_API_VERSION_1_6, &raster_api) == VG_SUCCESS, "vgGetApi v1.6")) return 1;
+    check(raster_api.version == VG_API_VERSION_1_6, "raster_api.version == v1.6");
+    check(raster_api.size == sizeof(VgApi), "raster_api.size matches the v1.6 table");
 
     VgRuntimeDesc raster_runtime_desc{};
     raster_runtime_desc.header.type = VG_STRUCTURE_RUNTIME_DESC;
@@ -673,6 +700,29 @@ int main() {
           "raster: getAllocationRef u16 index buffer");
     check(raster_api.getAllocationRef(raster_index32_allocation, &raster_index32_id, &raster_index32_gen) == VG_SUCCESS,
           "raster: getAllocationRef u32 index buffer");
+
+    // Checkpoint A: this translation unit includes only vg/vg.h, yet uploads
+    // pixels/vertices/indices, submits an offscreen triangle-list, then reads
+    // the color attachment through the public ABI.
+    std::vector<uint8_t> uploaded_source(kRasterTexelBytes, 0);
+    for (size_t texel = 0; texel < uploaded_source.size(); texel += 4) {
+      uploaded_source[texel] = 255;
+      uploaded_source[texel + 3] = 255;
+    }
+    const float uploaded_vertices[] = {
+        -1.f, -1.f, .5f, 0.f, 1.f,  1.f, -1.f, .5f, 1.f, 1.f,
+        -1.f,  1.f, .5f, 0.f, 0.f,  1.f,  1.f, .5f, 1.f, 0.f,
+    };
+    const uint16_t uploaded_indices[] = {0, 1, 2, 2, 1, 3};
+    check(raster_api.writeAllocation(raster_arena, raster_source_allocation, 0,
+                                     uploaded_source.data(), uploaded_source.size()) == VG_SUCCESS,
+          "checkpoint-a: upload source pixels");
+    check(raster_api.writeAllocation(raster_arena, raster_vertex_allocation, 0,
+                                     uploaded_vertices, sizeof(uploaded_vertices)) == VG_SUCCESS,
+          "checkpoint-a: upload vertices");
+    check(raster_api.writeAllocation(raster_arena, raster_index16_allocation, 0,
+                                     uploaded_indices, sizeof(uploaded_indices)) == VG_SUCCESS,
+          "checkpoint-a: upload indices");
 
     // acquireFacet (the new v1.3 entry point): source is Sample-kind, target
     // is Attachment-kind, the vertex buffer is Address-kind -- mirroring
@@ -799,9 +849,8 @@ int main() {
              "[[texture(0)]],\n"
              "                                             sampler samp [[sampler(0)]],\n"
              "                                             constant float4& tint [[buffer(0)]]) {\n"
-             "  (void)tex; (void)samp; (void)tint;\n"
              "  VgRasterFragment result;\n"
-             "  result.color = float4(0.0f, 1.0f, 0.0f, 1.0f);\n"
+             "  result.color = tex.sample(samp, varyings.uv) * tint;\n"
              "  return result;\n"
              "}\n";
     };
@@ -959,6 +1008,13 @@ int main() {
     // 0/1 (core.cpp), not a JSON boolean literal.
     check(raster_result_str.find("\"ok\":1") != std::string::npos,
           "raster: well-formed MSL submission execution result reports ok:1 (true)");
+    std::vector<uint8_t> checkpoint_pixels(kRasterTexelBytes);
+    check(raster_api.readAllocation(raster_arena, raster_target_allocation, 0,
+                                    checkpoint_pixels.data(), checkpoint_pixels.size()) == VG_SUCCESS &&
+              checkpoint_pixels[(kRasterExtent + 1) * 4] == 255 &&
+              checkpoint_pixels[(kRasterExtent + 1) * 4 + 1] == 0 &&
+              checkpoint_pixels[(kRasterExtent + 1) * 4 + 3] == 255,
+          "checkpoint-a: public readback observes uploaded offscreen texture pixel");
 
     raster_api.destroySubmission(raster_submission);
     raster_api.destroyTimeline(raster_timeline);
@@ -1234,7 +1290,7 @@ int main() {
     v14_api.size = sizeof(v14_api);
     check(vgGetApi(VG_API_VERSION_1_4, &v14_api) == VG_SUCCESS, "vgGetApi v1.4");
     check(v14_api.version == VG_API_VERSION_1_4, "v1.4 api.version");
-    check(v14_api.size == sizeof(VgApi), "v1.4 api.size == sizeof(VgApi)");
+    check(v14_api.size == offsetof(VgApi, writeAllocation), "v1.4 api.size == v1.6 boundary");
     check(v14_api.taskGraphAppendV2 != nullptr, "v1.4 taskGraphAppendV2 is populated");
   }
 
@@ -1245,7 +1301,7 @@ int main() {
     v15_api.size = sizeof(v15_api);
     check(vgGetApi(VG_API_VERSION_1_5, &v15_api) == VG_SUCCESS, "vgGetApi v1.5");
     check(v15_api.version == VG_API_VERSION_1_5, "v1.5 api.version");
-    check(v15_api.size == sizeof(VgApi), "v1.5 api.size == sizeof(VgApi)");
+    check(v15_api.size == offsetof(VgApi, writeAllocation), "v1.5 api.size == v1.6 boundary");
     check(v15_api.taskGraphAppendV2 != nullptr, "v1.5 reuses taskGraphAppendV2");
   }
 
