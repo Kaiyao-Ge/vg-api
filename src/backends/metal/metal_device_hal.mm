@@ -142,20 +142,24 @@ hal::CapabilitySnapshot make_hal_snapshot(id<MTLDevice> device, DeviceSnapshot* 
   // IndirectTier1 (genuinely optional hardware features), this bit is set
   // unconditionally, matching EffectDag.
   //
-  // Raster, RepresentationTransform and CheckedFacetGeneration join it for the
-  // same reason, and are deliberately *not* probed: each is an obligation this
-  // adapter now meets in software, not an optional hardware feature. Raster is
-  // a real MTLRenderPipelineState draw (06 §1 "render attachment 与基础
-  // raster"), RepresentationTransform is a real linear->Private-optimal blit
-  // that publishes a new epoch (02 §8), and CheckedFacetGeneration is the
-  // in-shader generation guard of 06 §6.4 specialized through an MSL function
-  // constant. A device that could not do one of them would have to leave the
-  // bit clear, but every Metal device this backend runs on can do all three.
+  // Raster, RepresentationTransform, CheckedFacetGeneration and UserShaderImport
+  // join it for the same reason, and are deliberately *not* probed: each is an
+  // obligation this adapter now meets in software, not an optional hardware
+  // feature. Raster is a real MTLRenderPipelineState draw (06 §1 "render
+  // attachment 与基础 raster"), RepresentationTransform is a real
+  // linear->Private-optimal blit that publishes a new epoch (02 §8),
+  // CheckedFacetGeneration is the in-shader generation guard of 06 §6.4
+  // specialized through an MSL function constant, and UserShaderImport is the
+  // restricted-import user MSL raster path (F3, ADR-043 Decision #4) that
+  // compile()/submit()/ensure_raster_pipeline()/run_raster_pass() already
+  // implement. A device that could not do one of them would have to leave the
+  // bit clear, but every Metal device this backend runs on can do all four.
   uint64_t bits = static_cast<uint64_t>(hal::Capability::EffectDag) |
                    static_cast<uint64_t>(hal::Capability::TaskPublication) |
                    static_cast<uint64_t>(hal::Capability::Raster) |
                    static_cast<uint64_t>(hal::Capability::RepresentationTransform) |
-                   static_cast<uint64_t>(hal::Capability::CheckedFacetGeneration);
+                   static_cast<uint64_t>(hal::Capability::CheckedFacetGeneration) |
+                   static_cast<uint64_t>(hal::Capability::UserShaderImport);
   if (shared_events) bits |= static_cast<uint64_t>(hal::Capability::Timeline);
   if (indirect) bits |= static_cast<uint64_t>(hal::Capability::IndirectTier1);
   if (gpu_addresses) bits |= static_cast<uint64_t>(hal::Capability::LinearAddress);
@@ -1533,15 +1537,34 @@ struct DeviceHal::Impl {
   // Real MTLRenderPipelineState for the shared raster pair. Only the attachment
   // format and the sample count reach the key; viewport and tint are dynamic
   // state and shader-visible data respectively, and stay out of it.
+  //
+  // F3 (ADR-043 Decision #4): when `user_shader` is non-null, this builds the
+  // pipeline from the caller's restricted-import MSL text and its declared
+  // entry-point names instead of the built-in `raster_facet_metal_source()`
+  // pair. make_pipeline_key/ensure_library/ensure_function/
+  // acquire_render_pipeline are already content-hash-keyed and source/entry-
+  // name-agnostic, so nothing below them needs to change -- only what gets
+  // passed in does. A missing/malformed entry point surfaces as an ordinary
+  // acquire_render_pipeline failure (Metal's own newFunctionWithName:/
+  // newRenderPipelineStateWithDescriptor: linking failure), which this
+  // returns through `error` exactly like the built-in path: a clean submit-
+  // time failure, never a crash or a silent fallback to the built-in shader
+  // (docs/START.md invariant 10).
   bool ensure_raster_pipeline(core::PixelFormat format, uint32_t sample_count,
-                              id<MTLRenderPipelineState>* out, std::string* error) {
-    const std::string source = compiler::raster_facet_metal_source();
-    const compiler::PipelineKey key = make_pipeline_key({source, "vg_raster_fragment"}, {},
+                              id<MTLRenderPipelineState>* out, std::string* error,
+                              const ir::UserRasterShaderContract* user_shader = nullptr) {
+    const std::string source =
+        user_shader != nullptr ? user_shader->source : compiler::raster_facet_metal_source();
+    const std::string vertex_entry = user_shader != nullptr ? user_shader->vertex_entry : "vg_raster_vertex";
+    const std::string fragment_entry = user_shader != nullptr ? user_shader->fragment_entry : "vg_raster_fragment";
+    const compiler::PipelineKey key = make_pipeline_key({source, fragment_entry}, {},
                                                         {static_cast<uint32_t>(format)}, sample_count);
-    return acquire_render_pipeline(pipeline_cache, render_pipeline_by_key, source, key, "vg_raster_vertex",
+    return acquire_render_pipeline(pipeline_cache, render_pipeline_by_key, source, key, vertex_entry,
                                    to_mtl_pixel_format(format),
-                                   "basic raster attachment store (05 §9 region.attachment.store)", out,
-                                   nullptr, error);
+                                   user_shader != nullptr
+                                       ? "restricted-import user MSL raster shader (ADR-043 Decision #4)"
+                                       : "basic raster attachment store (05 §9 region.attachment.store)",
+                                   out, nullptr, error);
   }
 
   // 1x1 stand-in bound on the path where the checked-profile guard is expected
@@ -1713,7 +1736,8 @@ struct DeviceHal::Impl {
   // MTLBuffer alone carries no length.
   bool run_raster_pass(const core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
                        const RasterDesc& desc, id<MTLBuffer> vertex_buffer, id<MTLBuffer> tint_buffer,
-                       uint32_t vertex_count, RasterResult* result, std::string* error) {
+                       uint32_t vertex_count, RasterResult* result, std::string* error,
+                       const ir::UserRasterShaderContract* user_shader = nullptr) {
     if (result == nullptr) { if (error) *error = "raster result output is required"; return false; }
     if (vertex_count == 0 || vertex_count % 3 != 0) {
       if (error) *error = "raster vertex count must be a non-zero multiple of 3 (triangle list)";
@@ -1818,7 +1842,7 @@ struct DeviceHal::Impl {
     std::string pipeline_error;
     id<MTLRenderPipelineState> pipeline_state = nil;
     if (!ensure_raster_pipeline(target_view.format, desc.attachment.sample_count, &pipeline_state,
-                                &pipeline_error)) {
+                                &pipeline_error, user_shader)) {
       if (error) *error = "Metal raster pipeline compile failed: " + pipeline_error;
       return false;
     }
@@ -2174,6 +2198,19 @@ struct DeviceHal::CompileOps {
 
   static bool select_package(DeviceHal& metal, const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
                              std::string* error) {
+    // F3 (ADR-043 Decision #4): a restricted-import MSL raster submission
+    // carries no linear IR module (device_hal.h's ExecutionPlan::
+    // user_raster_shader comment: `module` stays default/empty in this
+    // mode), so there is nothing here to lower into a ComputePackage.
+    // compiled->compute_package stays std::nullopt; CompileOps::pipelines()
+    // and SubmitOps::begin()/linear() are the other spots that treat
+    // "neither compute_package nor indexed_compute_package, but
+    // user_raster_shader set" as a legal compiled/submittable state rather
+    // than the pre-F3 "compile()/submit() never produces neither" case.
+    if (plan.user_raster_shader.has_value()) {
+      init(compiled, plan);
+      return true;
+    }
     const bool pointer_graph = is_pointer_graph_module(plan.module);
     const bool indexed_binding = !pointer_graph && plan.request_indexed_binding;
     if (indexed_binding) {
@@ -2300,6 +2337,33 @@ struct DeviceHal::CompileOps {
 
   static bool pipelines(DeviceHal& metal, const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
                         std::string* error) {
+    // F3 (ADR-043 Decision #4): no compute module was lowered for a
+    // restricted-import raster submission (select_package() left
+    // compute_package unset above), so there is no MTLComputePipelineState
+    // to build here -- the real MTLRenderPipelineState for the caller's MSL
+    // source is built lazily at submit() time by
+    // Impl::ensure_raster_pipeline() (SubmitOps::raster), same as the
+    // built-in raster shader's pipeline always has been. What this compile()
+    // step must still record is the trust-boundary disclosure the compiler
+    // owes per ADR-043 Decision #4 / docs/START.md invariant 10: the
+    // compiler validated only the caller's declared effect contract, never
+    // the MSL source's logic, so every raster task in this plan (validate()
+    // already guarantees the whole task graph is Raster-kind whenever
+    // user_raster_shader is set) must be recorded HostAssisted rather than
+    // silently treated as fully verified. This is deliberately a distinct
+    // "raster_user_shader" operation, not "metal_pipeline": the latter is
+    // matched by has_host_assisted_pipeline() for the unrelated atomic-
+    // fallback host-execution path below and must not be triggered here.
+    if (plan.user_raster_shader.has_value()) {
+      compiled->report.supported = true;
+      if (!plan.task_graph.tasks().empty())
+        compiled->report.add(
+            "raster_user_shader", hal::LoweringClass::HostAssisted, plan.task_graph.tasks().size(), 0,
+            "caller-declared effect contract accepted; shader logic not independently verified");
+      if (plan.timeline_signal != 0)
+        compiled->report.add("timeline", hal::LoweringClass::Direct, 1, 0, "MTLSharedEvent wait/signal");
+      return effect_dag(metal, plan, compiled, error);
+    }
     const bool pointer_graph = is_pointer_graph_module(plan.module);
     const bool indexed_binding = compiled->indexed_compute_package.has_value();
     const bool has_atomic = std::ranges::any_of(plan.module.instructions,
@@ -2403,7 +2467,8 @@ struct DeviceHal::SubmitOps {
                     std::string* error) {
     if (submission == nullptr) { if (error) *error = "submission output is required"; return false; }
     if (!compiled.report.supported) { if (error) *error = "compiled plan is unsupported"; return false; }
-    if (!compiled.compute_package.has_value() && !compiled.indexed_compute_package.has_value()) {
+    if (!compiled.compute_package.has_value() && !compiled.indexed_compute_package.has_value() &&
+        !compiled.plan.user_raster_shader.has_value()) {
       if (error) *error = "compiled plan has no compute package";
       return false;
     }
@@ -2521,18 +2586,16 @@ struct DeviceHal::SubmitOps {
       // F2 fixed defaults for the backend-private half of RasterDesc; the
       // rest (filter/wrap/tint) comes straight off the TaskRecord.
       RasterDesc desc;
-      desc.attachment.load = AttachmentLoadAction::Clear;
-      desc.attachment.store = AttachmentStoreAction::Store;
-      desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
-      desc.attachment.sample_count = 1;
-      desc.attachment.subresource = {0, 0};
+      desc.attachment = hal::f2_default_raster_attachment_config<AttachmentFacetDesc>();
       desc.filter = task.raster_filter;
       desc.wrap = task.raster_wrap;
       desc.tint = task.raster_tint;
 
       RasterResult result;
+      const ir::UserRasterShaderContract* user_shader =
+          compiled.plan.user_raster_shader.has_value() ? &*compiled.plan.user_raster_shader : nullptr;
       if (!metal.impl_->run_raster_pass(arena, metal.facet_pool(), task.raster_facets, desc, vertex_buffer,
-                                        tint_buffer, vertex_count, &result, &task_error)) {
+                                        tint_buffer, vertex_count, &result, &task_error, user_shader)) {
         if (out_message) *out_message = task_error;
         return false;
       }
@@ -2850,6 +2913,23 @@ struct DeviceHal::SubmitOps {
   static bool linear(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
                      uint64_t wait_value, uint64_t signal_value, hal::Submission* submission,
                      std::string* error) {
+    // F3 (ADR-043 Decision #4): a user-raster-shader submission has no
+    // compute_package (CompileOps::select_package() deliberately leaves it
+    // unset -- see its comment), so there is no linear compute dispatch to
+    // run here. Mirrors indexed()'s `if (!compiled.indexed_compute_package.
+    // has_value()) return Flow::Continue;` guard just above, except linear()
+    // is the chain's unconditional terminal step (not gated behind
+    // SubmitOps::take()/Flow), so unlike indexed() this cannot fall through
+    // to a later stage -- it must itself report the submission's outcome.
+    // The raster work already ran in SubmitOps::raster() before this whole
+    // Flow chain started; `finish()` folds that outcome in via `raster_ok`
+    // regardless of what this returns, so "no compute package" here is
+    // simply "nothing left to dispatch", not a failure.
+    if (!compiled.compute_package.has_value()) {
+      submission->result.ok = true;
+      submission->result.poison = core::PoisonState::Valid;
+      return true;
+    }
     const auto& package = *compiled.compute_package;
     const auto generation_by_allocation = generations(compiled.plan.module);
     std::vector<id<MTLBuffer>> buffers;

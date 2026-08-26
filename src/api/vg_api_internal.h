@@ -177,6 +177,11 @@ VgResult VG_CALL get_submission_lowering_report(VgSubmission submission, const c
 // v1.2 (ADR-045).
 VgResult VG_CALL get_submission_execution_result(VgSubmission submission, const char** out_json);
 
+// v1.3 (F2/ADR-046, F3.5/ADR-048): the public entry point onto
+// core::FacetPool::acquire, defined in vg_api_facet.cpp.
+VgResult VG_CALL acquire_facet(VgDevice device, VgArena arena, const VgCanonicalViewDesc* view,
+                                uint32_t facet_kind, VgFacetRef* out_facet);
+
 }  // namespace vg_api
 
 #endif

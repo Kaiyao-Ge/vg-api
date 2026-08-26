@@ -133,6 +133,15 @@ typedef struct VgApi {
 VG_API VgResult VG_CALL vgGetApi(uint32_t requested_version, VgApi* out_api);
 ```
 
+`VG_API_VERSION_1_0` 是本节示例的最小骨架版本。实际实现已按 ADR-044（v1.1：
+`openAdapter`…`getSubmissionLoweringReport` 全链路）、ADR-045（v1.2：
+`getSubmissionExecutionResult`）、ADR-048（v1.3：`acquireFacet`，见 §9.1）
+append-only 增长到 `VG_API_VERSION_1_3`（`include/vg/vg_version.h`）。每一版
+只在 `VgApi` 尾部追加函数指针，`vgGetApi` 按请求版本对应的 `size` 分档
+`memcpy`，旧版本调用方对新 runtime 保持字节兼容——这是本节以下描述的
+loader 契约在多版本增长下的实际延伸，具体每版新增了哪些成员见对应 ADR，
+本节不逐版复述。
+
 导出 `vgGetApi` 是最小 loader ABI。也可为易用性导出同名函数，但规范测试以 function table 为准。Runtime allocator 必须成对使用；callback 不能抛异常跨越 C ABI。
 
 ## 7. Adapter 与能力查询
@@ -203,6 +212,7 @@ typedef struct VgExecutionShape {
 typedef struct VgTaskRecord {
     VgNodeRef node;
     uint64_t root;
+    uint32_t root_generation;
     VgExecutionShape shape;
     uint32_t contract_index;
     uint32_t payload_size;
@@ -210,7 +220,129 @@ typedef struct VgTaskRecord {
 } VgTaskRecord;
 ```
 
+`root_generation`（ADR-044，v1.1）补上了 `core::TaskRecord` 本就有的
+`root_allocation`/`root_generation` 拆分身份——本节最初的示例 `root` 是裸
+`uint64_t`，没有位置放 generation；`root_generation` 是本文档 §17 明确授权
+的“示例字段可随 ADR 调整”的一次实际使用，不是未披露的漂移。
+
 具体 on-GPU ABI 由 schema 编译器产生，并有显式 version/hash。CPU 和 GPU 生成者必须使用同一 generated header。Task 发布协议通常为“写 payload -> release fence -> 原子发布状态/队尾”；consumer acquire 后不得观察半写记录。
+
+### 9.1 v1.3 补充：Raster 接入公共 C ABI（ADR-046 / ADR-047 / ADR-048）
+
+F2/F3（ADR-046、ADR-047）先让 rasterization 成为 `core::TaskRecord`/
+`ExecutionPlan` 的一种内部形状，但故意没有触碰公共 C ABI——ADR-046
+Consequences 明确写道“a public raster ABI entry point is deferred to a
+later F milestone”。F3.5（ADR-048）把这个此前故意留空的缺口补上：
+`VgTaskRecord` 在尾部追加一组新字段，新增 `VgCanonicalViewDesc`/
+`VgRasterFacetPair` 两个 struct，以及一个新的 `acquireFacet` 入口点。这是
+第二次对 `VgTaskRecord` 使用 §17 的“示例字段可随 ADR 调整”授权（第一次是
+上面 §9 的 `root_generation`），**披露、有引用**，因此不属于 §5 规则
+（“不允许通过在普通 struct 尾部盲加字段破坏 ABI”）禁止的“盲加”。
+
+`VgTaskRecord` v1.3 追加的字段（紧跟在 `payload_or_offset` 之后）：
+
+```c
+typedef struct VgTaskRecord {
+    VgNodeRef node;
+    uint64_t root;
+    uint32_t root_generation;
+    VgExecutionShape shape;
+    uint32_t contract_index;
+    uint32_t payload_size;
+    uint64_t payload_or_offset;
+    /* ---- v1.3 追加（F2/ADR-046、F3.5/ADR-048） ---- */
+    uint32_t kind;                     /* VG_TASK_KIND_* */
+    uint32_t topology;                 /* VG_TOPOLOGY_* */
+    VgRasterFacetPair raster_facets;
+    VgFacetRef vertex_buffer_ref;
+    VgFacetRef index_buffer_ref;
+    uint32_t index_count;
+    uint32_t raster_filter;            /* VG_FILTER_* */
+    uint32_t raster_wrap;              /* VG_WRAP_* */
+    float raster_tint[4];
+} VgTaskRecord;
+
+typedef struct VgRasterFacetPair {
+    VgFacetRef source;
+    VgFacetRef target;
+} VgRasterFacetPair;
+```
+
+**已披露的 recompile hazard**：与本文件其余每个 struct 不同，
+`VgTaskRecord` 没有 per-element `VgStructHeader`，`taskGraphAppend` 把它当
+裸数组传递，没有像 `VgApi` 那样的按次 `size` 协商。追加字段改变了
+`sizeof(VgTaskRecord)`；用旧（更小）header 编译、链接到新 `libvg` 的调用方
+必须重新编译，否则 `taskGraphAppend` 的数组下标会按库里编译进去的更大
+`sizeof` 计算，读出调用方自己数组边界之外。
+
+**已披露的 zero-init 默认值不匹配**：零初始化的 `VgTaskRecord` 能正确解出
+`kind = VG_TASK_KIND_COMPUTE`、`topology = VG_TOPOLOGY_TRIANGLE_LIST`、
+`raster_wrap = VG_WRAP_CLAMP`（均为序数 0，与内部引擎真实默认值一致），但
+**不能**正确解出 `raster_filter`（零解出 `VG_FILTER_NEAREST`，真实默认是
+`VG_FILTER_BILINEAR`）或 `raster_tint`（零解出 `{0,0,0,0}`，真实默认是不
+透明白色 `{1,1,1,1}`）。字段一律原样拷贝，不做 default-substitution；提交
+`VG_TASK_KIND_RASTER` task 的调用方必须显式设置这两个字段。
+
+`acquireFacet` 的输入（一次性调用，非热路径数组元素，因此保留标准的
+`VgStructHeader` 可扩展 struct 约定）：
+
+```c
+typedef struct VgFacetRef {
+    uint32_t index;
+    uint32_t generation;
+} VgFacetRef;
+
+typedef struct VgCanonicalViewDesc {
+    VgStructHeader header;
+    uint64_t allocation;
+    uint32_t allocation_generation;
+    uint32_t format;            /* VG_PIXEL_FORMAT_* */
+    uint32_t dimension;         /* VG_VIEW_DIMENSION_* */
+    uint32_t width;
+    uint32_t height;
+    uint32_t array_layers;
+    uint32_t mip_levels;
+    uint32_t swizzle_red;       /* VG_SWIZZLE_* */
+    uint32_t swizzle_green;
+    uint32_t swizzle_blue;
+    uint32_t swizzle_alpha;
+} VgCanonicalViewDesc;
+
+VgResult vgAcquireFacet(VgDevice device, VgArena arena,
+                        const VgCanonicalViewDesc* view,
+                        uint32_t facet_kind, VgFacetRef* out_facet);
+```
+
+`VgCanonicalViewDesc` 与内部 `core::CanonicalView` 逐字段镜像；
+`allocation`/`allocation_generation` 是裸 id/generation pair（不是
+`VgAllocation` handle），与 `core::CanonicalView` 的真实字段类型一致，通过
+既有 `getAllocationRef(VgAllocation, uint64_t*, uint32_t*)`（v1.1）获得。
+`acquireFacet` 是 `core::FacetPool::acquire` 的公共入口，是 v1.3 唯一的新
+函数表成员，紧跟在 v1.2 的 `getSubmissionExecutionResult` 之后
+（append-only、`size` 分档协商，ADR-044/ADR-045 既有纪律的第三次延伸）。
+后端无关：三个 backend 共享同一个 `DeviceHal::facet_pool()`，不像 F3
+（受限 MSL 导入）那样按 backend 分叉实现。
+
+v1.3 新增的枚举值块（与 `core::TaskKind`/`core::Topology`/
+`core::FilterMode`/`core::WrapMode`/`core::PixelFormat`/
+`core::ViewDimension`/`core::Swizzle` 按序数对应）：
+
+```c
+VG_STRUCTURE_CANONICAL_VIEW_DESC = 14u,
+VG_TASK_KIND_COMPUTE = 0u,     VG_TASK_KIND_RASTER = 1u,
+VG_TOPOLOGY_TRIANGLE_LIST = 0u,
+VG_FILTER_NEAREST = 0u,        VG_FILTER_BILINEAR = 1u,
+VG_WRAP_CLAMP = 0u,            VG_WRAP_REPEAT = 1u,
+VG_PIXEL_FORMAT_RGBA8_UNORM = 0u, VG_PIXEL_FORMAT_R32_FLOAT = 1u,
+VG_VIEW_DIMENSION_TEXTURE_2D = 0u, VG_VIEW_DIMENSION_TEXTURE_2D_ARRAY = 1u,
+VG_SWIZZLE_RED = 0u,  VG_SWIZZLE_GREEN = 1u, VG_SWIZZLE_BLUE = 2u,
+VG_SWIZZLE_ALPHA = 3u, VG_SWIZZLE_ZERO = 4u,  VG_SWIZZLE_ONE = 5u,
+```
+
+范围外（本节不涉及，见 ADR-048 Consequences）：混合 compute+raster 一次
+submission（ADR-047 Decision #6 仍然拒绝）；indexed raster 绘制
+（`index_count > 0` 仍在 `compile()` 时被拒绝，F5 才实现）；depth（F4）；
+per-shader 可声明绑定。
 
 ## 10. Builder 与 seal
 
@@ -220,13 +352,13 @@ typedef struct VgTaskRecord {
 VgResult vgCreateTaskGraphBuilder(VgDevice, const VgTaskGraphBuilderDesc*,
                                   VgTaskGraphBuilder*);
 VgResult vgTaskGraphAppend(VgTaskGraphBuilder, const VgTaskRecord* tasks,
-                           uint32_t task_count);
+                           uint32_t task_count, VgTaskId* out_ids);
 VgResult vgTaskGraphAddDependency(VgTaskGraphBuilder, VgTaskId before,
                                   VgTaskId after);
 VgResult vgSealTaskGraph(VgTaskGraphBuilder, const VgSealDesc*, VgTaskGraph*);
 ```
 
-Builder 不能 submit；sealed graph 不能修改。重复执行通过不同 Envelope/root data，而不是修改已发布 Task。
+Builder 不能 submit；sealed graph 不能修改。重复执行通过不同 Envelope/root data，而不是修改已发布 Task。`out_ids`（ADR-044，v1.1）按 append 顺序把每个 task 分配到的 `VgTaskId` 写回调用方数组，供后续 `vgTaskGraphAddDependency` 引用——`VgTaskId` 只在它来源的那一个 `VgTaskGraphBuilder`/`VgTaskGraph` 内有效，不是跨 graph 的 handle。
 
 ## 11. ExecutionEnvelope 与提交
 

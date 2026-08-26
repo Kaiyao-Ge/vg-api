@@ -38,6 +38,15 @@ std::string serialize_module(const Module& module) {
   json::Value::Array pointer_edges;for(const auto& edge:module.declared_pointer_edges)pointer_edges.push_back(pointer_edge_json(edge));
   return json::canonical(json::Value(json::Value::Object{{"effects",json::Value(std::move(effects))},{"instructions",json::Value(std::move(instructions))},{"pointer_edges",json::Value(std::move(pointer_edges))},{"root_schema",json::Value(module.root_schema)},{"schema",json::Value("vg.ir/v1")},{"version",json::Value(static_cast<int64_t>(module.version))}}));
 }
+UserRasterShaderContract parse_msl_raster_envelope(const std::string& text) {
+  json::Value document=json::parse(text); if(!document.is_object()) throw std::runtime_error("MSL raster envelope root must be an object"); const auto& o=document.object();
+  UserRasterShaderContract contract;
+  contract.root_schema=require(o,"root_schema").string(); if(contract.root_schema.empty()) throw std::runtime_error("MSL raster envelope missing field: root_schema");
+  contract.vertex_entry=require(o,"vertex_entry").string(); if(contract.vertex_entry.empty()) throw std::runtime_error("MSL raster envelope missing field: vertex_entry");
+  contract.fragment_entry=require(o,"fragment_entry").string(); if(contract.fragment_entry.empty()) throw std::runtime_error("MSL raster envelope missing field: fragment_entry");
+  contract.source=require(o,"source").string(); if(contract.source.empty()) throw std::runtime_error("MSL raster envelope missing field: source");
+  return contract;
+}
 bool effect_covers(const Effect& declared,const Effect& actual){ if(declared.allocation!=actual.allocation||declared.representation_epoch!=actual.representation_epoch)return false; if((static_cast<uint64_t>(declared.access)&static_cast<uint64_t>(actual.access))!=static_cast<uint64_t>(actual.access))return false; if(actual.size==0||declared.size==0||declared.offset>actual.offset)return false; const uint64_t relative=actual.offset-declared.offset; return relative<=declared.size && actual.size<=declared.size-relative; }
 namespace {
 bool pointer_edge_covers(const Module& module,const Instruction& root,const Instruction& via){

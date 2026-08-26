@@ -157,7 +157,29 @@ enum {
     VG_ACCESS_CERTIFICATE_MODE_UNIVERSE = 1u,
     VG_ACCESS_CERTIFICATE_MODE_DISCOVER_THEN_LEASE = 2u,
     VG_ACCESS_CERTIFICATE_MODE_SOFTWARE_PAGED = 3u,
-    VG_ACCESS_CERTIFICATE_MODE_FAULT_MANAGED = 4u
+    VG_ACCESS_CERTIFICATE_MODE_FAULT_MANAGED = 4u,
+    /* v1.3 additions (F2/ADR-046, F3.5/ADR-048): raster reaches the public
+     * C-ABI. Ordinal-matched to core::TaskKind, core::Topology,
+     * core::FilterMode, core::WrapMode, core::PixelFormat,
+     * core::ViewDimension and core::Swizzle respectively. */
+    VG_STRUCTURE_CANONICAL_VIEW_DESC = 14u,
+    VG_TASK_KIND_COMPUTE = 0u,
+    VG_TASK_KIND_RASTER = 1u,
+    VG_TOPOLOGY_TRIANGLE_LIST = 0u,
+    VG_FILTER_NEAREST = 0u,
+    VG_FILTER_BILINEAR = 1u,
+    VG_WRAP_CLAMP = 0u,
+    VG_WRAP_REPEAT = 1u,
+    VG_PIXEL_FORMAT_RGBA8_UNORM = 0u,
+    VG_PIXEL_FORMAT_R32_FLOAT = 1u,
+    VG_VIEW_DIMENSION_TEXTURE_2D = 0u,
+    VG_VIEW_DIMENSION_TEXTURE_2D_ARRAY = 1u,
+    VG_SWIZZLE_RED = 0u,
+    VG_SWIZZLE_GREEN = 1u,
+    VG_SWIZZLE_BLUE = 2u,
+    VG_SWIZZLE_ALPHA = 3u,
+    VG_SWIZZLE_ZERO = 4u,
+    VG_SWIZZLE_ONE = 5u
 };
 
 typedef void* (VG_CALL *VgAllocateFn)(void* user, size_t size, size_t alignment);
@@ -264,12 +286,65 @@ typedef struct VgExecutionShape {
     uint32_t flags;
 } VgExecutionShape;
 
+/* ---- v1.3 additions (F2/ADR-046, F3.5/ADR-048) ------------------------- */
+
+/* Sample source + attachment target for one raster pass, mirroring
+ * core::RasterFacetPair. Adjacent VgFacetRef parameters are otherwise
+ * interchangeable at every draw call site. */
+typedef struct VgRasterFacetPair {
+    VgFacetRef source;
+    VgFacetRef target;
+} VgRasterFacetPair;
+
+/* Mirrors core::CanonicalView field-for-field. `allocation`/`allocation_generation`
+ * are the raw id/generation pair (not a VgAllocation handle) -- obtain them via
+ * the existing getAllocationRef(VgAllocation, uint64_t*, uint32_t*) entry point. */
+typedef struct VgCanonicalViewDesc {
+    VgStructHeader header;
+    uint64_t allocation;
+    uint32_t allocation_generation;
+    uint32_t format;            /* VG_PIXEL_FORMAT_* */
+    uint32_t dimension;         /* VG_VIEW_DIMENSION_* */
+    uint32_t width;
+    uint32_t height;
+    uint32_t array_layers;
+    uint32_t mip_levels;
+    uint32_t swizzle_red;       /* VG_SWIZZLE_* */
+    uint32_t swizzle_green;
+    uint32_t swizzle_blue;
+    uint32_t swizzle_alpha;
+} VgCanonicalViewDesc;
+
 /* Mirrors core::TaskRecord field-for-field, with one disclosed extension:
  * 04-public-c-abi.md Sec.17's illustrative `root` is a bare uint64_t with no
  * room for a generation, but core::TaskRecord always carried
  * root_allocation+root_generation split. ADR-044 adds root_generation here
  * rather than silently truncating the identity the C++ type already
- * carries. */
+ * carries.
+ *
+ * Recompile hazard (ADR-048, precedented by root_generation's addition
+ * above under ADR-044): unlike every other struct in this file,
+ * VgTaskRecord carries no per-element VgStructHeader and is passed to
+ * taskGraphAppend as a raw array -- there is no runtime size negotiation
+ * for it the way VgApi negotiates `size` once per vgGetApi call. Appending
+ * the v1.3 fields below therefore changes sizeof(VgTaskRecord), and this is
+ * a disclosed, deliberate exception to "no blind tail-appending": an
+ * application binary compiled against an older (smaller) header but run
+ * against a newer libvg will have taskGraphAppend's array indexing computed
+ * from the *library's* larger compiled-in sizeof, reading past the end of
+ * the caller's own array. Callers MUST recompile against the current
+ * header when linking against a libvg built from this version.
+ *
+ * Zero-init defaulting mismatch: a zero-initialized VgTaskRecord correctly
+ * decodes kind = VG_TASK_KIND_COMPUTE, topology = VG_TOPOLOGY_TRIANGLE_LIST
+ * and raster_wrap = VG_WRAP_CLAMP (all ordinal 0, matching the internal
+ * engine's real defaults), but does NOT correctly default raster_filter
+ * (zero decodes as VG_FILTER_NEAREST, while core::TaskRecord's actual
+ * default is FilterMode::Bilinear) or raster_tint (zero decodes as
+ * {0,0,0,0}, while the internal default is {1,1,1,1}, i.e. opaque white).
+ * Fields are copied through as-is with no default-substitution -- a caller
+ * submitting a VG_TASK_KIND_RASTER task must explicitly set raster_filter
+ * and raster_tint rather than relying on zero-init. */
 typedef struct VgTaskRecord {
     VgNodeRef node;
     uint64_t root;
@@ -278,6 +353,17 @@ typedef struct VgTaskRecord {
     uint32_t contract_index;
     uint32_t payload_size;
     uint64_t payload_or_offset;
+    /* ---- v1.3 additions (F2/ADR-046, F3.5/ADR-048); see the recompile-hazard
+     * and zero-init-defaulting-mismatch notes above. ---- */
+    uint32_t kind;                     /* VG_TASK_KIND_* */
+    uint32_t topology;                 /* VG_TOPOLOGY_* */
+    VgRasterFacetPair raster_facets;
+    VgFacetRef vertex_buffer_ref;
+    VgFacetRef index_buffer_ref;
+    uint32_t index_count;
+    uint32_t raster_filter;            /* VG_FILTER_* */
+    uint32_t raster_wrap;              /* VG_WRAP_* */
+    float raster_tint[4];
 } VgTaskRecord;
 
 typedef struct VgSealDesc {
@@ -390,6 +476,16 @@ typedef struct VgApi {
      * valid until the submission is destroyed -- same shape/lifetime
      * contract as getSubmissionLoweringReport. */
     VgResult (VG_CALL *getSubmissionExecutionResult)(VgSubmission submission, const char** out_json);
+    /* ---- v1.3 (F2/ADR-046, F3.5/ADR-048); populated only when the caller
+     * requests VG_API_VERSION_1_3 or later from vgGetApi. Strictly
+     * append-only past this point, same discipline as the v1.1->v1.2
+     * boundary above: every member before this line keeps its exact v1.2
+     * offset and meaning. Raster reaches the public C-ABI: acquireFacet is
+     * the public entry point onto core::FacetPool::acquire, letting a
+     * caller obtain the VgFacetRef a VG_TASK_KIND_RASTER VgTaskRecord's
+     * raster_facets/vertex_buffer_ref/index_buffer_ref fields require. */
+    VgResult (VG_CALL *acquireFacet)(VgDevice device, VgArena arena, const VgCanonicalViewDesc* view,
+                                      uint32_t facet_kind, VgFacetRef* out_facet);
 } VgApi;
 
 #define VG_INIT_STRUCT(struct_type, structure_type) \

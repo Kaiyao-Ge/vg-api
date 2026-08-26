@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1459,6 +1460,51 @@ std::vector<vg::metal::RasterVertex> metal_fullscreen_quad() {
   return {top_left, top_right, bottom_left, top_right, bottom_right, bottom_left};
 }
 
+// F3 (ADR-043 Decision #4): a restricted-import MSL source, structurally
+// matching the exact binding contract run_raster_pass's encoder assumes --
+// same VgRasterVertex/VgRasterVaryings struct layout and the same fixed
+// buffer/texture/sampler indices raster_facet_metal_source() (the built-in
+// shader, src/compiler/compute_package.cpp) uses -- but with caller-chosen
+// entry-point names and a fragment body that ignores the sampled texture,
+// sampler, and tint buffer entirely, returning solid green. The encoder still
+// unconditionally binds all four at their fixed slots regardless of whether
+// this function reads them (metal_device_hal.mm), so the source only needs
+// to declare parameters at the right indices to be well-formed Metal, not to
+// use them. Solid green (0,1,0,1) round-trips RGBA8Unorm quantization exactly
+// and can never be produced by the built-in sample*tint formula against the
+// non-green source texel pattern run_task_graph_raster/this test fill, so a
+// pixel match against it is proof the custom shader itself executed.
+std::string user_raster_msl_source(const std::string& vertex_entry, const std::string& fragment_entry) {
+  std::ostringstream out;
+  out << "#include <metal_stdlib>\n"
+      << "using namespace metal;\n\n"
+      << "struct VgRasterVertex { float2 position; float2 uv; };\n"
+      << "struct VgRasterVaryings { float4 position [[position]]; float2 uv; };\n"
+      << "struct VgRasterFragment { float4 color [[color(0)]]; };\n\n"
+      << "vertex VgRasterVaryings " << vertex_entry
+      << "(device const VgRasterVertex* vertices [[buffer(" << vg::compiler::kRasterVertexBufferIndex << ")]],\n"
+      << "                                         uint vid [[vertex_id]]) {\n"
+      << "  VgRasterVaryings varyings;\n"
+      << "  varyings.position = float4(vertices[vid].position, 0.0f, 1.0f);\n"
+      << "  varyings.uv = vertices[vid].uv;\n"
+      << "  return varyings;\n"
+      << "}\n\n"
+      << "fragment VgRasterFragment " << fragment_entry
+      << "(VgRasterVaryings varyings [[stage_in]],\n"
+      << "                                             texture2d<float, access::sample> tex [[texture("
+      << vg::compiler::kRasterTextureIndex << ")]],\n"
+      << "                                             sampler samp [[sampler(" << vg::compiler::kRasterSamplerIndex
+      << ")]],\n"
+      << "                                             constant float4& tint [[buffer("
+      << vg::compiler::kRasterTintBufferIndex << ")]]) {\n"
+      << "  (void)tex; (void)samp; (void)tint;\n"
+      << "  VgRasterFragment result;\n"
+      << "  result.color = float4(0.0f, 1.0f, 0.0f, 1.0f);\n"
+      << "  return result;\n"
+      << "}\n";
+  return out.str();
+}
+
 // E008: Texture2DArray + mip, sampled through metal::SampleCoord, compared
 // against reference::sample_facet. A second call against the same FacetRef
 // must report facet_cache_hit. Out-of-range slice/lod is a rejection, not a
@@ -1964,10 +2010,7 @@ bool run_task_graph_raster(const std::string& root) {
   vg::metal::RasterDesc oracle_desc;
   oracle_desc.filter = raster_task.raster_filter;
   oracle_desc.wrap = raster_task.raster_wrap;
-  oracle_desc.attachment.load = vg::metal::AttachmentLoadAction::Clear;
-  oracle_desc.attachment.store = vg::metal::AttachmentStoreAction::Store;
-  oracle_desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
-  oracle_desc.attachment.sample_count = 1;
+  oracle_desc.attachment = vg::hal::f2_default_raster_attachment_config<vg::metal::AttachmentFacetDesc>();
   auto oracle = vg::reference::raster_triangles(arena, metal_device->facet_pool(),
                                                 {.source = source_ref, .target = target_ref},
                                                 to_reference_desc(oracle_desc), to_reference_vertices(quad));
@@ -2091,6 +2134,246 @@ bool run_task_graph_raster(const std::string& root) {
   }
 
   std::cout << "task-graph-raster: ok\n";
+  return true;
+}
+
+// F3 (ADR-043 Decision #4): restricted-import "vg.msl.raster/v1" shaders --
+// plan.user_raster_shader set, plan.module left default (validate() skips
+// ir::verify(module) whenever user_raster_shader is set, mirroring
+// vg_api_execution.cpp's submit() never attaching linear IR to this format
+// tag). Three sub-cases:
+//   (a) happy path: a real, hand-written MSL vertex+fragment pair matching
+//       the exact binding contract run_raster_pass's encoder assumes
+//       (user_raster_msl_source above) must actually execute -- every
+//       resolved pixel must match the custom shader's own solid-green
+//       formula, not the built-in sample*tint formula, and compile() must
+//       record a "raster_user_shader"/HostAssisted disclosure event
+//       (docs/START.md invariant 10: no silent "verified" reclassification --
+//       see also reference_raster_test.cpp's equivalent HostAssisted check).
+//   (b) malformed entry point: fragment_entry names a function absent from
+//       source. ensure_raster_pipeline compiles the MTLLibrary/pipeline
+//       lazily at submit() time, not at compile() time, so compile() must
+//       still succeed; submit() itself must still return true (host-side
+//       acceptance), but submission.result.ok must be false with a message
+//       containing "Metal raster pipeline compile failed" -- a clean
+//       submit-time failure, never a crash or a silent fallback to the
+//       built-in shader.
+//   (c) mixed compute+MSL-raster rejection: ExecutionPlan::validate()
+//       requires every task to be Raster-kind whenever user_raster_shader is
+//       set (device_hal.cpp); a graph mixing a Compute task with a Raster
+//       task must be rejected at compile() with that exact message.
+bool run_task_graph_raster_user_shader(const std::string& root) {
+  (void)root;
+  auto metal_device = vg::metal::make_device_hal();
+  if (metal_device == nullptr) {
+    std::cerr << "task-graph-raster-user-shader: no Metal device available on this host\n";
+    return false;
+  }
+  // Note: unlike the reference backend (reference_device_hal.cpp), Metal's
+  // capabilities() does not currently OR in Capability::UserShaderImport even
+  // though compile()/submit() fully implement it -- see the final report's
+  // flagged-bug list. Not asserted here since it is not part of this
+  // sub-case's required behaviour and the plan is submitted directly.
+
+  constexpr uint32_t kExtent = 4;
+  constexpr uint32_t kBytes = kExtent * kExtent * 4;
+  vg::core::Arena arena;
+  auto& source_alloc = arena.allocate(kBytes);
+  auto& target_alloc = arena.allocate(kBytes);
+  for (uint32_t y = 0; y < kExtent; ++y) {
+    for (uint32_t x = 0; x < kExtent; ++x) {
+      const uint64_t texel = (static_cast<uint64_t>(y) * kExtent + x) * 4;
+      source_alloc.bytes[texel + 0] = static_cast<uint8_t>(10 + 40 * x);
+      source_alloc.bytes[texel + 1] = static_cast<uint8_t>(20 + 40 * y);
+      source_alloc.bytes[texel + 2] = static_cast<uint8_t>(30 + 8 * x + 16 * y);
+      source_alloc.bytes[texel + 3] = 255;
+    }
+  }
+
+  const vg::core::CanonicalView source_view = make_rgba8_view(source_alloc, {.width = kExtent, .height = kExtent});
+  const vg::core::CanonicalView target_view = make_rgba8_view(target_alloc, {.width = kExtent, .height = kExtent});
+
+  vg::core::FacetRef source_ref;
+  vg::core::FacetRef target_ref;
+  std::string error;
+  if (!metal_device->facet_pool().acquire(arena, source_view, vg::core::FacetKind::Sample, &source_ref, &error) ||
+      !metal_device->facet_pool().acquire(arena, target_view, vg::core::FacetKind::Attachment, &target_ref,
+                                          &error)) {
+    std::cerr << "task-graph-raster-user-shader: acquire failed: " << error << "\n";
+    return false;
+  }
+
+  const auto quad = metal_fullscreen_quad();
+  const uint64_t vertex_bytes = quad.size() * sizeof(vg::metal::RasterVertex);
+  auto& vertex_alloc = arena.allocate(vertex_bytes);
+  std::memcpy(vertex_alloc.bytes.data(), quad.data(), vertex_bytes);
+  const vg::core::CanonicalView vertex_view =
+      make_rgba8_view(vertex_alloc, {.width = static_cast<uint32_t>(vertex_bytes / 4), .height = 1});
+  vg::core::FacetRef vertex_ref;
+  if (!metal_device->facet_pool().acquire(arena, vertex_view, vg::core::FacetKind::Address, &vertex_ref, &error)) {
+    std::cerr << "task-graph-raster-user-shader: vertex facet acquire failed: " << error << "\n";
+    return false;
+  }
+
+  TaskRecord raster_task{};
+  raster_task.kind = vg::core::TaskKind::Raster;
+  raster_task.raster_facets = {.source = source_ref, .target = target_ref};
+  raster_task.vertex_buffer_ref = vertex_ref;
+  raster_task.raster_filter = vg::core::FilterMode::Nearest;
+  raster_task.raster_wrap = vg::core::WrapMode::Clamp;
+
+  TaskGraphBuilder builder;
+  if (!builder.append(raster_task)) {
+    std::cerr << "task-graph-raster-user-shader: failed to append raster task\n";
+    return false;
+  }
+  TaskGraph graph;
+  if (!builder.seal(&graph) || !graph.publish()) {
+    std::cerr << "task-graph-raster-user-shader: failed to seal/publish task graph\n";
+    return false;
+  }
+
+  // (a) Happy path: a real, valid custom shader whose own formula (solid
+  // green) is trivially distinguishable from the built-in sample*tint
+  // formula against this non-green source texel pattern.
+  vg::hal::ExecutionPlan plan;
+  plan.capabilities = metal_device->capabilities();
+  plan.user_raster_shader = vg::ir::UserRasterShaderContract{
+      "vg.test.raster/v1", "vg_user_raster_vertex", "vg_user_raster_fragment",
+      user_raster_msl_source("vg_user_raster_vertex", "vg_user_raster_fragment")};
+  plan.published = true;
+  plan.task_graph = graph;
+  plan.graph_epoch = arena.topology_epoch();
+
+  vg::hal::CompiledPlan compiled;
+  if (!metal_device->compile(plan, &compiled, &error)) {
+    std::cerr << "task-graph-raster-user-shader: Metal compile failed: " << error << "\n";
+    return false;
+  }
+  if (!compiled.report.supported) {
+    std::cerr << "task-graph-raster-user-shader: report.supported should be true\n";
+    return false;
+  }
+  bool found_user_shader_event = false;
+  for (const auto& event : compiled.report.events) {
+    if (event.operation == "raster_user_shader" && event.classification == vg::hal::LoweringClass::HostAssisted)
+      found_user_shader_event = true;
+  }
+  if (!found_user_shader_event) {
+    std::cerr << "task-graph-raster-user-shader: missing HostAssisted raster_user_shader LoweringEvent\n";
+    return false;
+  }
+
+  vg::hal::Submission submission;
+  if (!metal_device->submit(compiled, arena, &submission, &error)) {
+    std::cerr << "task-graph-raster-user-shader: Metal submit failed: " << error << "\n";
+    return false;
+  }
+  if (!submission.result.ok) {
+    std::cerr << "task-graph-raster-user-shader: Metal execution reported failure: " << submission.result.message
+              << "\n";
+    return false;
+  }
+  if (submission.raster_results.size() != 1) {
+    std::cerr << "task-graph-raster-user-shader: expected exactly one raster_results entry, got "
+              << submission.raster_results.size() << "\n";
+    return false;
+  }
+  const auto& raster_result = submission.raster_results[0];
+  if (raster_result.width != kExtent || raster_result.height != kExtent) {
+    std::cerr << "task-graph-raster-user-shader: raster_results[0] shape mismatch\n";
+    return false;
+  }
+  const std::array<float, 4> solid_green{0.0f, 1.0f, 0.0f, 1.0f};
+  for (size_t index = 0; index < raster_result.resolved_rgba.size(); ++index) {
+    if (!channels_close(raster_result.resolved_rgba[index], solid_green, kNearestTol,
+                        "task-graph-raster-user-shader", "custom-shader pixel"))
+      return false;
+  }
+
+  // (b) Malformed entry point: fragment_entry names a function absent from
+  // source. compile() still succeeds (pipeline is built lazily at submit()),
+  // but submit() must report a clean, non-crashing failure via
+  // submission.result.
+  vg::hal::ExecutionPlan bad_plan;
+  bad_plan.capabilities = metal_device->capabilities();
+  bad_plan.user_raster_shader = vg::ir::UserRasterShaderContract{
+      "vg.test.raster/v1", "vg_user_raster_vertex", "vg_does_not_exist_in_source",
+      user_raster_msl_source("vg_user_raster_vertex", "vg_user_raster_fragment")};
+  bad_plan.published = true;
+  bad_plan.task_graph = graph;
+  bad_plan.graph_epoch = arena.topology_epoch();
+
+  vg::hal::CompiledPlan bad_compiled;
+  std::string bad_compile_error;
+  if (!metal_device->compile(bad_plan, &bad_compiled, &bad_compile_error)) {
+    std::cerr << "task-graph-raster-user-shader: compile() should defer pipeline compilation to submit(), "
+                 "but failed at compile() instead: "
+              << bad_compile_error << "\n";
+    return false;
+  }
+  vg::hal::Submission bad_submission;
+  std::string bad_submit_error;
+  if (!metal_device->submit(bad_compiled, arena, &bad_submission, &bad_submit_error)) {
+    std::cerr << "task-graph-raster-user-shader: submit() call itself should succeed even when the "
+                 "pipeline fails to compile (host-side acceptance), but failed: "
+              << bad_submit_error << "\n";
+    return false;
+  }
+  if (bad_submission.result.ok) {
+    std::cerr << "task-graph-raster-user-shader: malformed entry point must report submission.result.ok "
+                 "== false\n";
+    return false;
+  }
+  if (bad_submission.result.message.find("Metal raster pipeline compile failed") == std::string::npos) {
+    std::cerr << "task-graph-raster-user-shader: unexpected malformed-entry-point failure message: "
+              << bad_submission.result.message << "\n";
+    return false;
+  }
+
+  // (c) Mixed compute+MSL-raster rejection: validate() requires every task
+  // to be Raster-kind whenever user_raster_shader is set.
+  TaskRecord compute_task{};
+  compute_task.node_index = 0;
+  compute_task.root_allocation = 99;
+  compute_task.x = 1;
+  compute_task.y = 1;
+  compute_task.z = 1;
+  TaskRecord mixed_raster_task{};
+  mixed_raster_task.node_index = 1;
+  mixed_raster_task.kind = vg::core::TaskKind::Raster;
+  mixed_raster_task.raster_facets = {.source = source_ref, .target = target_ref};
+  mixed_raster_task.vertex_buffer_ref = vertex_ref;
+  TaskGraphBuilder mixed_builder;
+  if (!mixed_builder.append(compute_task) || !mixed_builder.append(mixed_raster_task)) {
+    std::cerr << "task-graph-raster-user-shader: failed to build mixed compute+raster graph\n";
+    return false;
+  }
+  TaskGraph mixed_graph;
+  if (!mixed_builder.seal(&mixed_graph) || !mixed_graph.publish()) {
+    std::cerr << "task-graph-raster-user-shader: failed to seal/publish mixed compute+raster graph\n";
+    return false;
+  }
+  vg::hal::ExecutionPlan mixed_plan;
+  mixed_plan.capabilities = metal_device->capabilities();
+  mixed_plan.user_raster_shader = plan.user_raster_shader;
+  mixed_plan.published = true;
+  mixed_plan.task_graph = mixed_graph;
+  mixed_plan.graph_epoch = arena.topology_epoch();
+  vg::hal::CompiledPlan mixed_compiled;
+  std::string mixed_error;
+  if (metal_device->compile(mixed_plan, &mixed_compiled, &mixed_error)) {
+    std::cerr << "task-graph-raster-user-shader: compile() unexpectedly accepted a mixed compute+"
+                 "user_raster_shader graph\n";
+    return false;
+  }
+  if (mixed_error != "a user_raster_shader submission may only contain raster tasks") {
+    std::cerr << "task-graph-raster-user-shader: unexpected mixed-graph rejection message: " << mixed_error
+              << "\n";
+    return false;
+  }
+
+  std::cout << "task-graph-raster-user-shader: ok\n";
   return true;
 }
 
@@ -2825,7 +3108,8 @@ int main(int argc, char** argv) {
     std::cerr << "usage: vg_metal_task_timeline_test "
                  "<task-tier0|timeline|access-certificate|tier1-indirect|cull-compact|cull-compact-1m|effect-dag|pointer-graph|"
                  "indexed-binding|representation-layer|sample-facet|checked-facet-generation|basic-raster|"
-                 "task-graph-raster|pipeline-classification|consume-input|representation-churn> "
+                 "task-graph-raster|task-graph-raster-user-shader|pipeline-classification|consume-input|"
+                 "representation-churn> "
                  "<repo_root>\n";
     return 2;
   }
@@ -2860,6 +3144,8 @@ int main(int argc, char** argv) {
     ok = run_basic_raster(root);
   } else if (mode == "task-graph-raster") {
     ok = run_task_graph_raster(root);
+  } else if (mode == "task-graph-raster-user-shader") {
+    ok = run_task_graph_raster_user_shader(root);
   } else if (mode == "pipeline-classification") {
     ok = run_pipeline_classification(root);
   } else if (mode == "consume-input") {

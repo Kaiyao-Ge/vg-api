@@ -765,10 +765,8 @@ int main() {
     vg::reference::RasterDesc oracle_desc;
     oracle_desc.filter = raster_task.raster_filter;
     oracle_desc.wrap = raster_task.raster_wrap;
-    oracle_desc.attachment.load = vg::reference::AttachmentLoadAction::Clear;
-    oracle_desc.attachment.store = vg::reference::AttachmentStoreAction::Store;
-    oracle_desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
-    oracle_desc.attachment.sample_count = 1;
+    oracle_desc.attachment =
+        vg::hal::f2_default_raster_attachment_config<vg::reference::AttachmentFacetDesc>();
     const auto oracle = vg::reference::raster_triangles(arena, device->facet_pool(), {.source = source_ref, .target = target_ref},
                                                         oracle_desc, quad);
     assert(oracle.ok);
@@ -802,6 +800,121 @@ int main() {
     std::string indexed_error;
     assert(!device->compile(indexed_plan, &indexed_compiled, &indexed_error));
     assert(indexed_error == "indexed raster draws deferred to F5");
+  }
+
+  // --- F3 (ADR-043 Decision #4): a restricted-import "vg.msl.raster/v1"
+  // submission -- plan.user_raster_shader set, plan.module left default --
+  // must still drive a Raster-kind task exactly like F2's plain path above.
+  // This backend never interprets the supplied MSL text (raster_triangles()
+  // is completely unchanged), so the pixel output must match F2's fixed
+  // C++-shading formula exactly, regardless of what the custom fragment
+  // shader source below claims to compute -- a disclosed, intentional
+  // limitation (ADR-018: this backend is not a pixel-correctness oracle for
+  // user shading logic), asserted here as documented behaviour. compile()
+  // must also record the "raster_user_shader" HostAssisted disclosure event
+  // (docs/START.md invariant 10: no silent degradation to "verified"). ---
+  {
+    auto device = vg::reference::make_device_hal();
+    assert(device != nullptr);
+    const auto& caps = device->capabilities();
+    assert(caps.supports(vg::hal::Capability::UserShaderImport));
+
+    vg::core::Arena arena;
+    constexpr uint32_t kExtent = 4;
+    const uint64_t source_id = arena.allocate(64).id;
+    const uint64_t target_id = arena.allocate(64).id;
+    const vg::core::CanonicalView source = plain_view(source_id, {.width = kExtent, .height = kExtent});
+    const vg::core::CanonicalView target = plain_view(target_id, {.width = kExtent, .height = kExtent});
+
+    auto* source_allocation = arena.lookup(vg::core::PointerRef{source_id, 1});
+    for (uint32_t y = 0; y < kExtent; ++y)
+      for (uint32_t x = 0; x < kExtent; ++x) write_texel(*source_allocation, source, 0, 0, x, y, texel_pattern(x, y));
+
+    std::string error;
+    vg::core::FacetRef source_ref, target_ref;
+    assert(device->facet_pool().acquire(arena, source, vg::core::FacetKind::Sample, &source_ref, &error));
+    assert(device->facet_pool().acquire(arena, target, vg::core::FacetKind::Attachment, &target_ref, &error));
+
+    const auto quad = full_target_quad();
+    const uint64_t vertex_bytes = quad.size() * sizeof(vg::reference::RasterVertex);
+    auto& vertex_alloc = arena.allocate(vertex_bytes);
+    std::memcpy(vertex_alloc.bytes.data(), quad.data(), vertex_bytes);
+    const vg::core::CanonicalView vertex_view =
+        plain_view(vertex_alloc.id, {.width = static_cast<uint32_t>(vertex_bytes / 4), .height = 1});
+    vg::core::FacetRef vertex_ref;
+    assert(device->facet_pool().acquire(arena, vertex_view, vg::core::FacetKind::Address, &vertex_ref, &error));
+
+    vg::core::TaskRecord raster_task{};
+    raster_task.kind = vg::core::TaskKind::Raster;
+    raster_task.raster_facets = {.source = source_ref, .target = target_ref};
+    raster_task.vertex_buffer_ref = vertex_ref;
+    raster_task.raster_filter = vg::core::FilterMode::Nearest;
+    raster_task.raster_wrap = vg::core::WrapMode::Clamp;
+
+    vg::core::TaskGraphBuilder builder;
+    assert(builder.append(raster_task));
+    vg::core::TaskGraph graph;
+    assert(builder.seal(&graph) && graph.publish());
+
+    vg::hal::ExecutionPlan plan;
+    plan.capabilities = device->capabilities();
+    // plan.module stays default: a "vg.msl.raster/v1" submission never
+    // carries linear IR (vg_api_execution.cpp's submit()); validate() skips
+    // ir::verify(module) whenever user_raster_shader is set.
+    plan.user_raster_shader = vg::ir::UserRasterShaderContract{
+        "vg.test.raster/v1", "vg_test_vertex", "vg_test_fragment",
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "struct VgRasterVertex { float2 position; float2 uv; };\n"
+        "struct VgRasterVaryings { float4 position [[position]]; float2 uv; };\n"
+        "vertex VgRasterVaryings vg_test_vertex(device const VgRasterVertex* vertices [[buffer(0)]],\n"
+        "                                       uint vid [[vertex_id]]) {\n"
+        "  VgRasterVaryings varyings;\n"
+        "  varyings.position = float4(vertices[vid].position, 0.0f, 1.0f);\n"
+        "  varyings.uv = vertices[vid].uv;\n"
+        "  return varyings;\n"
+        "}\n"
+        "fragment float4 vg_test_fragment(VgRasterVaryings varyings [[stage_in]]) {\n"
+        "  return float4(1.0f, 0.0f, 0.0f, 1.0f);\n"
+        "}\n"};
+    plan.published = true;
+    plan.task_graph = graph;
+    plan.graph_epoch = arena.topology_epoch();
+
+    vg::hal::CompiledPlan compiled;
+    assert(device->compile(plan, &compiled, &error));
+    assert(compiled.report.supported);
+    bool found_user_shader_event = false;
+    for (const auto& event : compiled.report.events) {
+      if (event.operation == "raster_user_shader" && event.classification == vg::hal::LoweringClass::HostAssisted)
+        found_user_shader_event = true;
+    }
+    assert(found_user_shader_event);
+
+    vg::hal::Submission submission;
+    assert(device->submit(compiled, arena, &submission, &error));
+    assert(submission.result.ok);
+    assert(submission.raster_results.size() == 1);
+    const auto& task_result = submission.raster_results[0];
+    assert(task_result.width == kExtent && task_result.height == kExtent);
+
+    // The reference backend never interprets the supplied MSL text above (it
+    // always runs raster_triangles()'s fixed C++ shading), so the pixel
+    // output must equal F2's plain fixed-shading oracle exactly -- the same
+    // oracle construction as the plain task-graph-driven raster case earlier
+    // in this file -- not the solid-red colour the custom fragment shader
+    // source claims to produce.
+    vg::reference::RasterDesc oracle_desc;
+    oracle_desc.filter = raster_task.raster_filter;
+    oracle_desc.wrap = raster_task.raster_wrap;
+    oracle_desc.attachment =
+        vg::hal::f2_default_raster_attachment_config<vg::reference::AttachmentFacetDesc>();
+    const auto oracle = vg::reference::raster_triangles(arena, device->facet_pool(), {.source = source_ref, .target = target_ref},
+                                                        oracle_desc, quad);
+    assert(oracle.ok);
+    assert(task_result.resolved_rgba.size() == oracle.resolved_rgba.size());
+    for (size_t i = 0; i < oracle.resolved_rgba.size(); ++i)
+      assert(exact_match(task_result.resolved_rgba[i], oracle.resolved_rgba[i]));
   }
 
   return 0;

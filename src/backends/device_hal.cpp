@@ -102,8 +102,20 @@ bool validate_tier2_select(const ExecutionPlan& plan, std::string* error) {
 bool ExecutionPlan::validate(std::string* error) const {
   if (abi_version != kDeviceHalAbiVersion) { if (error) *error = "execution plan ABI version is unsupported"; return false; }
   if (capabilities.abi_version != kDeviceHalAbiVersion) { if (error) *error = "capability snapshot ABI version is unsupported"; return false; }
-  const auto verification = ir::verify(module);
-  if (!verification.ok) { if (error) *error = verification.message; return false; }
+  if (user_raster_shader.has_value()) {
+    // F3 (ADR-043 Decision #4) v1 scope cut: a restricted-import MSL
+    // submission carries no linear IR to verify (module stays default), and
+    // may only contain raster tasks -- no mixed compute+raster.
+    for (const auto& task : task_graph.tasks()) {
+      if (task.kind != core::TaskKind::Raster) {
+        if (error) *error = "a user_raster_shader submission may only contain raster tasks";
+        return false;
+      }
+    }
+  } else {
+    const auto verification = ir::verify(module);
+    if (!verification.ok) { if (error) *error = verification.message; return false; }
+  }
   if (!capabilities.supports(Capability::LinearAddress)) { if (error) *error = "linear address capability is unsupported"; return false; }
   if (timeline_signal != 0 && timeline_signal <= timeline_wait) { if (error) *error = "timeline signal does not advance past wait"; return false; }
   if (!published && !task_graph.tasks().empty()) { if (error) *error = "execution plan contains unpublished tasks"; return false; }

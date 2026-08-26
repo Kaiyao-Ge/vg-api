@@ -78,6 +78,7 @@ add_library(vg_api STATIC
     src/api/vg_api_code.cpp
     src/api/vg_api_taskgraph.cpp
     src/api/vg_api_execution.cpp
+    src/api/vg_api_facet.cpp
     src/backends/reference/reference_probe.cpp
 )
 target_compile_features(vg_api PRIVATE cxx_std_20)
@@ -305,6 +306,7 @@ if(BUILD_TESTING)
     add_test(NAME vertical-slice.metal.checked-facet-generation COMMAND vg_metal_task_timeline_test checked-facet-generation ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.basic-raster COMMAND vg_metal_task_timeline_test basic-raster ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.task-graph-raster COMMAND vg_metal_task_timeline_test task-graph-raster ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.metal.task-graph-raster-user-shader COMMAND vg_metal_task_timeline_test task-graph-raster-user-shader ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.pipeline-classification COMMAND vg_metal_task_timeline_test pipeline-classification ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.consume-input COMMAND vg_metal_task_timeline_test consume-input ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.representation-churn COMMAND vg_metal_task_timeline_test representation-churn ${CMAKE_CURRENT_SOURCE_DIR})
@@ -328,6 +330,8 @@ if(BUILD_TESTING)
     target_compile_features(vg_vulkan_task_timeline_test PRIVATE cxx_std_20)
     add_test(NAME vertical-slice.vulkan.task-tier0 COMMAND vg_vulkan_task_timeline_test task-tier0 ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.vulkan.timeline COMMAND vg_vulkan_task_timeline_test timeline ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.vulkan.raster-rejected COMMAND vg_vulkan_task_timeline_test raster-rejected ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME vertical-slice.vulkan.raster-msl-rejected COMMAND vg_vulkan_task_timeline_test raster-msl-rejected ${CMAKE_CURRENT_SOURCE_DIR})
   endif()
 
   add_test(NAME schema.generate COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_schema_generator.py ${CMAKE_CURRENT_SOURCE_DIR} ${VG_GENERATED_DIR})

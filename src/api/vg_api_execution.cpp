@@ -206,18 +206,34 @@ VgResult VG_CALL submit(VgDevice device, const VgSubmitDesc* submit_desc, VgSubm
     }
   }
 
-  vg::ir::Module module;
-  try {
-    const std::string text(code_object->code.bytes.begin(), code_object->code.bytes.end());
-    module = vg::ir::parse_module(text);
-  } catch (const std::exception& e) {
-    set_diagnostic(e.what());
-    return VG_ERROR_INVALID_ARGUMENT;
+  vg::hal::ExecutionPlan plan;
+  // F3 (ADR-043 Decision #4): a "vg.msl.raster/v1" CodeObject carries a
+  // restricted-import hand-written MSL raster shader, not the linear IR --
+  // parse the envelope instead of ir::parse_module and leave plan.module at
+  // its default (ExecutionPlan::validate() skips ir::verify(module) when
+  // user_raster_shader is set). Every other format_tag keeps the pre-F3
+  // ir::parse_module path unchanged.
+  if (code_object->code.format_tag == "vg.msl.raster/v1") {
+    try {
+      const std::string text(code_object->code.bytes.begin(), code_object->code.bytes.end());
+      plan.user_raster_shader = vg::ir::parse_msl_raster_envelope(text);
+    } catch (const std::exception& e) {
+      set_diagnostic(e.what());
+      return VG_ERROR_INVALID_ARGUMENT;
+    }
+  } else {
+    vg::ir::Module module;
+    try {
+      const std::string text(code_object->code.bytes.begin(), code_object->code.bytes.end());
+      module = vg::ir::parse_module(text);
+    } catch (const std::exception& e) {
+      set_diagnostic(e.what());
+      return VG_ERROR_INVALID_ARGUMENT;
+    }
+    plan.module = std::move(module);
   }
 
-  vg::hal::ExecutionPlan plan;
   plan.capabilities = device->hal->capabilities();
-  plan.module = std::move(module);
   plan.published = true;
   // TOCTOU narrowing (ADR-044 Concurrency): re-validate immediately before
   // each handle's last dereference in this function. This does not close

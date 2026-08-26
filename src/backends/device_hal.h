@@ -45,6 +45,13 @@ enum class Capability : uint32_t {
   // backend that dereferences facets unchecked leaves the bit clear rather
   // than letting a caller believe a stale token would be caught.
   CheckedFacetGeneration = 1u << 8,
+  // F3 (ADR-043 Decision #4): advertising this obliges the backend to accept
+  // an ExecutionPlan::user_raster_shader submission -- compiling the
+  // caller's hand-written MSL against its declared effect contract only,
+  // never validating shader logic -- and to classify that trust boundary as
+  // HostAssisted, never a silently upgraded fully-verified status. A backend
+  // with no restricted-import path leaves the bit clear.
+  UserShaderImport = 1u << 9,
 };
 
 struct CapabilitySnapshot {
@@ -217,6 +224,12 @@ struct ExecutionPlan {
   // selection must classify Serialized/HostAssisted -- never DevicePass.
   bool request_tier2_select{};
   std::vector<uint32_t> authorized_node_classes;
+  // F3 (ADR-043 Decision #4): when set, this submission carries a restricted-
+  // import hand-written MSL raster shader instead of `module`'s linear IR --
+  // `module` stays default/empty and validate() skips ir::verify(module)
+  // entirely in that case, since there is no IR to verify. Meaningless (and
+  // never set) unless the backend advertises Capability::UserShaderImport.
+  std::optional<ir::UserRasterShaderContract> user_raster_shader;
 
   bool validate(std::string* error = nullptr) const;
   // Checked separately from validate() because it needs the live arena: a
@@ -275,6 +288,33 @@ struct RasterTaskResult {
   bool stored{};
   bool contents_defined{true};
 };
+
+// F2 (ADR-046) Decision #3: single source of truth for the fixed raster-
+// attachment defaults (load=Clear, store=Store, clear_rgba={0,0,0,1},
+// sample_count=1, subresource={0,0}) that F2 deliberately keeps backend-
+// private rather than promoting to core (see reference::AttachmentFacetDesc /
+// metal::AttachmentFacetDesc's own comments -- promoting them here would be
+// exactly the "adapter feature upgraded to core minimum capability"
+// anti-pattern docs/START.md §5 rules out, ADR-046 Decision #3). Templated,
+// not one shared struct returned directly, because reference::
+// AttachmentFacetDesc and metal::AttachmentFacetDesc are deliberately two
+// distinct backend-local types (same rationale) that merely happen to share
+// field names/shape -- this fills in whichever one the caller names without
+// requiring them to be unified. Used by both backends' submit-path RasterDesc
+// construction (reference_device_hal.cpp, metal_device_hal.mm) and both
+// raster tests' oracle construction (reference_raster_test.cpp,
+// metal_task_timeline_test.cpp), so the five fixed values are hand-written
+// exactly once.
+template <typename AttachmentFacetDescT>
+constexpr AttachmentFacetDescT f2_default_raster_attachment_config() {
+  AttachmentFacetDescT desc{};
+  desc.load = decltype(desc.load)::Clear;
+  desc.store = decltype(desc.store)::Store;
+  desc.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
+  desc.sample_count = 1;
+  desc.subresource = {};
+  return desc;
+}
 
 struct Submission {
   uint32_t abi_version{kDeviceHalAbiVersion};

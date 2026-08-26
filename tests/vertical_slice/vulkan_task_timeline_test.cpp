@@ -220,11 +220,174 @@ bool run_timeline(const std::string& root) {
   return true;
 }
 
+// F2 (ADR-046) wired TaskGraph-driven rasterization through compile()/
+// submit() for the reference and Metal backends only -- this backend's own
+// raster machinery (ensure_raster_pipeline/run_raster_facet in
+// vulkan_device_hal.cpp) is separate, pre-existing, and permanently
+// compile-review-only (ADR-043 §7). A Raster-kind TaskRecord reaching this
+// backend's TaskGraph must be rejected at compile() time (Unsupported), not
+// silently republished as a default x=y=z=1 compute dispatch --
+// pack_task_record/unpack_task_record (vulkan_device_hal.cpp) never read
+// task.kind, so without this check the task would fall straight through the
+// GPU task-ring publication path. Same START.md §4 invariant 10 contract
+// reference/Metal already enforce for index_count > 0 (see
+// reference_raster_test.cpp / metal_task_timeline_test.cpp's indexed-draw
+// sub-case). Compile-review-only here since no Linux/NVIDIA hardware is
+// available to actually run this binary.
+bool run_raster_rejected(const std::string& root) {
+  (void)root;
+  std::string device_error;
+  auto vulkan_device = vg::vulkan::make_device_hal(&device_error);
+  if (vulkan_device == nullptr) {
+    std::cerr << "raster-rejected: no Vulkan device available on this host: " << device_error << "\n";
+    return false;
+  }
+
+  vg::core::Arena arena;
+  const auto module = make_probe_module(arena);
+
+  // An otherwise-default TaskRecord is enough to reach the kind==Raster
+  // rejection: TaskGraph::validate_execution() (run inside plan.validate(),
+  // ahead of this check) only requires the graph to be sealed/published with
+  // non-zero node/root generation, both of which default to 1, and never
+  // inspects FacetRef contents.
+  TaskRecord raster_task{};
+  raster_task.kind = vg::core::TaskKind::Raster;
+  TaskGraphBuilder builder;
+  if (!builder.append(raster_task)) {
+    std::cerr << "raster-rejected: failed to append raster task\n";
+    return false;
+  }
+  TaskGraph graph;
+  if (!builder.seal(&graph) || !graph.publish()) {
+    std::cerr << "raster-rejected: failed to seal/publish task graph\n";
+    return false;
+  }
+
+  vg::hal::ExecutionPlan plan;
+  plan.capabilities = vulkan_device->capabilities();
+  plan.module = module;
+  plan.published = true;
+  plan.task_graph = graph;
+  plan.graph_epoch = arena.topology_epoch();
+
+  vg::hal::CompiledPlan compiled;
+  std::string error;
+  if (vulkan_device->compile(plan, &compiled, &error)) {
+    std::cerr << "raster-rejected: compile() unexpectedly accepted a Raster-kind task\n";
+    return false;
+  }
+  if (error != "raster tasks not supported on Vulkan backend") {
+    std::cerr << "raster-rejected: unexpected error message: " << error << "\n";
+    return false;
+  }
+  if (compiled.report.supported) {
+    std::cerr << "raster-rejected: report.supported should be false\n";
+    return false;
+  }
+  bool found_unsupported_event = false;
+  for (const auto& event : compiled.report.events) {
+    if (event.operation == "raster_task" && event.classification == vg::hal::LoweringClass::Unsupported) {
+      found_unsupported_event = true;
+      break;
+    }
+  }
+  if (!found_unsupported_event) {
+    std::cerr << "raster-rejected: missing Unsupported raster_task LoweringEvent\n";
+    return false;
+  }
+  std::cout << "raster-rejected: ok\n";
+  return true;
+}
+
+// F3 (ADR-043 Decision #4): a restricted-import "vg.msl.raster/v1"
+// submission (plan.user_raster_shader set, plan.module left default) needed
+// zero new Vulkan code -- ExecutionPlan::validate() already skips
+// ir::verify(module) whenever user_raster_shader is set (so the default/
+// empty module here no longer chokes it), and this backend's pre-existing
+// task.kind==Raster rejection loop above (run_raster_rejected) runs right
+// after validate() succeeds and rejects the task before pack_task_record
+// ever sees it, identically to the plain-raster case. This is a cheap
+// regression guard that the two features compose correctly, not a new
+// code path: same "raster tasks not supported on Vulkan backend" message,
+// same Unsupported "raster_task" LoweringEvent. Compile-review-only here
+// since no Linux/NVIDIA hardware is available to actually run this binary.
+bool run_raster_msl_rejected(const std::string& root) {
+  (void)root;
+  std::string device_error;
+  auto vulkan_device = vg::vulkan::make_device_hal(&device_error);
+  if (vulkan_device == nullptr) {
+    std::cerr << "raster-msl-rejected: no Vulkan device available on this host: " << device_error << "\n";
+    return false;
+  }
+
+  // An otherwise-default TaskRecord is enough to reach the kind==Raster
+  // rejection, same as raster-rejected above.
+  TaskRecord raster_task{};
+  raster_task.kind = vg::core::TaskKind::Raster;
+  TaskGraphBuilder builder;
+  if (!builder.append(raster_task)) {
+    std::cerr << "raster-msl-rejected: failed to append raster task\n";
+    return false;
+  }
+  TaskGraph graph;
+  if (!builder.seal(&graph) || !graph.publish()) {
+    std::cerr << "raster-msl-rejected: failed to seal/publish task graph\n";
+    return false;
+  }
+
+  vg::core::Arena arena;
+  vg::hal::ExecutionPlan plan;
+  plan.capabilities = vulkan_device->capabilities();
+  // plan.module stays default (never set): a "vg.msl.raster/v1" submission
+  // never carries linear IR (vg_api_execution.cpp's submit()). Without
+  // user_raster_shader set, ExecutionPlan::validate() would instead run
+  // ir::verify(module) on this default/empty module and fail there --
+  // before ever reaching the Raster-kind rejection below, which is exactly
+  // the "chokes on the empty module in MSL-mode" case F3 fixed in
+  // validate() so the two paths compose (see device_hal.cpp).
+  plan.user_raster_shader = vg::ir::UserRasterShaderContract{
+      "vg.test.raster/v1", "vg_test_vertex", "vg_test_fragment",
+      "#version 450\nvoid main() {}\n"};
+  plan.published = true;
+  plan.task_graph = graph;
+  plan.graph_epoch = arena.topology_epoch();
+
+  vg::hal::CompiledPlan compiled;
+  std::string error;
+  if (vulkan_device->compile(plan, &compiled, &error)) {
+    std::cerr << "raster-msl-rejected: compile() unexpectedly accepted a user_raster_shader Raster-kind task\n";
+    return false;
+  }
+  if (error != "raster tasks not supported on Vulkan backend") {
+    std::cerr << "raster-msl-rejected: unexpected error message: " << error << "\n";
+    return false;
+  }
+  if (compiled.report.supported) {
+    std::cerr << "raster-msl-rejected: report.supported should be false\n";
+    return false;
+  }
+  bool found_unsupported_event = false;
+  for (const auto& event : compiled.report.events) {
+    if (event.operation == "raster_task" && event.classification == vg::hal::LoweringClass::Unsupported) {
+      found_unsupported_event = true;
+      break;
+    }
+  }
+  if (!found_unsupported_event) {
+    std::cerr << "raster-msl-rejected: missing Unsupported raster_task LoweringEvent\n";
+    return false;
+  }
+  std::cout << "raster-msl-rejected: ok\n";
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc != 3) {
-    std::cerr << "usage: vg_vulkan_task_timeline_test <task-tier0|timeline> <repo_root>\n";
+    std::cerr << "usage: vg_vulkan_task_timeline_test "
+                 "<task-tier0|timeline|raster-rejected|raster-msl-rejected> <repo_root>\n";
     return 2;
   }
   const std::string mode = argv[1];
@@ -234,6 +397,10 @@ int main(int argc, char** argv) {
     ok = run_task_tier0(root);
   } else if (mode == "timeline") {
     ok = run_timeline(root);
+  } else if (mode == "raster-rejected") {
+    ok = run_raster_rejected(root);
+  } else if (mode == "raster-msl-rejected") {
+    ok = run_raster_msl_rejected(root);
   } else {
     std::cerr << "unknown mode: " << mode << "\n";
     return 2;

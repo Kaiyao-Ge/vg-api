@@ -26,5 +26,14 @@ Module parse_module(const std::string& text);
 std::string serialize_module(const Module& module);
 VerifyResult verify(const Module& module);
 bool effect_covers(const Effect& declared, const Effect& actual);
+// F3 (ADR-043 Decision #4): the declared effect contract for a restricted-
+// import hand-written MSL raster shader -- root_schema here is an unrelated
+// concept from Module::root_schema (same field name, different meaning: this
+// one names the shader's declared root schema, not an IR module's) and must
+// never be cross-assigned with it. The compiler validates only this
+// caller-declared shape, never the MSL source's logic (source is carried
+// through untouched).
+struct UserRasterShaderContract { std::string root_schema; std::string vertex_entry; std::string fragment_entry; std::string source; };
+UserRasterShaderContract parse_msl_raster_envelope(const std::string& text);
 }
 #endif

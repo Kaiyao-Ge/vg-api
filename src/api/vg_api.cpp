@@ -150,22 +150,27 @@ extern "C" VG_API VgResult VG_CALL vgGetApi(uint32_t requested_version, VgApi* o
   // v1.0's layout is exactly the first 5 members (version, size, and the
   // three original function pointers); v1.1 adds the golden-path chain
   // through getSubmissionLoweringReport; v1.2 (ADR-045) appends
-  // getSubmissionExecutionResult. Using the version-appropriate boundary
-  // here (rather than always requiring sizeof(VgApi)) is what lets an older
-  // caller with an older-sized output buffer succeed against this newer
-  // library -- the actual backward-compatibility contract offsetof/size
-  // negotiation exists for.
+  // getSubmissionExecutionResult; v1.3 (F2/ADR-046, F3.5/ADR-048) appends
+  // acquireFacet. Using the version-appropriate boundary here (rather than
+  // always requiring sizeof(VgApi)) is what lets an older caller with an
+  // older-sized output buffer succeed against this newer library -- the
+  // actual backward-compatibility contract offsetof/size negotiation exists
+  // for.
   const size_t v1_0_size = offsetof(VgApi, openAdapter);
   const size_t v1_1_size = offsetof(VgApi, getSubmissionExecutionResult);
+  const size_t v1_2_size = offsetof(VgApi, acquireFacet);
   if (out_api == nullptr ||
       (requested_version != VG_API_VERSION_1_0 && requested_version != VG_API_VERSION_1_1 &&
-       requested_version != VG_API_VERSION_1_2)) {
+       requested_version != VG_API_VERSION_1_2 && requested_version != VG_API_VERSION_1_3)) {
     vg_api::set_diagnostic("requested API version is unsupported");
     return VG_ERROR_INVALID_ARGUMENT;
   }
-  const bool at_least_v1_1 = requested_version == VG_API_VERSION_1_1 || requested_version == VG_API_VERSION_1_2;
-  const bool at_least_v1_2 = requested_version == VG_API_VERSION_1_2;
-  const size_t full_size = at_least_v1_2 ? sizeof(VgApi) : (at_least_v1_1 ? v1_1_size : v1_0_size);
+  const bool at_least_v1_1 = requested_version == VG_API_VERSION_1_1 || requested_version == VG_API_VERSION_1_2 ||
+                              requested_version == VG_API_VERSION_1_3;
+  const bool at_least_v1_2 = requested_version == VG_API_VERSION_1_2 || requested_version == VG_API_VERSION_1_3;
+  const bool at_least_v1_3 = requested_version == VG_API_VERSION_1_3;
+  const size_t full_size =
+      at_least_v1_3 ? sizeof(VgApi) : (at_least_v1_2 ? v1_2_size : (at_least_v1_1 ? v1_1_size : v1_0_size));
   if (out_api->size < full_size) {
     vg_api::set_diagnostic("output API table is too small for the requested version");
     return VG_ERROR_INVALID_ARGUMENT;
@@ -210,6 +215,9 @@ extern "C" VG_API VgResult VG_CALL vgGetApi(uint32_t requested_version, VgApi* o
   }
   if (at_least_v1_2) {
     api.getSubmissionExecutionResult = vg_api::get_submission_execution_result;
+  }
+  if (at_least_v1_3) {
+    api.acquireFacet = vg_api::acquire_facet;
   }
   std::memcpy(out_api, &api, full_size);
   return VG_SUCCESS;

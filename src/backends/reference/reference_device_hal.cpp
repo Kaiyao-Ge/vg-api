@@ -30,7 +30,13 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         // in-shader check 06 §6.4 asks a GPU adapter for.
         static_cast<uint64_t>(hal::Capability::Raster) |
         static_cast<uint64_t>(hal::Capability::RepresentationTransform) |
-        static_cast<uint64_t>(hal::Capability::CheckedFacetGeneration);
+        static_cast<uint64_t>(hal::Capability::CheckedFacetGeneration) |
+        // F3 (ADR-043 Decision #4): this backend accepts an
+        // ExecutionPlan::user_raster_shader submission (compile()/submit()
+        // below), but only against its declared effect contract -- it never
+        // interprets the supplied MSL text, applying its own fixed C++
+        // shading instead and disclosing that as HostAssisted.
+        static_cast<uint64_t>(hal::Capability::UserShaderImport);
     capabilities_.max_buffer_size = UINT64_MAX;
     capabilities_.address_width = 64;
     capabilities_.min_buffer_alignment = 1;
@@ -56,17 +62,37 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       if (error) *error = compiled->report.diagnostic;
       return false;
     }
-    const auto package = compiler::build_linear_compute_package(plan.module);
-    if (!package.ok) { if (error) *error = package.message; return false; }
-    compiled->abi_version = hal::kDeviceHalAbiVersion;
-    compiled->plan = plan;
-    compiled->compute_package = package.package;
-    compiled->report = {};
-    compiled->report.backend = hal::BackendKind::Reference;
-    compiled->report.supported = true;
-    compiled->report.add("canonical_ir", hal::LoweringClass::Direct, 1, plan.module.instructions.size(), "reference interpreter");
-    compiled->report.add("compute_package", hal::LoweringClass::Direct, 1, package.package.bindings.size(), "shared B4 linear package");
-    compiled->report.add("linear_access", hal::LoweringClass::Direct, plan.module.instructions.size(), 0, "checked arena access");
+    if (plan.user_raster_shader.has_value()) {
+      // F3 (ADR-043 Decision #4): plan.module is default/empty in this mode
+      // (vg_api_execution.cpp's submit() leaves it unset when the code
+      // object is vg.msl.raster/v1), so building a compute package from it
+      // would be meaningless -- skip straight to the disclosure event below.
+      // HostAssisted, not Direct: this backend accepts the caller's declared
+      // root_schema/entry points but never interprets the supplied MSL text;
+      // submit() below still runs its own fixed C++ shading regardless of
+      // what that MSL says (unlike Metal, which really compiles and runs it).
+      compiled->abi_version = hal::kDeviceHalAbiVersion;
+      compiled->plan = plan;
+      compiled->report = {};
+      compiled->report.backend = hal::BackendKind::Reference;
+      compiled->report.supported = true;
+      compiled->report.add("raster_user_shader", hal::LoweringClass::HostAssisted, 1,
+                           plan.user_raster_shader->source.size(),
+                           "caller-declared effect contract accepted; shader logic not independently verified; "
+                           "reference backend applies fixed C++ shading regardless of supplied MSL text");
+    } else {
+      const auto package = compiler::build_linear_compute_package(plan.module);
+      if (!package.ok) { if (error) *error = package.message; return false; }
+      compiled->abi_version = hal::kDeviceHalAbiVersion;
+      compiled->plan = plan;
+      compiled->compute_package = package.package;
+      compiled->report = {};
+      compiled->report.backend = hal::BackendKind::Reference;
+      compiled->report.supported = true;
+      compiled->report.add("canonical_ir", hal::LoweringClass::Direct, 1, plan.module.instructions.size(), "reference interpreter");
+      compiled->report.add("compute_package", hal::LoweringClass::Direct, 1, package.package.bindings.size(), "shared B4 linear package");
+      compiled->report.add("linear_access", hal::LoweringClass::Direct, plan.module.instructions.size(), 0, "checked arena access");
+    }
     if (!plan.task_graph.tasks().empty()) compiled->report.add("task_publication", hal::LoweringClass::Direct, plan.task_graph.tasks().size(), 0, "immutable task graph");
     if (plan.timeline_signal != 0) compiled->report.add("timeline", hal::LoweringClass::Direct, 1, 0, "reference monotonic timeline");
     // plan.validate() above already rejected a malformed request set, so every
@@ -159,10 +185,21 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     // below, and cpu_encode_ns stays 0 since there is no separate encode
     // phase to distinguish it from.
     const auto submit_start = std::chrono::steady_clock::now();
-    submission->result = execute(compiled.plan.module, arena,
-                                 compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate,
-                                 &timeline_, {.wait = compiled.plan.timeline_wait,
-                                              .signal = compiled.plan.timeline_signal});
+    if (compiled.plan.user_raster_shader.has_value()) {
+      // F3 (ADR-043 Decision #4): compiled.plan.module is default/empty in
+      // this mode, so there is no compute-module work for execute() to run --
+      // calling it would additionally trip its internal ir::verify() rejection
+      // of an empty module. Synthesize the trivial success result the raster
+      // block below expects; the actual raster shading happens there,
+      // unchanged, via raster_triangles().
+      submission->result = core::ExecutionResult{};
+      submission->result.ok = true;
+    } else {
+      submission->result = execute(compiled.plan.module, arena,
+                                   compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate,
+                                   &timeline_, {.wait = compiled.plan.timeline_wait,
+                                                .signal = compiled.plan.timeline_signal});
+    }
     submission->timeline_value = timeline_.value();
     if (!submission->result.ok) {
       submission->cpu_submit_ns =
@@ -249,11 +286,7 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
           std::memcpy(vertices.data(), vertex_allocation->bytes.data(), vertex_count * sizeof(RasterVertex));
         }
         RasterDesc desc;
-        desc.attachment.load = AttachmentLoadAction::Clear;
-        desc.attachment.store = AttachmentStoreAction::Store;
-        desc.attachment.clear_rgba = {0.0f, 0.0f, 0.0f, 1.0f};
-        desc.attachment.sample_count = 1;
-        desc.attachment.subresource = {};
+        desc.attachment = hal::f2_default_raster_attachment_config<AttachmentFacetDesc>();
         desc.filter = task.raster_filter;
         desc.wrap = task.raster_wrap;
         desc.tint = task.raster_tint;

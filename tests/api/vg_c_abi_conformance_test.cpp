@@ -500,5 +500,670 @@ int main() {
     legacy.destroyRuntime(rt);
   }
 
+  // ------------------------------------------------------------------------
+  // F3.5 (ADR-046/ADR-048): a genuine end-to-end raster submission through
+  // nothing but the public C-ABI -- vgGetApi(v1.3) -> createRuntime ->
+  // openAdapter/createDevice -> createArena -> loadCodeObject
+  // ("vg.msl.raster/v1") -> acquireFacet (source/target/vertex) ->
+  // createTaskGraphBuilder/createNode -> taskGraphAppend(VG_TASK_KIND_RASTER)
+  // -> sealTaskGraph -> submit -> getSubmissionExecutionResult.
+  //
+  // Two structural gaps in the v1.0-v1.3 public surface bound what this test
+  // can assert, and are called out explicitly rather than silently worked
+  // around:
+  //
+  //   Gap #1 (no write-to-allocation API): there is no public entry point to
+  //   copy host bytes into an arenaAllocate()'d allocation anywhere in
+  //   v1.0-v1.3. The source texture and vertex buffer built below are
+  //   therefore necessarily zero-filled -- real geometry/pixel content can
+  //   never be authored through the public ABI as it stands. This does not
+  //   block the assertions below: Metal's raster pipeline is compiled from
+  //   the submitted MSL text (and accepted or rejected based on its
+  //   entry-point names) independently of vertex *content* -- draw-call
+  //   vertex_count is derived purely from the vertex allocation's *byte
+  //   size* (metal_device_hal.mm run_raster_pass/its caller), which is
+  //   non-zero and a multiple of 3 here, so a zero-content vertex buffer
+  //   still exercises the full pipeline-compile path this test cares about.
+  //
+  //   Gap #2 (no pixel-readback API): there is no public entry point to
+  //   retrieve a submission's rendered pixels anywhere in v1.0-v1.3
+  //   (hal::Submission::raster_results::resolved_rgba is never surfaced
+  //   through VgApi; getSubmissionExecutionResult/getSubmissionLoweringReport
+  //   both return outcome-metadata-only JSON). A direct "the output pixel is
+  //   green" assertion is therefore impossible through the public ABI alone.
+  //   In its place this test uses a differential proof that the actual
+  //   submitted MSL text (not just "some MSL") drives real compilation
+  //   behaviour: a well-formed fragment_entry name must submit with
+  //   ok==true, and a fragment_entry name that does not exist in the MSL
+  //   source must submit with ok==false and Metal's specific
+  //   pipeline-compile-failure message -- proving the entry name the caller
+  //   wrote into the JSON envelope is the one Metal actually tried to
+  //   resolve, not just JSON that happened to parse.
+  //
+  // These are genuine gaps in the landed v1.0-v1.3 public API surface (not
+  // bugs in this test), flagged here per this task's instructions rather
+  // than worked around by touching include/vg/vg.h or src/api/*.cpp.
+  {
+    VgApi raster_api{};
+    raster_api.size = sizeof(raster_api);
+    if (!check(vgGetApi(VG_API_VERSION_1_3, &raster_api) == VG_SUCCESS, "vgGetApi v1.3")) return 1;
+    check(raster_api.version == VG_API_VERSION_1_3, "raster_api.version == v1.3");
+    check(raster_api.size == sizeof(VgApi), "raster_api.size == sizeof(VgApi) at v1.3");
+
+    VgRuntimeDesc raster_runtime_desc{};
+    raster_runtime_desc.header.type = VG_STRUCTURE_RUNTIME_DESC;
+    raster_runtime_desc.header.size = sizeof(raster_runtime_desc);
+    VgRuntime raster_runtime = nullptr;
+    if (!check(raster_api.createRuntime(&raster_runtime_desc, &raster_runtime) == VG_SUCCESS,
+               "raster: createRuntime"))
+      return 1;
+
+    uint32_t raster_adapter_count = 0;
+    check(raster_api.enumerateAdapters(raster_runtime, &raster_adapter_count, nullptr) == VG_SUCCESS,
+          "raster: enumerateAdapters count");
+    check(raster_adapter_count > 0, "raster: at least one adapter enumerated");
+    std::vector<VgAdapterInfo> raster_adapters(raster_adapter_count);
+    for (auto& info : raster_adapters) {
+      info.header.type = VG_STRUCTURE_ADAPTER_INFO;
+      info.header.size = sizeof(VgAdapterInfo);
+    }
+    uint32_t raster_adapter_written = raster_adapter_count;
+    check(raster_api.enumerateAdapters(raster_runtime, &raster_adapter_written, raster_adapters.data()) ==
+              VG_SUCCESS,
+          "raster: enumerateAdapters fill");
+
+    const VgAdapterInfo* raster_chosen = nullptr;
+    for (const auto& info : raster_adapters) {
+      if (info.backend_kind == VG_BACKEND_METAL) {
+        raster_chosen = &info;
+        break;
+      }
+    }
+    if (raster_chosen == nullptr) {
+      for (const auto& info : raster_adapters) {
+        if (info.backend_kind == VG_BACKEND_REFERENCE) {
+          raster_chosen = &info;
+          break;
+        }
+      }
+    }
+    if (!check(raster_chosen != nullptr, "raster: a usable adapter (Metal or reference) is present")) return 1;
+    const bool raster_is_metal = raster_chosen->backend_kind == VG_BACKEND_METAL;
+
+    VgAdapter raster_adapter = nullptr;
+    check(raster_api.openAdapter(raster_runtime, raster_chosen->stable_uuid, &raster_adapter) == VG_SUCCESS,
+          "raster: openAdapter");
+
+    VgDeviceDesc raster_device_desc{};
+    raster_device_desc.header.type = VG_STRUCTURE_DEVICE_DESC;
+    raster_device_desc.header.size = sizeof(raster_device_desc);
+    VgDevice raster_device = nullptr;
+    check(raster_api.createDevice(raster_adapter, &raster_device_desc, &raster_device) == VG_SUCCESS,
+          "raster: createDevice");
+
+    VgAddressDomainDesc raster_domain_desc{};
+    raster_domain_desc.header.type = VG_STRUCTURE_ADDRESS_DOMAIN_DESC;
+    raster_domain_desc.header.size = sizeof(raster_domain_desc);
+    raster_domain_desc.kind = VG_ADDRESS_DOMAIN_DEVICE_LOCAL;
+    VgAddressDomain raster_domain = nullptr;
+    check(raster_api.createAddressDomain(raster_device, &raster_domain_desc, &raster_domain) == VG_SUCCESS,
+          "raster: createAddressDomain");
+
+    VgArenaDesc raster_arena_desc{};
+    raster_arena_desc.header.type = VG_STRUCTURE_ARENA_DESC;
+    raster_arena_desc.header.size = sizeof(raster_arena_desc);
+    raster_arena_desc.domain = raster_domain;
+    VgArena raster_arena = nullptr;
+    check(raster_api.createArena(raster_device, &raster_arena_desc, &raster_arena) == VG_SUCCESS,
+          "raster: createArena");
+
+    // A 4x4 RGBA8Unorm source/target (64 bytes each) and a 6-vertex
+    // (fullscreen-quad-shaped) vertex buffer (96 bytes). Gap #1 above means
+    // these all stay zero-filled -- there is no public write path to load
+    // the fullscreen-quad values metal_fullscreen_quad() uses internally
+    // (tests/vertical_slice/metal_task_timeline_test.cpp).
+    constexpr uint32_t kRasterExtent = 4;
+    constexpr uint64_t kRasterTexelBytes = static_cast<uint64_t>(kRasterExtent) * kRasterExtent * 4;
+    constexpr uint64_t kRasterVertexBytes = 6ull * 4ull * sizeof(float);  // 6 vertices * {x,y,u,v}
+
+    VgAllocation raster_source_allocation = nullptr;
+    check(raster_api.arenaAllocate(raster_arena, kRasterTexelBytes, &raster_source_allocation) == VG_SUCCESS,
+          "raster: arenaAllocate source");
+    uint64_t raster_source_id = 0;
+    uint32_t raster_source_gen = 0;
+    check(raster_api.getAllocationRef(raster_source_allocation, &raster_source_id, &raster_source_gen) ==
+              VG_SUCCESS,
+          "raster: getAllocationRef source");
+
+    VgAllocation raster_target_allocation = nullptr;
+    check(raster_api.arenaAllocate(raster_arena, kRasterTexelBytes, &raster_target_allocation) == VG_SUCCESS,
+          "raster: arenaAllocate target");
+    uint64_t raster_target_id = 0;
+    uint32_t raster_target_gen = 0;
+    check(raster_api.getAllocationRef(raster_target_allocation, &raster_target_id, &raster_target_gen) ==
+              VG_SUCCESS,
+          "raster: getAllocationRef target");
+
+    VgAllocation raster_vertex_allocation = nullptr;
+    check(raster_api.arenaAllocate(raster_arena, kRasterVertexBytes, &raster_vertex_allocation) == VG_SUCCESS,
+          "raster: arenaAllocate vertex buffer");
+    uint64_t raster_vertex_id = 0;
+    uint32_t raster_vertex_gen = 0;
+    check(raster_api.getAllocationRef(raster_vertex_allocation, &raster_vertex_id, &raster_vertex_gen) ==
+              VG_SUCCESS,
+          "raster: getAllocationRef vertex buffer");
+
+    // acquireFacet (the new v1.3 entry point): source is Sample-kind, target
+    // is Attachment-kind, the vertex buffer is Address-kind -- mirroring
+    // run_task_graph_raster_user_shader's internal-API precedent
+    // (tests/vertical_slice/metal_task_timeline_test.cpp).
+    VgCanonicalViewDesc raster_source_view{};
+    raster_source_view.header.type = VG_STRUCTURE_CANONICAL_VIEW_DESC;
+    raster_source_view.header.size = sizeof(raster_source_view);
+    raster_source_view.allocation = raster_source_id;
+    raster_source_view.allocation_generation = raster_source_gen;
+    raster_source_view.format = VG_PIXEL_FORMAT_RGBA8_UNORM;
+    raster_source_view.dimension = VG_VIEW_DIMENSION_TEXTURE_2D;
+    raster_source_view.width = kRasterExtent;
+    raster_source_view.height = kRasterExtent;
+    raster_source_view.array_layers = 1;
+    raster_source_view.mip_levels = 1;
+    // VgCanonicalViewDesc has no default member initializers (plain C
+    // struct), so zero-init leaves swizzle_red/green/blue/alpha all at 0
+    // (VG_SWIZZLE_RED) -- a non-identity swizzle. The internal
+    // core::SwizzleChannels default IS identity, so this must be set
+    // explicitly or Metal rejects the Sample-kind facet with "Unsupported:
+    // non-identity swizzle applies to SampleFacet only".
+    raster_source_view.swizzle_red = VG_SWIZZLE_RED;
+    raster_source_view.swizzle_green = VG_SWIZZLE_GREEN;
+    raster_source_view.swizzle_blue = VG_SWIZZLE_BLUE;
+    raster_source_view.swizzle_alpha = VG_SWIZZLE_ALPHA;
+    VgFacetRef raster_source_facet{};
+    check(raster_api.acquireFacet(raster_device, raster_arena, &raster_source_view, VG_FACET_KIND_SAMPLE,
+                                   &raster_source_facet) == VG_SUCCESS,
+          "raster: acquireFacet source");
+
+    VgCanonicalViewDesc raster_target_view = raster_source_view;
+    raster_target_view.allocation = raster_target_id;
+    raster_target_view.allocation_generation = raster_target_gen;
+    VgFacetRef raster_target_facet{};
+    check(raster_api.acquireFacet(raster_device, raster_arena, &raster_target_view, VG_FACET_KIND_ATTACHMENT,
+                                   &raster_target_facet) == VG_SUCCESS,
+          "raster: acquireFacet target");
+
+    VgCanonicalViewDesc raster_vertex_view{};
+    raster_vertex_view.header.type = VG_STRUCTURE_CANONICAL_VIEW_DESC;
+    raster_vertex_view.header.size = sizeof(raster_vertex_view);
+    raster_vertex_view.allocation = raster_vertex_id;
+    raster_vertex_view.allocation_generation = raster_vertex_gen;
+    raster_vertex_view.format = VG_PIXEL_FORMAT_RGBA8_UNORM;
+    raster_vertex_view.dimension = VG_VIEW_DIMENSION_TEXTURE_2D;
+    raster_vertex_view.width = static_cast<uint32_t>(kRasterVertexBytes / 4);
+    raster_vertex_view.height = 1;
+    raster_vertex_view.array_layers = 1;
+    raster_vertex_view.mip_levels = 1;
+    raster_vertex_view.swizzle_red = VG_SWIZZLE_RED;
+    raster_vertex_view.swizzle_green = VG_SWIZZLE_GREEN;
+    raster_vertex_view.swizzle_blue = VG_SWIZZLE_BLUE;
+    raster_vertex_view.swizzle_alpha = VG_SWIZZLE_ALPHA;
+    VgFacetRef raster_vertex_facet{};
+    check(raster_api.acquireFacet(raster_device, raster_arena, &raster_vertex_view, VG_FACET_KIND_ADDRESS,
+                                   &raster_vertex_facet) == VG_SUCCESS,
+          "raster: acquireFacet vertex buffer");
+
+    // A restricted-import MSL raster shader, structurally matching the fixed
+    // binding contract the encoder unconditionally uses -- buffer/texture/
+    // sampler index 0 for the vertex buffer/tint buffer/texture/sampler
+    // respectively (src/compiler/compiler.h's kRasterVertexBufferIndex,
+    // kRasterTintBufferIndex, kRasterTextureIndex, kRasterSamplerIndex, all
+    // literally 0; mirrored here as literals since this test may not include
+    // internal headers). Mirrors user_raster_msl_source() in
+    // tests/vertical_slice/metal_task_timeline_test.cpp, but with locally
+    // chosen entry-point names.
+    const std::string raster_vertex_entry = "vg_c_abi_raster_vertex";
+    const std::string raster_good_fragment_entry = "vg_c_abi_raster_fragment";
+    const auto make_raster_msl_source = [&](const std::string& fragment_entry) {
+      return std::string(
+                 "#include <metal_stdlib>\n"
+                 "using namespace metal;\n\n"
+                 "struct VgRasterVertex { float2 position; float2 uv; };\n"
+                 "struct VgRasterVaryings { float4 position [[position]]; float2 uv; };\n"
+                 "struct VgRasterFragment { float4 color [[color(0)]]; };\n\n"
+                 "vertex VgRasterVaryings ") +
+             raster_vertex_entry +
+             "(device const VgRasterVertex* vertices [[buffer(0)]],\n"
+             "                                         uint vid [[vertex_id]]) {\n"
+             "  VgRasterVaryings varyings;\n"
+             "  varyings.position = float4(vertices[vid].position, 0.0f, 1.0f);\n"
+             "  varyings.uv = vertices[vid].uv;\n"
+             "  return varyings;\n"
+             "}\n\n"
+             "fragment VgRasterFragment " +
+             fragment_entry +
+             "(VgRasterVaryings varyings [[stage_in]],\n"
+             "                                             texture2d<float, access::sample> tex "
+             "[[texture(0)]],\n"
+             "                                             sampler samp [[sampler(0)]],\n"
+             "                                             constant float4& tint [[buffer(0)]]) {\n"
+             "  (void)tex; (void)samp; (void)tint;\n"
+             "  VgRasterFragment result;\n"
+             "  result.color = float4(0.0f, 1.0f, 0.0f, 1.0f);\n"
+             "  return result;\n"
+             "}\n";
+    };
+
+    // Minimal JSON-string escaper for embedding the MSL source (which
+    // contains newlines) inside the msl-raster envelope's "source" field.
+    const auto json_escape = [](const std::string& text) {
+      std::string out;
+      out.reserve(text.size());
+      for (const char c : text) {
+        switch (c) {
+          case '"':
+            out += "\\\"";
+            break;
+          case '\\':
+            out += "\\\\";
+            break;
+          case '\n':
+            out += "\\n";
+            break;
+          case '\r':
+            out += "\\r";
+            break;
+          case '\t':
+            out += "\\t";
+            break;
+          default:
+            out += c;
+            break;
+        }
+      }
+      return out;
+    };
+
+    // The 4-field "vg.msl.raster/v1" envelope vg::ir::parse_msl_raster_envelope
+    // requires: root_schema, vertex_entry, fragment_entry, source.
+    //
+    // declared_fragment_entry is the envelope's fragment_entry field (the
+    // name Metal looks up via newFunctionWithName: at ensure_raster_pipeline
+    // time -- metal_device_hal.mm). source_fragment_entry is the name the
+    // MSL source text actually *defines* its fragment function under. These
+    // must be independent parameters: the malformed-entry negative case
+    // needs a declared name that is genuinely absent from the compiled
+    // library, not merely a different string baked into both places (which
+    // would make the source define exactly the function being looked up,
+    // defeating the negative test).
+    const auto make_raster_envelope_json = [&](const std::string& declared_fragment_entry,
+                                                const std::string& source_fragment_entry) {
+      return "{\"root_schema\":\"vg.c-abi-conformance.raster/v1\",\"vertex_entry\":\"" + raster_vertex_entry +
+             "\",\"fragment_entry\":\"" + declared_fragment_entry + "\",\"source\":\"" +
+             json_escape(make_raster_msl_source(source_fragment_entry)) + "\"}";
+    };
+
+    // ---- (a) Happy path: a well-formed custom raster shader submits
+    // successfully through the full public C-ABI raster path. ----
+    const std::string raster_good_envelope_json =
+        make_raster_envelope_json(raster_good_fragment_entry, raster_good_fragment_entry);
+
+    VgCodeObjectDesc raster_code_desc{};
+    raster_code_desc.header.type = VG_STRUCTURE_CODE_OBJECT_DESC;
+    raster_code_desc.header.size = sizeof(raster_code_desc);
+    raster_code_desc.bytes = raster_good_envelope_json.data();
+    raster_code_desc.byte_size = raster_good_envelope_json.size();
+    raster_code_desc.format_tag = "vg.msl.raster/v1";
+    VgCodeObject raster_code_object = nullptr;
+    check(raster_api.loadCodeObject(raster_device, &raster_code_desc, &raster_code_object) == VG_SUCCESS,
+          "raster: loadCodeObject vg.msl.raster/v1");
+
+    // taskGraphAppend validates the caller-supplied VgNodeRef unconditionally
+    // regardless of task kind (vg_api_taskgraph.cpp), so a raster-only task
+    // graph still needs a throwaway node -- createNode is format-tag-agnostic
+    // and never parses the MSL source (vg_api_code.cpp).
+    VgNodeDesc raster_node_desc{};
+    raster_node_desc.header.type = VG_STRUCTURE_NODE_DESC;
+    raster_node_desc.header.size = sizeof(raster_node_desc);
+    raster_node_desc.entry_name = "vg_c_abi_raster_throwaway_node";
+    VgNode raster_node = nullptr;
+    check(raster_api.createNode(raster_code_object, &raster_node_desc, &raster_node) == VG_SUCCESS,
+          "raster: createNode");
+    VgNodeRef raster_node_ref{};
+    check(raster_api.getNodeRef(raster_node, &raster_node_ref) == VG_SUCCESS, "raster: getNodeRef");
+
+    VgTaskGraphBuilderDesc raster_builder_desc{};
+    raster_builder_desc.header.type = VG_STRUCTURE_TASK_GRAPH_BUILDER_DESC;
+    raster_builder_desc.header.size = sizeof(raster_builder_desc);
+    raster_builder_desc.code_object = raster_code_object;
+    VgTaskGraphBuilder raster_builder = nullptr;
+    check(raster_api.createTaskGraphBuilder(raster_device, &raster_builder_desc, &raster_builder) == VG_SUCCESS,
+          "raster: createTaskGraphBuilder");
+
+    VgTaskRecord raster_task{};
+    raster_task.node = raster_node_ref;
+    raster_task.root = 0;
+    raster_task.root_generation = 1;  // Non-zero; unused by a raster task, but
+                                       // TaskGraphBuilder::append (device_hal.cpp)
+                                       // requires node_generation/root_generation != 0
+                                       // regardless of task kind.
+    raster_task.shape = {1, 1, 1, 0};
+    raster_task.kind = VG_TASK_KIND_RASTER;
+    raster_task.topology = VG_TOPOLOGY_TRIANGLE_LIST;
+    raster_task.raster_facets.source = raster_source_facet;
+    raster_task.raster_facets.target = raster_target_facet;
+    raster_task.vertex_buffer_ref = raster_vertex_facet;
+    raster_task.raster_filter = VG_FILTER_BILINEAR;
+    raster_task.raster_wrap = VG_WRAP_CLAMP;
+    raster_task.raster_tint[0] = 1.0f;
+    raster_task.raster_tint[1] = 1.0f;
+    raster_task.raster_tint[2] = 1.0f;
+    raster_task.raster_tint[3] = 1.0f;
+
+    VgTaskId raster_task_id{};
+    check(raster_api.taskGraphAppend(raster_builder, &raster_task, 1, &raster_task_id) == VG_SUCCESS,
+          "raster: taskGraphAppend VG_TASK_KIND_RASTER");
+
+    VgSealDesc raster_seal_desc{};
+    raster_seal_desc.header.type = VG_STRUCTURE_SEAL_DESC;
+    raster_seal_desc.header.size = sizeof(raster_seal_desc);
+    VgTaskGraph raster_graph = nullptr;
+    check(raster_api.sealTaskGraph(raster_builder, &raster_seal_desc, &raster_graph) == VG_SUCCESS,
+          "raster: sealTaskGraph");
+
+    VgExecutionEnvelopeDesc raster_envelope_desc{};
+    raster_envelope_desc.header.type = VG_STRUCTURE_EXECUTION_ENVELOPE_DESC;
+    raster_envelope_desc.header.size = sizeof(raster_envelope_desc);
+    raster_envelope_desc.arena = raster_arena;
+    VgExecutionEnvelope raster_envelope = nullptr;
+    check(raster_api.createExecutionEnvelope(raster_device, &raster_envelope_desc, &raster_envelope) ==
+              VG_SUCCESS,
+          "raster: createExecutionEnvelope");
+
+    VgTimeline raster_timeline = nullptr;
+    check(raster_api.createTimeline(raster_device, &raster_timeline) == VG_SUCCESS, "raster: createTimeline");
+
+    VgSubmitDesc raster_submit_desc{};
+    raster_submit_desc.header.type = VG_STRUCTURE_SUBMIT_DESC;
+    raster_submit_desc.header.size = sizeof(raster_submit_desc);
+    raster_submit_desc.graph = raster_graph;
+    raster_submit_desc.envelope = raster_envelope;
+    VgSubmission raster_submission = nullptr;
+    check(raster_api.submit(raster_device, &raster_submit_desc, &raster_submission) == VG_SUCCESS,
+          "raster: submit (well-formed MSL)");
+
+    const char* raster_result_json = nullptr;
+    check(raster_api.getSubmissionExecutionResult(raster_submission, &raster_result_json) == VG_SUCCESS,
+          "raster: getSubmissionExecutionResult (well-formed MSL)");
+    const std::string raster_result_str = raster_result_json != nullptr ? raster_result_json : "";
+    // core::ExecutionResult::canonical_json() serializes `ok` as the integer
+    // 0/1 (core.cpp), not a JSON boolean literal.
+    check(raster_result_str.find("\"ok\":1") != std::string::npos,
+          "raster: well-formed MSL submission execution result reports ok:1 (true)");
+
+    raster_api.destroySubmission(raster_submission);
+    raster_api.destroyTimeline(raster_timeline);
+    raster_api.destroyExecutionEnvelope(raster_envelope);
+    raster_api.destroyTaskGraph(raster_graph);
+    raster_api.destroyTaskGraphBuilder(raster_builder);
+    raster_api.destroyNode(raster_node);
+    raster_api.destroyCodeObject(raster_code_object);
+
+    // ---- (b) Metal-only negative: fragment_entry names a function absent
+    // from the submitted MSL source. Reference never interprets MSL text
+    // (ADR-018 -- it always runs a fixed C++ shading formula regardless of
+    // entry-name correctness, reference_device_hal.cpp), so this sub-case
+    // only makes sense on Metal. Metal's raster pipeline compiles lazily at
+    // submit() time (ensure_raster_pipeline in metal_device_hal.mm), so
+    // submit() itself still returns VG_SUCCESS (host-side acceptance) but the
+    // execution result reports ok:false with the specific
+    // pipeline-compile-failure message -- proof the actual entry name string
+    // drives real Metal shader compilation, not just JSON parsing. ----
+    if (raster_is_metal) {
+      const std::string raster_bad_fragment_entry = "vg_c_abi_raster_fragment_does_not_exist";
+      // make_raster_msl_source(raster_good_fragment_entry) means the compiled
+      // MSL source only defines a fragment function named
+      // raster_good_fragment_entry; declaring fragment_entry as
+      // raster_bad_fragment_entry means Metal's newFunctionWithName: lookup
+      // at ensure_raster_pipeline time genuinely fails to find it -- not
+      // just a mismatched JSON field with a matching function baked in
+      // alongside it.
+      const std::string raster_bad_envelope_json =
+          make_raster_envelope_json(raster_bad_fragment_entry, raster_good_fragment_entry);
+
+      VgCodeObjectDesc raster_bad_code_desc{};
+      raster_bad_code_desc.header.type = VG_STRUCTURE_CODE_OBJECT_DESC;
+      raster_bad_code_desc.header.size = sizeof(raster_bad_code_desc);
+      raster_bad_code_desc.bytes = raster_bad_envelope_json.data();
+      raster_bad_code_desc.byte_size = raster_bad_envelope_json.size();
+      raster_bad_code_desc.format_tag = "vg.msl.raster/v1";
+      VgCodeObject raster_bad_code_object = nullptr;
+      check(raster_api.loadCodeObject(raster_device, &raster_bad_code_desc, &raster_bad_code_object) ==
+                VG_SUCCESS,
+            "raster: loadCodeObject (malformed fragment_entry setup)");
+
+      VgNodeDesc raster_bad_node_desc{};
+      raster_bad_node_desc.header.type = VG_STRUCTURE_NODE_DESC;
+      raster_bad_node_desc.header.size = sizeof(raster_bad_node_desc);
+      raster_bad_node_desc.entry_name = "vg_c_abi_raster_bad_throwaway_node";
+      VgNode raster_bad_node = nullptr;
+      check(raster_api.createNode(raster_bad_code_object, &raster_bad_node_desc, &raster_bad_node) == VG_SUCCESS,
+            "raster: createNode (malformed fragment_entry setup)");
+      VgNodeRef raster_bad_node_ref{};
+      check(raster_api.getNodeRef(raster_bad_node, &raster_bad_node_ref) == VG_SUCCESS,
+            "raster: getNodeRef (malformed fragment_entry setup)");
+
+      VgTaskGraphBuilderDesc raster_bad_builder_desc{};
+      raster_bad_builder_desc.header.type = VG_STRUCTURE_TASK_GRAPH_BUILDER_DESC;
+      raster_bad_builder_desc.header.size = sizeof(raster_bad_builder_desc);
+      raster_bad_builder_desc.code_object = raster_bad_code_object;
+      VgTaskGraphBuilder raster_bad_builder = nullptr;
+      check(raster_api.createTaskGraphBuilder(raster_device, &raster_bad_builder_desc, &raster_bad_builder) ==
+                VG_SUCCESS,
+            "raster: createTaskGraphBuilder (malformed fragment_entry setup)");
+
+      VgTaskRecord raster_bad_task{};
+      raster_bad_task.node = raster_bad_node_ref;
+      raster_bad_task.root = 0;
+      raster_bad_task.root_generation = 1;
+      raster_bad_task.shape = {1, 1, 1, 0};
+      raster_bad_task.kind = VG_TASK_KIND_RASTER;
+      raster_bad_task.topology = VG_TOPOLOGY_TRIANGLE_LIST;
+      raster_bad_task.raster_facets.source = raster_source_facet;
+      raster_bad_task.raster_facets.target = raster_target_facet;
+      raster_bad_task.vertex_buffer_ref = raster_vertex_facet;
+      raster_bad_task.raster_filter = VG_FILTER_BILINEAR;
+      raster_bad_task.raster_wrap = VG_WRAP_CLAMP;
+      raster_bad_task.raster_tint[0] = 1.0f;
+      raster_bad_task.raster_tint[1] = 1.0f;
+      raster_bad_task.raster_tint[2] = 1.0f;
+      raster_bad_task.raster_tint[3] = 1.0f;
+
+      VgTaskId raster_bad_task_id{};
+      check(raster_api.taskGraphAppend(raster_bad_builder, &raster_bad_task, 1, &raster_bad_task_id) ==
+                VG_SUCCESS,
+            "raster: taskGraphAppend (malformed fragment_entry setup)");
+
+      VgSealDesc raster_bad_seal_desc{};
+      raster_bad_seal_desc.header.type = VG_STRUCTURE_SEAL_DESC;
+      raster_bad_seal_desc.header.size = sizeof(raster_bad_seal_desc);
+      VgTaskGraph raster_bad_graph = nullptr;
+      check(raster_api.sealTaskGraph(raster_bad_builder, &raster_bad_seal_desc, &raster_bad_graph) == VG_SUCCESS,
+            "raster: sealTaskGraph (malformed fragment_entry setup)");
+
+      VgExecutionEnvelopeDesc raster_bad_envelope_desc{};
+      raster_bad_envelope_desc.header.type = VG_STRUCTURE_EXECUTION_ENVELOPE_DESC;
+      raster_bad_envelope_desc.header.size = sizeof(raster_bad_envelope_desc);
+      raster_bad_envelope_desc.arena = raster_arena;
+      VgExecutionEnvelope raster_bad_envelope = nullptr;
+      check(raster_api.createExecutionEnvelope(raster_device, &raster_bad_envelope_desc, &raster_bad_envelope) ==
+                VG_SUCCESS,
+            "raster: createExecutionEnvelope (malformed fragment_entry setup)");
+
+      VgTimeline raster_bad_timeline = nullptr;
+      check(raster_api.createTimeline(raster_device, &raster_bad_timeline) == VG_SUCCESS,
+            "raster: createTimeline (malformed fragment_entry setup)");
+
+      VgSubmitDesc raster_bad_submit_desc{};
+      raster_bad_submit_desc.header.type = VG_STRUCTURE_SUBMIT_DESC;
+      raster_bad_submit_desc.header.size = sizeof(raster_bad_submit_desc);
+      raster_bad_submit_desc.graph = raster_bad_graph;
+      raster_bad_submit_desc.envelope = raster_bad_envelope;
+      VgSubmission raster_bad_submission = nullptr;
+      check(raster_api.submit(raster_device, &raster_bad_submit_desc, &raster_bad_submission) == VG_SUCCESS,
+            "raster: submit (malformed fragment_entry) still returns VG_SUCCESS (host-side acceptance)");
+
+      const char* raster_bad_result_json = nullptr;
+      check(raster_api.getSubmissionExecutionResult(raster_bad_submission, &raster_bad_result_json) ==
+                VG_SUCCESS,
+            "raster: getSubmissionExecutionResult (malformed fragment_entry)");
+      const std::string raster_bad_result_str =
+          raster_bad_result_json != nullptr ? raster_bad_result_json : "";
+      check(raster_bad_result_str.find("\"ok\":0") != std::string::npos,
+            "raster: malformed fragment_entry submission execution result reports ok:0 (false)");
+      check(raster_bad_result_str.find("Metal raster pipeline compile failed") != std::string::npos,
+            "raster: malformed fragment_entry execution result names the Metal pipeline-compile failure");
+
+      raster_api.destroySubmission(raster_bad_submission);
+      raster_api.destroyTimeline(raster_bad_timeline);
+      raster_api.destroyExecutionEnvelope(raster_bad_envelope);
+      raster_api.destroyTaskGraph(raster_bad_graph);
+      raster_api.destroyTaskGraphBuilder(raster_bad_builder);
+      raster_api.destroyNode(raster_bad_node);
+      raster_api.destroyCodeObject(raster_bad_code_object);
+    }
+
+    // ---- (c) Backend-agnostic negative: a "vg.msl.raster/v1" submission may
+    // only contain raster tasks -- device_hal.cpp's ExecutionPlan::validate()
+    // rejects any mix of compute+raster under a user_raster_shader plan,
+    // independent of backend. ----
+    {
+      const std::string raster_mixed_envelope_json =
+          make_raster_envelope_json(raster_good_fragment_entry, raster_good_fragment_entry);
+
+      VgCodeObjectDesc raster_mixed_code_desc{};
+      raster_mixed_code_desc.header.type = VG_STRUCTURE_CODE_OBJECT_DESC;
+      raster_mixed_code_desc.header.size = sizeof(raster_mixed_code_desc);
+      raster_mixed_code_desc.bytes = raster_mixed_envelope_json.data();
+      raster_mixed_code_desc.byte_size = raster_mixed_envelope_json.size();
+      raster_mixed_code_desc.format_tag = "vg.msl.raster/v1";
+      VgCodeObject raster_mixed_code_object = nullptr;
+      check(raster_api.loadCodeObject(raster_device, &raster_mixed_code_desc, &raster_mixed_code_object) ==
+                VG_SUCCESS,
+            "raster: loadCodeObject (mixed compute+raster setup)");
+
+      VgNodeDesc raster_mixed_node_desc{};
+      raster_mixed_node_desc.header.type = VG_STRUCTURE_NODE_DESC;
+      raster_mixed_node_desc.header.size = sizeof(raster_mixed_node_desc);
+      raster_mixed_node_desc.entry_name = "vg_c_abi_raster_mixed_throwaway_node";
+      VgNode raster_mixed_node = nullptr;
+      check(raster_api.createNode(raster_mixed_code_object, &raster_mixed_node_desc, &raster_mixed_node) ==
+                VG_SUCCESS,
+            "raster: createNode (mixed compute+raster setup)");
+      VgNodeRef raster_mixed_node_ref{};
+      check(raster_api.getNodeRef(raster_mixed_node, &raster_mixed_node_ref) == VG_SUCCESS,
+            "raster: getNodeRef (mixed compute+raster setup)");
+
+      VgTaskGraphBuilderDesc raster_mixed_builder_desc{};
+      raster_mixed_builder_desc.header.type = VG_STRUCTURE_TASK_GRAPH_BUILDER_DESC;
+      raster_mixed_builder_desc.header.size = sizeof(raster_mixed_builder_desc);
+      raster_mixed_builder_desc.code_object = raster_mixed_code_object;
+      VgTaskGraphBuilder raster_mixed_builder = nullptr;
+      check(raster_api.createTaskGraphBuilder(raster_device, &raster_mixed_builder_desc,
+                                               &raster_mixed_builder) == VG_SUCCESS,
+            "raster: createTaskGraphBuilder (mixed compute+raster setup)");
+
+      VgTaskRecord raster_mixed_tasks[2]{};
+      raster_mixed_tasks[0].node = raster_mixed_node_ref;
+      raster_mixed_tasks[0].root = 0;
+      raster_mixed_tasks[0].root_generation = 1;
+      raster_mixed_tasks[0].shape = {1, 1, 1, 0};
+      raster_mixed_tasks[0].kind = VG_TASK_KIND_COMPUTE;
+
+      raster_mixed_tasks[1].node = raster_mixed_node_ref;
+      raster_mixed_tasks[1].root = 0;
+      raster_mixed_tasks[1].root_generation = 1;
+      raster_mixed_tasks[1].shape = {1, 1, 1, 0};
+      raster_mixed_tasks[1].kind = VG_TASK_KIND_RASTER;
+      raster_mixed_tasks[1].topology = VG_TOPOLOGY_TRIANGLE_LIST;
+      raster_mixed_tasks[1].raster_facets.source = raster_source_facet;
+      raster_mixed_tasks[1].raster_facets.target = raster_target_facet;
+      raster_mixed_tasks[1].vertex_buffer_ref = raster_vertex_facet;
+      raster_mixed_tasks[1].raster_filter = VG_FILTER_BILINEAR;
+      raster_mixed_tasks[1].raster_wrap = VG_WRAP_CLAMP;
+      raster_mixed_tasks[1].raster_tint[0] = 1.0f;
+      raster_mixed_tasks[1].raster_tint[1] = 1.0f;
+      raster_mixed_tasks[1].raster_tint[2] = 1.0f;
+      raster_mixed_tasks[1].raster_tint[3] = 1.0f;
+
+      VgTaskId raster_mixed_ids[2]{};
+      check(raster_api.taskGraphAppend(raster_mixed_builder, raster_mixed_tasks, 2, raster_mixed_ids) ==
+                VG_SUCCESS,
+            "raster: taskGraphAppend mixed compute+raster (mixed compute+raster setup)");
+
+      VgSealDesc raster_mixed_seal_desc{};
+      raster_mixed_seal_desc.header.type = VG_STRUCTURE_SEAL_DESC;
+      raster_mixed_seal_desc.header.size = sizeof(raster_mixed_seal_desc);
+      VgTaskGraph raster_mixed_graph = nullptr;
+      check(raster_api.sealTaskGraph(raster_mixed_builder, &raster_mixed_seal_desc, &raster_mixed_graph) ==
+                VG_SUCCESS,
+            "raster: sealTaskGraph (mixed compute+raster setup)");
+
+      VgExecutionEnvelopeDesc raster_mixed_envelope_desc{};
+      raster_mixed_envelope_desc.header.type = VG_STRUCTURE_EXECUTION_ENVELOPE_DESC;
+      raster_mixed_envelope_desc.header.size = sizeof(raster_mixed_envelope_desc);
+      raster_mixed_envelope_desc.arena = raster_arena;
+      VgExecutionEnvelope raster_mixed_envelope = nullptr;
+      check(raster_api.createExecutionEnvelope(raster_device, &raster_mixed_envelope_desc,
+                                                &raster_mixed_envelope) == VG_SUCCESS,
+            "raster: createExecutionEnvelope (mixed compute+raster setup)");
+
+      VgTimeline raster_mixed_timeline = nullptr;
+      check(raster_api.createTimeline(raster_device, &raster_mixed_timeline) == VG_SUCCESS,
+            "raster: createTimeline (mixed compute+raster setup)");
+
+      VgSubmitDesc raster_mixed_submit_desc{};
+      raster_mixed_submit_desc.header.type = VG_STRUCTURE_SUBMIT_DESC;
+      raster_mixed_submit_desc.header.size = sizeof(raster_mixed_submit_desc);
+      raster_mixed_submit_desc.graph = raster_mixed_graph;
+      raster_mixed_submit_desc.envelope = raster_mixed_envelope;
+      VgSubmission raster_mixed_submission = nullptr;
+      check(raster_api.submit(raster_device, &raster_mixed_submit_desc, &raster_mixed_submission) ==
+                VG_ERROR_INVALID_ARGUMENT,
+            "raster: submit rejects a mixed compute+raster user_raster_shader submission (backend-agnostic)");
+
+      raster_api.destroyExecutionEnvelope(raster_mixed_envelope);
+      raster_api.destroyTimeline(raster_mixed_timeline);
+      raster_api.destroyTaskGraph(raster_mixed_graph);
+      raster_api.destroyTaskGraphBuilder(raster_mixed_builder);
+      raster_api.destroyNode(raster_mixed_node);
+      raster_api.destroyCodeObject(raster_mixed_code_object);
+    }
+
+    raster_api.destroyArena(raster_arena);
+    raster_api.destroyAddressDomain(raster_domain);
+    raster_api.destroyDevice(raster_device);
+    raster_api.closeAdapter(raster_adapter);
+    raster_api.destroyRuntime(raster_runtime);
+  }
+
+  // Version skew (Sec.16), v1.3 extension: request v1.2 from a v1.3-capable
+  // library -- the v1.2/v1.3 boundary is offsetof(VgApi, acquireFacet),
+  // mirroring the v1.0/v1.1 and v1.1/v1.2 boundary checks above.
+  {
+    VgApi v12_api{};
+    v12_api.size = sizeof(v12_api);
+    check(vgGetApi(VG_API_VERSION_1_2, &v12_api) == VG_SUCCESS, "vgGetApi v1.2");
+    check(v12_api.version == VG_API_VERSION_1_2, "v1.2 api.version");
+    check(v12_api.size == offsetof(VgApi, acquireFacet), "v1.2 api.size matches the v1.2/v1.3 boundary");
+
+    VgRuntimeDesc desc{};
+    desc.header.type = VG_STRUCTURE_RUNTIME_DESC;
+    desc.header.size = sizeof(desc);
+    VgRuntime rt = nullptr;
+    check(v12_api.createRuntime(&desc, &rt) == VG_SUCCESS, "v1.2 createRuntime");
+    uint32_t count = 0;
+    check(v12_api.enumerateAdapters(rt, &count, nullptr) == VG_SUCCESS, "v1.2 enumerateAdapters");
+    v12_api.destroyRuntime(rt);
+  }
+
   return g_ok ? 0 : 1;
 }

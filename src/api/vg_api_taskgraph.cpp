@@ -93,6 +93,23 @@ VgResult VG_CALL task_graph_append(VgTaskGraphBuilder builder, const VgTaskRecor
     record.contract_index = tasks[i].contract_index;
     record.payload_size = tasks[i].payload_size;
     record.payload_or_offset = tasks[i].payload_or_offset;
+    // v1.3 (F2/ADR-046, F3.5/ADR-048): blind field-for-field copy, no
+    // default-substitution -- kind/topology/raster_filter/raster_wrap are
+    // raw-cast uint32_t ordinals that already match the internal enums 1:1
+    // (see the v1.3 additions comment in vg.h), and raster_facets/
+    // vertex_buffer_ref/index_buffer_ref are VgFacetRef->core::FacetRef
+    // translated the same way node/root are above.
+    record.kind = static_cast<vg::core::TaskKind>(tasks[i].kind);
+    record.topology = static_cast<vg::core::Topology>(tasks[i].topology);
+    record.raster_facets.source = {tasks[i].raster_facets.source.index, tasks[i].raster_facets.source.generation};
+    record.raster_facets.target = {tasks[i].raster_facets.target.index, tasks[i].raster_facets.target.generation};
+    record.vertex_buffer_ref = {tasks[i].vertex_buffer_ref.index, tasks[i].vertex_buffer_ref.generation};
+    record.index_buffer_ref = {tasks[i].index_buffer_ref.index, tasks[i].index_buffer_ref.generation};
+    record.index_count = tasks[i].index_count;
+    record.raster_filter = static_cast<vg::core::FilterMode>(tasks[i].raster_filter);
+    record.raster_wrap = static_cast<vg::core::WrapMode>(tasks[i].raster_wrap);
+    record.raster_tint = {tasks[i].raster_tint[0], tasks[i].raster_tint[1], tasks[i].raster_tint[2],
+                           tasks[i].raster_tint[3]};
     if (!builder->builder.append(record, &error)) {
       set_diagnostic(error.c_str());
       return VG_ERROR_INVALID_ARGUMENT;
