@@ -2,6 +2,7 @@
 
 #include "backends/reference/reference_executor.h"
 #include "backends/reference/tier2_oracle.h"
+#include "core/scene_root.h"
 
 #include <chrono>
 #include <cstring>
@@ -233,6 +234,9 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       // publish order), matching RasterTaskResult's contract. `tasks` above
       // is scoped to the publish_order block, so re-fetch here.
       const auto& all_tasks = compiled.plan.task_graph.tasks();
+      const std::string& root_schema = compiled.plan.user_raster_shader.has_value()
+          ? compiled.plan.user_raster_shader->root_schema : compiled.plan.module.root_schema;
+      const bool uses_scene_root = core::is_scene_root_raster_schema(root_schema);
       for (uint32_t task_index = 0; task_index < all_tasks.size(); ++task_index) {
         const core::TaskRecord& task = all_tasks[task_index];
         if (task.kind != core::TaskKind::Raster) continue;
@@ -318,6 +322,7 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
           }
           vertices = std::move(indexed);
         }
+        core::RasterFacetPair facets = task.raster_facets;
         RasterDesc desc;
         desc.attachment = hal::f2_default_raster_attachment_config<AttachmentFacetDesc>();
         desc.filter = task.raster_filter;
@@ -327,7 +332,35 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         desc.depth_test_enable = task.depth_test_enable;
         desc.depth_write_enable = task.depth_write_enable;
         desc.depth_compare_op = task.depth_compare_op;
-        const RasterResult raster_result = raster_triangles(arena, facet_pool(), task.raster_facets, desc, vertices);
+        if (uses_scene_root) {
+          core::ResolvedSceneRootRaster root;
+          std::string root_error;
+          if (!core::resolve_scene_root_raster(arena, task, &root, &root_error)) {
+            submission->result.ok = false;
+            submission->result.message = root_error;
+            return true;
+          }
+          facets.source = root.albedo;
+          desc.tint = root.base_color;
+          for (RasterVertex& vertex : vertices) {
+            // Preserve F4's producer contract before the F6 transform. Metal
+            // validates these source bytes before binding the camera, so the
+            // Reference oracle must not accept an out-of-range input merely
+            // because an affine matrix happens to scale it back into range.
+            if (!std::isfinite(vertex.z) || vertex.z < 0.0f || vertex.z > 1.0f) {
+              submission->result.ok = false;
+              submission->result.message = "raster task vertex z must be finite and normalized to [0,1] (F4 vertex ABI)";
+              return true;
+            }
+            if (!core::transform_scene_root_vertex(root, vertex.x, vertex.y, vertex.z,
+                                                    &vertex.x, &vertex.y, &vertex.z, &root_error)) {
+              submission->result.ok = false;
+              submission->result.message = root_error;
+              return true;
+            }
+          }
+        }
+        const RasterResult raster_result = raster_triangles(arena, facet_pool(), facets, desc, vertices);
         if (!raster_result.ok) {
           submission->result.ok = false;
           submission->result.message = raster_result.message;

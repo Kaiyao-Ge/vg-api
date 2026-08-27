@@ -166,17 +166,17 @@ extern "C" VG_API VgResult VG_CALL vgGetApi(uint32_t requested_version, VgApi* o
       (requested_version != VG_API_VERSION_1_0 && requested_version != VG_API_VERSION_1_1 &&
        requested_version != VG_API_VERSION_1_2 && requested_version != VG_API_VERSION_1_3 &&
        requested_version != VG_API_VERSION_1_4 && requested_version != VG_API_VERSION_1_5 &&
-       requested_version != VG_API_VERSION_1_6)) {
+       requested_version != VG_API_VERSION_1_6 && requested_version != VG_API_VERSION_1_7)) {
     vg_api::set_diagnostic("requested API version is unsupported");
     return VG_ERROR_INVALID_ARGUMENT;
   }
   const bool at_least_v1_1 = requested_version == VG_API_VERSION_1_1 || requested_version == VG_API_VERSION_1_2 ||
-                              requested_version == VG_API_VERSION_1_3 || requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6;
+                              requested_version == VG_API_VERSION_1_3 || requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6 || requested_version == VG_API_VERSION_1_7;
   const bool at_least_v1_2 = requested_version == VG_API_VERSION_1_2 || requested_version == VG_API_VERSION_1_3 ||
-                              requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6;
-  const bool at_least_v1_3 = requested_version == VG_API_VERSION_1_3 || requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6;
-  const bool at_least_v1_4 = requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6;
-  const bool at_least_v1_6 = requested_version == VG_API_VERSION_1_6;
+                              requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6 || requested_version == VG_API_VERSION_1_7;
+  const bool at_least_v1_3 = requested_version == VG_API_VERSION_1_3 || requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6 || requested_version == VG_API_VERSION_1_7;
+  const bool at_least_v1_4 = requested_version == VG_API_VERSION_1_4 || requested_version == VG_API_VERSION_1_5 || requested_version == VG_API_VERSION_1_6 || requested_version == VG_API_VERSION_1_7;
+  const bool at_least_v1_6 = requested_version == VG_API_VERSION_1_6 || requested_version == VG_API_VERSION_1_7;
   const size_t full_size =
       at_least_v1_6 ? sizeof(VgApi) : (at_least_v1_4 ? v1_4_size :
                     (at_least_v1_3 ? v1_3_size : (at_least_v1_2 ? v1_2_size : (at_least_v1_1 ? v1_1_size : v1_0_size))));

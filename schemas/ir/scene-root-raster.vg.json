@@ -1,0 +1,24 @@
+{
+  "schema": "vg.schema/v1",
+  "name": "SceneRootRaster",
+  "version": 1,
+  "contract_name": "vg.scene-root.raster/v1",
+  "output": "vg_scene_root",
+  "types": {
+    "Material": {
+      "kind": "struct",
+      "fields": [
+        {"name": "base_color", "type": "f32", "array": 4},
+        {"name": "albedo", "type": "facet_ref", "relocation": "facet"}
+      ]
+    },
+    "SceneRootRaster": {
+      "kind": "struct",
+      "fields": [
+        {"name": "camera_clip_from_local", "type": "f32", "array": 16},
+        {"name": "material", "type": "Material"}
+      ]
+    }
+  },
+  "root": "SceneRootRaster"
+}

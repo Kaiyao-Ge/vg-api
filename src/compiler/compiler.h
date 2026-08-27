@@ -166,6 +166,9 @@ std::string sample_facet_array_vulkan_source();
 // table per stage, so vertex buffer(0) and fragment buffer(0) are different
 // slots and both may legitimately be index 0.
 constexpr uint32_t kRasterVertexBufferIndex = 0;
+// F6's generated SceneRoot is ordinary allocation-backed root data, bound at
+// a second vertex-stage slot. It is not a new UBO/resource family.
+constexpr uint32_t kRasterSceneRootBufferIndex = 1;
 constexpr uint32_t kRasterTintBufferIndex = 0;
 constexpr uint32_t kRasterTextureIndex = 0;
 constexpr uint32_t kRasterSamplerIndex = 0;

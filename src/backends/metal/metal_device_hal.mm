@@ -3,6 +3,7 @@
 
 #include "backends/reference/reference_executor.h"
 #include "compiler/pipeline_classification.h"
+#include "core/scene_root.h"
 #include "ir/sha256.h"
 
 #import <Foundation/Foundation.h>
@@ -734,6 +735,16 @@ struct DeviceHal::Impl {
       it->second.content_epoch = allocation.content_epoch;
     }
     return it->second.buffer;
+  }
+
+  id<MTLBuffer> make_identity_scene_root_buffer() {
+    constexpr size_t kSceneRootBytes = 16 * sizeof(float) + 4 * sizeof(float) + 2 * sizeof(uint32_t);
+    id<MTLBuffer> buffer = [device newBufferWithLength:kSceneRootBytes options:MTLResourceStorageModeShared];
+    if (buffer == nil) return nil;
+    std::memset([buffer contents], 0, kSceneRootBytes);
+    auto* matrix = static_cast<float*>([buffer contents]);
+    matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
+    return buffer;
   }
 
   // Commit a completed GPU buffer write to the canonical F7 byte store and
@@ -1836,7 +1847,8 @@ struct DeviceHal::Impl {
   // `vertex_count` stands in for `vertices.size()` since the caller-supplied
   // MTLBuffer alone carries no length.
   bool run_raster_pass(core::Arena& arena, core::FacetPool& pool, core::RasterFacetPair facets,
-                       const RasterDesc& desc, id<MTLBuffer> vertex_buffer, id<MTLBuffer> tint_buffer,
+                       const RasterDesc& desc, id<MTLBuffer> vertex_buffer, id<MTLBuffer> scene_root_buffer,
+                       id<MTLBuffer> tint_buffer,
                        uint32_t vertex_count, id<MTLBuffer> index_buffer, MTLIndexType index_type,
                        uint32_t index_count, RasterResult* result, std::string* error,
                        const ir::UserRasterShaderContract* user_shader = nullptr) {
@@ -2041,6 +2053,7 @@ struct DeviceHal::Impl {
     [encoder setViewport:(MTLViewport){0.0, 0.0, static_cast<double>(width), static_cast<double>(height),
                                        0.0, 1.0}];
     [encoder setVertexBuffer:vertex_buffer offset:0 atIndex:compiler::kRasterVertexBufferIndex];
+    [encoder setVertexBuffer:scene_root_buffer offset:0 atIndex:compiler::kRasterSceneRootBufferIndex];
     [encoder setFragmentTexture:source_texture atIndex:compiler::kRasterTextureIndex];
     [encoder setFragmentSamplerState:sampler atIndex:compiler::kRasterSamplerIndex];
     [encoder setFragmentBuffer:tint_buffer offset:0 atIndex:compiler::kRasterTintBufferIndex];
@@ -2753,11 +2766,37 @@ struct DeviceHal::SubmitOps {
   static bool raster(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
                      hal::Submission* submission, std::string* out_message) {
     const auto& tasks = compiled.plan.task_graph.tasks();
+    const std::string& root_schema = compiled.plan.user_raster_shader.has_value()
+        ? compiled.plan.user_raster_shader->root_schema : compiled.plan.module.root_schema;
+    const bool uses_scene_root = core::is_scene_root_raster_schema(root_schema);
     for (size_t task_index = 0; task_index < tasks.size(); ++task_index) {
       const core::TaskRecord& task = tasks[task_index];
       if (task.kind != core::TaskKind::Raster) continue;
 
       std::string task_error;
+      core::RasterFacetPair facets = task.raster_facets;
+      std::array<float, 4> tint = task.raster_tint;
+      std::optional<core::ResolvedSceneRootRaster> scene_root;
+      id<MTLBuffer> scene_root_buffer = nil;
+      if (uses_scene_root) {
+        scene_root.emplace();
+        if (!core::resolve_scene_root_raster(arena, task, &*scene_root, &task_error)) {
+          if (out_message) *out_message = task_error;
+          return false;
+        }
+        facets.source = scene_root->albedo;
+        tint = scene_root->base_color;
+        scene_root_buffer = metal.impl_->ensure_buffer(*scene_root->allocation);
+      } else {
+        // The built-in shader always reads slot 1 after F6. Bind an explicit
+        // identity root for every pre-F6 task so its pixels and PSO key stay
+        // unchanged rather than relying on an unbound Metal buffer.
+        scene_root_buffer = metal.impl_->make_identity_scene_root_buffer();
+      }
+      if (scene_root_buffer == nil) {
+        if (out_message) *out_message = "Metal SceneRoot buffer allocation failed";
+        return false;
+      }
       // Address facets are just as much GPU-visible capabilities as sample
       // and attachment facets. Hold vertex (and, below, index) slots until
       // run_raster_pass has committed and waited for the command buffer.
@@ -2807,6 +2846,12 @@ struct DeviceHal::SubmitOps {
             *out_message = "raster task vertex z must be finite and normalized to [0,1] (F4 vertex ABI)";
           return false;
         }
+        if (scene_root.has_value() &&
+            !core::transform_scene_root_vertex(*scene_root, vertex.x, vertex.y, vertex.z,
+                                                &vertex.x, &vertex.y, &vertex.z, &task_error)) {
+          if (out_message) *out_message = task_error;
+          return false;
+        }
       }
 
       id<MTLBuffer> index_buffer = nil;
@@ -2850,7 +2895,7 @@ struct DeviceHal::SubmitOps {
         if (out_message) *out_message = "Metal raster buffer allocation failed";
         return false;
       }
-      std::memcpy([tint_buffer contents], task.raster_tint.data(), sizeof(float) * 4);
+      std::memcpy([tint_buffer contents], tint.data(), sizeof(float) * 4);
 
       // F2 fixed defaults for the backend-private half of RasterDesc; the
       // rest (filter/wrap/tint) comes straight off the TaskRecord.
@@ -2858,7 +2903,7 @@ struct DeviceHal::SubmitOps {
       desc.attachment = hal::f2_default_raster_attachment_config<AttachmentFacetDesc>();
       desc.filter = task.raster_filter;
       desc.wrap = task.raster_wrap;
-      desc.tint = task.raster_tint;
+      desc.tint = tint;
       desc.depth_attachment_ref = task.depth_attachment_ref;
       desc.depth_test_enable = task.depth_test_enable;
       desc.depth_write_enable = task.depth_write_enable;
@@ -2867,7 +2912,7 @@ struct DeviceHal::SubmitOps {
       RasterResult result;
       const ir::UserRasterShaderContract* user_shader =
           compiled.plan.user_raster_shader.has_value() ? &*compiled.plan.user_raster_shader : nullptr;
-      if (!metal.impl_->run_raster_pass(arena, metal.facet_pool(), task.raster_facets, desc, vertex_buffer,
+      if (!metal.impl_->run_raster_pass(arena, metal.facet_pool(), facets, desc, vertex_buffer, scene_root_buffer,
                                         tint_buffer, vertex_count, index_buffer, index_type, task.index_count,
                                         &result, &task_error, user_shader)) {
         if (out_message) *out_message = task_error;
@@ -4021,7 +4066,12 @@ bool DeviceHal::run_raster_triangles(core::Arena& arena, core::FacetPool& pool,
   std::memcpy([vertex_buffer contents], vertices.data(), vertices.size() * sizeof(RasterVertex));
   std::memcpy([tint_buffer contents], desc.tint.data(), sizeof(float) * 4);
 
-  return impl_->run_raster_pass(arena, pool, facets, desc, vertex_buffer, tint_buffer,
+  id<MTLBuffer> scene_root_buffer = impl_->make_identity_scene_root_buffer();
+  if (scene_root_buffer == nil) {
+    if (error) *error = "Metal SceneRoot buffer allocation failed";
+    return false;
+  }
+  return impl_->run_raster_pass(arena, pool, facets, desc, vertex_buffer, scene_root_buffer, tint_buffer,
                                 static_cast<uint32_t>(vertices.size()), nil, MTLIndexTypeUInt16, 0,
                                 result, error);
 }

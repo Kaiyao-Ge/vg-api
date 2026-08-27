@@ -1,5 +1,6 @@
 #include "backends/device_hal.h"
 
+#include "core/scene_root.h"
 #include "ir/ir.h"
 #include "ir/json.h"
 
@@ -119,6 +120,16 @@ bool ExecutionPlan::validate(std::string* error) const {
   } else {
     const auto verification = ir::verify(module);
     if (!verification.ok) { if (error) *error = verification.message; return false; }
+  }
+  const std::string& root_schema = user_raster_shader.has_value()
+      ? user_raster_shader->root_schema : module.root_schema;
+  if (core::is_scene_root_raster_schema(root_schema)) {
+    for (const auto& task : task_graph.tasks()) {
+      if (task.kind != core::TaskKind::Raster) {
+        if (error) *error = "a SceneRoot raster submission may only contain raster tasks; compute+raster mixing is deferred";
+        return false;
+      }
+    }
   }
   if (!capabilities.supports(Capability::LinearAddress)) { if (error) *error = "linear address capability is unsupported"; return false; }
   if (timeline_signal != 0 && timeline_signal <= timeline_wait) { if (error) *error = "timeline signal does not advance past wait"; return false; }

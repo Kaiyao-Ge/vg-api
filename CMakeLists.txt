@@ -19,9 +19,13 @@ find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 
 set(VG_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(VG_SCHEMA_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/schemas/ir/task-root.vg.json")
+set(VG_SCENE_ROOT_SCHEMA_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/schemas/ir/scene-root-raster.vg.json")
 set(VG_SCHEMA_HEADER "${VG_GENERATED_DIR}/vg_task_root.h")
 set(VG_SCHEMA_REFLECTION "${VG_GENERATED_DIR}/vg_task_root.reflection.json")
 set(VG_SCHEMA_GOLDEN "${VG_GENERATED_DIR}/vg_task_root.layout.json")
+set(VG_SCENE_ROOT_HEADER "${VG_GENERATED_DIR}/vg_scene_root.h")
+set(VG_SCENE_ROOT_REFLECTION "${VG_GENERATED_DIR}/vg_scene_root.reflection.json")
+set(VG_SCENE_ROOT_GOLDEN "${VG_GENERATED_DIR}/vg_scene_root.layout.json")
 add_custom_command(
   OUTPUT "${VG_SCHEMA_HEADER}" "${VG_SCHEMA_REFLECTION}" "${VG_SCHEMA_GOLDEN}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${VG_GENERATED_DIR}"
@@ -30,7 +34,16 @@ add_custom_command(
   DEPENDS "${VG_SCHEMA_INPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/vg-schema/vg_schema.py"
   VERBATIM
 )
-add_custom_target(vg_schema_generate DEPENDS "${VG_SCHEMA_HEADER}" "${VG_SCHEMA_REFLECTION}" "${VG_SCHEMA_GOLDEN}")
+add_custom_command(
+  OUTPUT "${VG_SCENE_ROOT_HEADER}" "${VG_SCENE_ROOT_REFLECTION}" "${VG_SCENE_ROOT_GOLDEN}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${VG_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/vg-schema/vg_schema.py"
+          "${VG_SCENE_ROOT_SCHEMA_INPUT}" --out-dir "${VG_GENERATED_DIR}"
+  DEPENDS "${VG_SCENE_ROOT_SCHEMA_INPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/vg-schema/vg_schema.py"
+  VERBATIM
+)
+add_custom_target(vg_schema_generate DEPENDS "${VG_SCHEMA_HEADER}" "${VG_SCHEMA_REFLECTION}" "${VG_SCHEMA_GOLDEN}"
+                                                "${VG_SCENE_ROOT_HEADER}" "${VG_SCENE_ROOT_REFLECTION}" "${VG_SCENE_ROOT_GOLDEN}")
 
 add_library(vg_ir STATIC
     src/ir/json.cpp
@@ -40,9 +53,10 @@ add_library(vg_ir STATIC
 target_compile_features(vg_ir PUBLIC cxx_std_20)
 target_include_directories(vg_ir PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-add_library(vg_core STATIC src/core/core.cpp src/core/task_schema.cpp)
+add_library(vg_core STATIC src/core/core.cpp src/core/task_schema.cpp src/core/scene_root.cpp)
 target_compile_features(vg_core PUBLIC cxx_std_20)
 target_include_directories(vg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(vg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(vg_core PUBLIC "${VG_GENERATED_DIR}")
 target_link_libraries(vg_core PUBLIC vg_ir)
 add_dependencies(vg_core vg_schema_generate)
@@ -156,6 +170,11 @@ add_executable(vg-replay tools/vg-replay.cpp)
 target_link_libraries(vg-replay PRIVATE vg_capture vg_backend_reference)
 target_compile_features(vg-replay PRIVATE cxx_std_20)
 
+# A standalone public-C-ABI sample.  It deliberately includes only <vg/vg.h>
+# and writes the read-back color attachment as a portable PPM image.
+add_executable(vg-offscreen-triangle-ppm tools/vg-offscreen-triangle-ppm.c)
+target_link_libraries(vg-offscreen-triangle-ppm PRIVATE vg_api)
+
 # Regenerates tests/fixtures/golden/* from tests/fixtures/ir/*.vgir.json.
 # Built by default; never invoked automatically by CTest or CI.
 add_executable(vg-golden-gen tools/vg-golden-gen/vg_golden_gen.cpp)
@@ -192,6 +211,9 @@ if(BUILD_TESTING)
   add_executable(vg_f7_checkpoint_a_test tests/api/vg_f7_checkpoint_a.c)
   target_link_libraries(vg_f7_checkpoint_a_test PRIVATE vg_api)
   add_test(NAME api.f7-checkpoint-a-c COMMAND vg_f7_checkpoint_a_test)
+  add_executable(vg_f6_scene_root_test tests/api/vg_f6_scene_root.c)
+  target_link_libraries(vg_f6_scene_root_test PRIVATE vg_api)
+  add_test(NAME api.f6-scene-root-c COMMAND vg_f6_scene_root_test)
 
   if(VG_ENABLE_METAL)
     # Reruns E002 (ADR-028/TASK-B15 typed pointer graph) through the public

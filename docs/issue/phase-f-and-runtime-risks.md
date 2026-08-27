@@ -247,3 +247,24 @@ allocation 作为 Sample facet texture 读取并验证新像素的链路固定�
 - 是否在 F6 SceneRoot/material texture 使用前补一条 Metal compute→SampleFacet→raster 的
   content-epoch freshness conformance？
 - 该测试应使用线性、indexed binding 还是 effect-DAG compute，或三者都覆盖？
+
+## 7. F6 SceneRoot 中嵌入 facet 的 effect 与 capture 边界
+
+### 现状
+
+F6 的 `SceneRootRaster` 将 `Material.albedo` 作为生成布局中的 `VgFacetRef`。
+运行时在 submit 时解析它，并在 Reference/Metal 的同一 raster binding 路径使用它；但
+`TaskGraphBuilder::seal` 不持有 Arena/FacetPool，无法把 root 内的 token 精确还原为
+allocation/range effect。Capture v1 也没有 FacetPool snapshot/reacquire 表。
+
+### 当前约束
+
+F6 仅承诺 host 在 submit 前准备只读 material；跨 task 的 producer/consumer 必须继续
+显式 `addDependency`。SceneRoot capture replay 目前明确拒绝，不会把已序列化的 token
+静默当作可用 capability。
+
+### 需要后续回答的问题
+
+- 如何在不修改 sealed graph 的前提下建立 submit-time 的 immutable resolved-effect graph？
+- capture 新版本应如何记录 facet canonical view、重新 acquire token 并按生成 relocation
+  metadata patch root bytes？
