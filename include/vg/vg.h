@@ -275,7 +275,7 @@ typedef struct VgNodeDesc {
     const char* entry_name;
 } VgNodeDesc;
 
-/* Capability token identifying one Node entry inside a VgCodeObject --
+/* Capability token identifying one Node entry inside a VgDevice --
  * index+generation, the same staleness-checked shape as VgFacetRef, obtained
  * via getNodeRef and embedded in VgTaskRecord.node. */
 typedef struct VgNodeRef {
@@ -285,9 +285,8 @@ typedef struct VgNodeRef {
 
 typedef struct VgTaskGraphBuilderDesc {
     VgStructHeader header;
-    /* v1.1 narrowing (ADR-044): every task appended to the resulting graph
-     * runs against this one CodeObject's module. Multi-module task graphs
-     * (one per Effect DAG pass) are deferred past F1. */
+    /* Deprecated same-device compatibility hint.  It does not constrain the
+     * NodeRefs appended to this graph, which are device-scoped. */
     VgCodeObject code_object;
     uint32_t max_tasks;
     uint32_t reserved;

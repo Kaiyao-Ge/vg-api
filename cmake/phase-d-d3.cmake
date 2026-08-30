@@ -7,6 +7,7 @@ target_sources(vg_backend_reference PRIVATE
 
 add_executable(vg_working_set_test tests/unit/working_set_test.cpp)
 target_link_libraries(vg_working_set_test PRIVATE vg_backend_reference vg_compiler)
+target_include_directories(vg_working_set_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
 target_compile_features(vg_working_set_test PRIVATE cxx_std_20)
 add_test(NAME core.working-set COMMAND vg_working_set_test)
 

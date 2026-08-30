@@ -1,6 +1,7 @@
 #include "compiler/compiler.h"
 
 #include "ir/sha256.h"
+#include "vg_scene_root_msl.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -488,22 +489,19 @@ std::string raster_facet_metal_source() {
       // This is an intentional F3 contract break;
       // old four-float user MSL vertex declarations must be rebuilt.
       << "struct VgRasterVertex { packed_float3 position; packed_float2 uv; };\n"
-      // `packed_float4` keeps this MSL declaration byte-identical to the
-      // generated C schema: four 16-byte camera columns, a 16-byte color,
-      // then the 8-byte VgFacetRef. Do not use float4x4 here: its 16-byte
-      // struct alignment would turn the 88-byte host root into a padded ABI.
-      << "struct VgRasterMaterial { packed_float4 base_color; uint2 albedo; };\n"
-      << "struct VgRasterSceneRoot { packed_float4 camera_columns[4]; VgRasterMaterial material; };\n"
+      // Generated from scene-root-raster.vg.json. The declaration names and
+      // packed types are no longer a second handwritten layout source.
+      << VG_SCHEMA_SCENEROOTRASTER_MSL_DECLARATIONS
       << "struct VgRasterVaryings { float4 position [[position]]; float2 uv; };\n"
       << "struct VgRasterFragment { float4 color [[color(0)]]; };\n\n"
       << "vertex VgRasterVaryings vg_raster_vertex(device const VgRasterVertex* vertices [[buffer("
       << kRasterVertexBufferIndex << ")]],\n"
-      << "                                         constant VgRasterSceneRoot& root [[buffer("
+      << "                                         constant VgSchema_SceneRootRaster& root [[buffer("
       << kRasterSceneRootBufferIndex << ")]],\n"
       << "                                         uint vid [[vertex_id]]) {\n"
       << "  VgRasterVaryings varyings;\n"
-      << "  float4x4 camera(float4(root.camera_columns[0]), float4(root.camera_columns[1]), "
-      << "float4(root.camera_columns[2]), float4(root.camera_columns[3]));\n"
+      << "  float4x4 camera(float4(root.camera_clip_from_local[0]), float4(root.camera_clip_from_local[1]), "
+      << "float4(root.camera_clip_from_local[2]), float4(root.camera_clip_from_local[3]));\n"
       << "  varyings.position = camera * float4(float3(vertices[vid].position), 1.0f);\n"
       << "  varyings.uv = float2(vertices[vid].uv);\n"
       << "  return varyings;\n"

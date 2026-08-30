@@ -5,6 +5,7 @@
 #include "capture/capture.h"
 #include "compiler/compiler.h"
 #include "ir/ir.h"
+#include "assembled_plan_fixture.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,38 @@ namespace {
 using vg::core::TaskGraph;
 using vg::core::TaskGraphBuilder;
 using vg::core::TaskRecord;
+
+// All compile/submit paths in this vertical slice start from the public
+// semantic assembly boundary.  Keep the legacy test body focused on the
+// Metal observation it is making; this helper supplies the otherwise
+// repetitive CodeObject/NodeTable/TaskGraph/Envelope plumbing without ever
+// manufacturing Stage 0--5 sealing facts.
+bool assemble_compute_plan(vg::core::Arena& arena, vg::ir::Module module,
+                           std::vector<TaskRecord> tasks, vg::hal::ExecutionPlan* out,
+                           std::string* error, const vg::test_support::AssemblyOptions& options = {}) {
+  // The fixture owns the NodeTable only during assembly; the plan carries its
+  // immutable resolved-node snapshot afterwards, exactly as production does.
+  vg::test_support::AssembledPlanFixture fixture;
+  return vg::test_support::assemble_single_node_plan(arena, std::move(module), tasks, &fixture, out, error, options);
+}
+
+bool assemble_user_raster_plan(vg::core::Arena& arena, const vg::ir::UserRasterShaderContract& shader,
+                               std::vector<TaskRecord> tasks, vg::hal::ExecutionPlan* out,
+                               std::string* error, const vg::test_support::AssemblyOptions& options = {}) {
+  vg::test_support::AssembledPlanFixture fixture;
+  return vg::test_support::assemble_single_user_raster_plan(arena, shader, tasks, &fixture, out, error, options);
+}
+
+TaskRecord probe_task(const vg::ir::Module& module) {
+  TaskRecord task{};
+  // Probe modules always contain a real allocation access.  Binding the task
+  // root to it is deliberate: a compute Task root is part of assembler-owned
+  // authority, rather than a backend fixture shortcut.
+  task.root_allocation = module.instructions.front().allocation;
+  task.root_generation = module.instructions.front().generation;
+  task.x = task.y = task.z = 1;
+  return task;
+}
 
 // A minimal single-load module. Its only purpose is to give compile()/
 // submit() a valid linear compute package to run so the timeline/task-ring
@@ -70,34 +103,31 @@ bool same_task(const TaskRecord& a, const TaskRecord& b) {
 // reference oracle (reference::execute_task_graph()).
 bool run_task_tier0(const std::string& root) {
   (void)root;
-  TaskGraphBuilder builder;
-  TaskRecord task0{};
-  task0.node_index = 0;
-  task0.root_allocation = 42;
+  vg::core::Arena arena;
+  const auto module = make_probe_module(arena);
+  TaskRecord task0 = probe_task(module);
   task0.x = 3;
   task0.y = 2;
   task0.z = 1;
   task0.payload_size = 8;
-  TaskRecord task1{};
-  task1.node_index = 1;
-  task1.root_allocation = 42;
+  TaskRecord task1 = probe_task(module);
   task1.x = 1;
   task1.y = 1;
   task1.z = 1;
   task1.flags = 7;
   task1.contract_index = 3;
   task1.payload_or_offset = 0x1'0000'0001ULL;
-  if (!builder.append(task0) || !builder.append(task1) || !builder.add_dependency(0, 1)) {
-    std::cerr << "task-tier0: failed to build task graph\n";
-    return false;
-  }
-  TaskGraph graph;
-  if (!builder.seal(&graph) || !graph.publish()) {
-    std::cerr << "task-tier0: failed to seal/publish task graph\n";
+  const std::vector<std::pair<uint32_t, uint32_t>> dependencies{{0, 1}};
+  vg::test_support::AssemblyOptions options;
+  options.dependencies = &dependencies;
+  vg::hal::ExecutionPlan plan;
+  std::string error;
+  if (!assemble_compute_plan(arena, module, {task0, task1}, &plan, &error, options)) {
+    std::cerr << "task-tier0: plan assembly failed: " << error << "\n";
     return false;
   }
 
-  auto oracle = vg::reference::execute_task_graph(graph);
+  auto oracle = vg::reference::execute_task_graph(plan.task_graph);
   if (!oracle.ok || oracle.published_tasks.size() != 2) {
     std::cerr << "task-tier0: reference oracle failed: " << oracle.message << "\n";
     return false;
@@ -109,18 +139,7 @@ bool run_task_tier0(const std::string& root) {
     return false;
   }
 
-  vg::core::Arena arena;
-  const auto module = make_probe_module(arena);
-
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal_device->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-
   vg::hal::CompiledPlan compiled;
-  std::string error;
   if (!metal_device->compile(plan, &compiled, &error)) {
     std::cerr << "task-tier0: Metal compile failed: " << error << "\n";
     return false;
@@ -171,11 +190,13 @@ bool run_timeline(const std::string& root) {
   const auto module = make_probe_module(arena);
   std::string error;
 
+  vg::test_support::AssemblyOptions signal_options;
+  signal_options.timeline_signal = 5;
   vg::hal::ExecutionPlan signal_plan;
-  signal_plan.capabilities = metal_device->capabilities();
-  signal_plan.module = module;
-  signal_plan.published = true;
-  signal_plan.timeline_signal = 5;
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &signal_plan, &error, signal_options)) {
+    std::cerr << "timeline: assembly (signal) failed: " << error << "\n";
+    return false;
+  }
   vg::hal::CompiledPlan signal_compiled;
   if (!metal_device->compile(signal_plan, &signal_compiled, &error)) {
     std::cerr << "timeline: compile (signal) failed: " << error << "\n";
@@ -191,12 +212,14 @@ bool run_timeline(const std::string& root) {
     return false;
   }
 
+  vg::test_support::AssemblyOptions wait_options;
+  wait_options.timeline_wait = 5;
+  wait_options.timeline_signal = 10;
   vg::hal::ExecutionPlan wait_plan;
-  wait_plan.capabilities = metal_device->capabilities();
-  wait_plan.module = module;
-  wait_plan.published = true;
-  wait_plan.timeline_wait = 5;
-  wait_plan.timeline_signal = 10;
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &wait_plan, &error, wait_options)) {
+    std::cerr << "timeline: assembly (wait) failed: " << error << "\n";
+    return false;
+  }
   vg::hal::CompiledPlan wait_compiled;
   if (!metal_device->compile(wait_plan, &wait_compiled, &error)) {
     std::cerr << "timeline: compile (wait) failed: " << error << "\n";
@@ -212,12 +235,14 @@ bool run_timeline(const std::string& root) {
     return false;
   }
 
+  vg::test_support::AssemblyOptions stuck_options;
+  stuck_options.timeline_wait = 999;
+  stuck_options.timeline_signal = 1000;
   vg::hal::ExecutionPlan stuck_plan;
-  stuck_plan.capabilities = metal_device->capabilities();
-  stuck_plan.module = module;
-  stuck_plan.published = true;
-  stuck_plan.timeline_wait = 999;
-  stuck_plan.timeline_signal = 1000;
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &stuck_plan, &error, stuck_options)) {
+    std::cerr << "timeline: assembly (stuck) failed: " << error << "\n";
+    return false;
+  }
   vg::hal::CompiledPlan stuck_compiled;
   if (!metal_device->compile(stuck_plan, &stuck_compiled, &error)) {
     std::cerr << "timeline: compile (stuck) failed: " << error << "\n";
@@ -254,16 +279,28 @@ bool run_access_certificate(const std::string& root) {
                              vg::hal::LoweringClass expected_classification, const char* label) {
     vg::core::Arena arena;
     const auto module = make_probe_module(arena);
-    arena.allocate(16);  // untouched by the module -- only Universe/DiscoverThenLease should see it
+    const auto& untouched = arena.allocate(16);  // Universe/discovery witness deliberately includes this seed
 
+    vg::test_support::AssemblyOptions options;
+    options.certificate_mode = mode;
+    // CertifiedPinned is explicit envelope authority.  The other modes may
+    // still receive the same exact access list without changing their
+    // Universe/discovery semantics.
+    options.certificate_touched = {{module.instructions.front().allocation,
+                                    module.instructions.front().generation}};
+    const std::vector<vg::core::PointerRef> discovery_seeds{{module.instructions.front().allocation,
+                                                              module.instructions.front().generation},
+                                                             {untouched.id, untouched.generation}};
+    if (mode == vg::core::AccessCertificateMode::DiscoverThenLease)
+      options.discovery_seeds = &discovery_seeds;
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal_device->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.requested_certificate_mode = mode;
+    std::string error;
+    if (!assemble_compute_plan(arena, module, {probe_task(module)}, &plan, &error, options)) {
+      std::cerr << "access-certificate: " << label << " assembly failed: " << error << "\n";
+      return false;
+    }
 
     vg::hal::CompiledPlan compiled;
-    std::string error;
     if (!metal_device->compile(plan, &compiled, &error)) {
       std::cerr << "access-certificate: " << label << " compile failed: " << error << "\n";
       return false;
@@ -289,6 +326,17 @@ bool run_access_certificate(const std::string& root) {
       std::cerr << "access-certificate: " << label << " expected " << expected_references << " references, got "
                 << submission.access_certificate->epoch.references().size() << "\n";
       return false;
+    }
+    // Discovery is now sealed by the core assembler, so Stage 6 correctly
+    // has no backend-side discovery event to report or re-walk.  Its concrete
+    // witness was already checked through the resulting certificate above.
+    if (mode == vg::core::AccessCertificateMode::DiscoverThenLease) {
+      if (!plan.discovery_result.has_value()) {
+        std::cerr << "access-certificate: " << label << " is missing its sealed discovery witness\n";
+        return false;
+      }
+      std::cout << "access-certificate: " << label << " ok\n";
+      return true;
     }
     bool found_event = false;
     for (const auto& event : submission.report.events) {
@@ -320,32 +368,21 @@ bool run_access_certificate(const std::string& root) {
     vg::core::Arena arena;
     const auto module = make_probe_module(arena);
 
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal_device->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.requested_certificate_mode = mode;
-
-    vg::hal::CompiledPlan compiled;
     std::string error;
-    if (metal_device->compile(plan, &compiled, &error)) {
-      std::cerr << "access-certificate: " << label << " unexpectedly compiled successfully\n";
+    vg::test_support::AssemblyOptions options;
+    options.certificate_mode = mode;
+    options.certificate_touched = {{module.instructions.front().allocation,
+                                    module.instructions.front().generation}};
+    vg::hal::ExecutionPlan plan;
+    if (assemble_compute_plan(arena, module, {probe_task(module)}, &plan, &error, options)) {
+      std::cerr << "access-certificate: " << label << " unexpectedly assembled successfully\n";
       return false;
     }
-    if (compiled.report.supported) {
-      std::cerr << "access-certificate: " << label << " report claims supported\n";
+    if (error.find("Unsupported") == std::string::npos) {
+      std::cerr << "access-certificate: " << label << " was rejected for the wrong reason: " << error << "\n";
       return false;
     }
-    bool found_unsupported = false;
-    for (const auto& event : compiled.report.events) {
-      if (event.operation == "access_certificate" && event.classification == vg::hal::LoweringClass::Unsupported)
-        found_unsupported = true;
-    }
-    if (!found_unsupported) {
-      std::cerr << "access-certificate: " << label << " missing honest Unsupported report event\n";
-      return false;
-    }
-    std::cout << "access-certificate: " << label << " honestly unsupported\n";
+    std::cout << "access-certificate: " << label << " honestly rejected by semantic assembly\n";
     return true;
   };
 
@@ -381,42 +418,27 @@ bool run_tier1_indirect(const std::string& root) {
     return true;
   }
 
-  TaskGraphBuilder builder;
-  TaskRecord task0{};
-  task0.node_index = 0;
-  task0.root_allocation = 42;
+  vg::core::Arena arena;
+  const auto module = make_probe_module(arena);
+  TaskRecord task0 = probe_task(module);
   task0.x = 4;
   task0.y = 1;
   task0.z = 1;
-  TaskRecord task1{};
-  task1.node_index = 1;
-  task1.root_allocation = 42;
+  TaskRecord task1 = probe_task(module);
   task1.x = 2;
   task1.y = 3;
   task1.z = 1;
-  if (!builder.append(task0) || !builder.append(task1) || !builder.add_dependency(0, 1)) {
-    std::cerr << "tier1-indirect: failed to build task graph\n";
-    return false;
-  }
-  TaskGraph graph;
-  if (!builder.seal(&graph) || !graph.publish()) {
-    std::cerr << "tier1-indirect: failed to seal/publish task graph\n";
-    return false;
-  }
-
-  vg::core::Arena arena;
-  const auto module = make_probe_module(arena);
-
+  const std::vector<std::pair<uint32_t, uint32_t>> dependencies{{0, 1}};
+  vg::test_support::AssemblyOptions options;
+  options.dependencies = &dependencies;
+  options.request_tier1_indirect = true;
   vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal_device->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-  plan.request_tier1_indirect = true;
-
-  vg::hal::CompiledPlan compiled;
   std::string error;
+  if (!assemble_compute_plan(arena, module, {task0, task1}, &plan, &error, options)) {
+    std::cerr << "tier1-indirect: plan assembly failed: " << error << "\n";
+    return false;
+  }
+  vg::hal::CompiledPlan compiled;
   if (!metal_device->compile(plan, &compiled, &error)) {
     std::cerr << "tier1-indirect: Metal compile failed: " << error << "\n";
     return false;
@@ -967,15 +989,16 @@ bool run_effect_dag(const std::string& root) {
                          vg::core::EffectGraphShape expected_shape, uint64_t expected_encoder_count,
                          uint64_t expected_barrier_count, vg::core::Arena& arena,
                          const std::vector<std::pair<uint64_t, uint32_t>>& expect_final_bytes) {
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal_device->capabilities();
-    plan.module = passes[0];
-    plan.published = true;
-    plan.effect_dag_passes = passes;
-    plan.effect_dag_dependencies = dependencies;
-
-    vg::hal::CompiledPlan compiled;
     std::string error;
+    vg::test_support::AssemblyOptions options;
+    options.effect_dag_passes = &passes;
+    options.effect_dag_dependencies = &dependencies;
+    vg::hal::ExecutionPlan plan;
+    if (!assemble_compute_plan(arena, passes[0], {probe_task(passes[0])}, &plan, &error, options)) {
+      std::cerr << "effect-dag: " << label << " assembly failed: " << error << "\n";
+      return false;
+    }
+    vg::hal::CompiledPlan compiled;
     if (!metal_device->compile(plan, &compiled, &error)) {
       std::cerr << "effect-dag: " << label << " compile failed: " << error << "\n";
       return false;
@@ -1118,15 +1141,18 @@ bool run_effect_dag(const std::string& root) {
       join.declared_effects.push_back({b.id, 0, 4, vg::ir::Access::Read, b.representation_epoch});
     }
 
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal_device->capabilities();
-    plan.module = source;
-    plan.published = true;
-    plan.effect_dag_passes = {source, middle1, middle2, join};
-    plan.effect_dag_dependencies = {{0, 1}, {0, 2}, {1, 3}, {2, 3}};
-
-    vg::hal::CompiledPlan compiled;
     std::string error;
+    const std::vector<vg::ir::Module> passes{source, middle1, middle2, join};
+    const std::vector<std::pair<uint32_t, uint32_t>> dependencies{{0, 1}, {0, 2}, {1, 3}, {2, 3}};
+    vg::test_support::AssemblyOptions options;
+    options.effect_dag_passes = &passes;
+    options.effect_dag_dependencies = &dependencies;
+    vg::hal::ExecutionPlan plan;
+    if (!assemble_compute_plan(arena, source, {probe_task(source)}, &plan, &error, options)) {
+      std::cerr << "effect-dag: unsupported-shape assembly failed: " << error << "\n";
+      return false;
+    }
+    vg::hal::CompiledPlan compiled;
     if (metal_device->compile(plan, &compiled, &error)) {
       std::cerr << "effect-dag: unsupported-shape unexpectedly compiled successfully\n";
       return false;
@@ -1198,13 +1224,13 @@ bool run_pointer_graph(const std::string& root) {
 
   module.declared_pointer_edges.push_back({ref_holder.id, 0, target.id});
 
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal_device->capabilities();
-  plan.module = module;
-  plan.published = true;
-
-  vg::hal::CompiledPlan compiled;
   std::string error;
+  vg::hal::ExecutionPlan plan;
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &plan, &error)) {
+    std::cerr << "pointer-graph: plan assembly failed: " << error << "\n";
+    return false;
+  }
+  vg::hal::CompiledPlan compiled;
   if (!metal_device->compile(plan, &compiled, &error)) {
     std::cerr << "pointer-graph: compile failed: " << error << "\n";
     return false;
@@ -1293,14 +1319,15 @@ bool run_indexed_binding(const std::string& root) {
   module.declared_effects.push_back(
       {store_target.id, 0, 4, vg::ir::Access::Write, store_target.representation_epoch});
 
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal_device->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.request_indexed_binding = true;
-
-  vg::hal::CompiledPlan compiled;
   std::string error;
+  vg::test_support::AssemblyOptions options;
+  options.request_indexed_binding = true;
+  vg::hal::ExecutionPlan plan;
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &plan, &error, options)) {
+    std::cerr << "indexed-binding: plan assembly failed: " << error << "\n";
+    return false;
+  }
+  vg::hal::CompiledPlan compiled;
   if (!metal_device->compile(plan, &compiled, &error)) {
     if (error.find("gpuAddress") != std::string::npos) {
       std::cout << "indexed-binding: device does not support MTLBuffer.gpuAddress, skipping\n";
@@ -1978,24 +2005,12 @@ bool run_task_graph_raster(const std::string& root) {
   raster_task.raster_filter = vg::core::FilterMode::Nearest;
   raster_task.raster_wrap = vg::core::WrapMode::Clamp;
 
-  TaskGraphBuilder builder;
-  if (!builder.append(raster_task)) {
-    std::cerr << "task-graph-raster: failed to append raster task\n";
-    return false;
-  }
-  TaskGraph graph;
-  if (!builder.seal(&graph) || !graph.publish()) {
-    std::cerr << "task-graph-raster: failed to seal/publish task graph\n";
-    return false;
-  }
-
   const auto module = make_probe_module(arena);
   vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal_device->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
+  if (!assemble_compute_plan(arena, module, {raster_task}, &plan, &error)) {
+    std::cerr << "task-graph-raster: plan assembly failed: " << error << "\n";
+    return false;
+  }
 
   vg::hal::CompiledPlan compiled;
   if (!metal_device->compile(plan, &compiled, &error)) {
@@ -2095,15 +2110,8 @@ bool run_task_graph_raster(const std::string& root) {
     indexed_task.index_buffer_ref = index_ref;
     indexed_task.index_count = 6;
     indexed_task.depth_attachment_ref = indexed_depth_ref;
-    TaskGraphBuilder indexed_builder;
-    TaskGraph indexed_graph;
-    if (!indexed_builder.append(indexed_task) || !indexed_builder.seal(&indexed_graph) || !indexed_graph.publish()) return false;
     vg::hal::ExecutionPlan indexed_plan;
-    indexed_plan.capabilities = metal_device->capabilities();
-    indexed_plan.module = module;
-    indexed_plan.published = true;
-    indexed_plan.task_graph = indexed_graph;
-    indexed_plan.graph_epoch = arena.topology_epoch();
+    if (!assemble_compute_plan(arena, module, {indexed_task}, &indexed_plan, &error)) return false;
     vg::hal::CompiledPlan indexed_compiled;
     vg::hal::Submission indexed_submission;
     if (!metal_device->compile(indexed_plan, &indexed_compiled, &error) ||
@@ -2139,37 +2147,27 @@ bool run_task_graph_raster(const std::string& root) {
   // raster failure (folded in last by DeviceHal::submit()'s `finish()`), but
   // result.trace/timeline_value/published_tasks -- all only written by a
   // completed linear() dispatch -- prove the compute half genuinely ran.
+  const auto& mixed_root = arena.allocate(4);
   TaskRecord compute_task{};
-  compute_task.node_index = 0;
-  compute_task.root_allocation = 99;
+  compute_task.root_allocation = mixed_root.id;
+  compute_task.root_generation = mixed_root.generation;
   compute_task.x = 2;
   compute_task.y = 1;
   compute_task.z = 1;
   TaskRecord broken_raster_task{};
-  broken_raster_task.node_index = 1;
-  broken_raster_task.root_allocation = 99;
   broken_raster_task.kind = vg::core::TaskKind::Raster;
   // vertex_buffer_ref left default (never acquired against any facet pool),
   // so SubmitOps::raster fails this task deterministically.
-  TaskGraphBuilder mixed_builder;
-  if (!mixed_builder.append(compute_task) || !mixed_builder.append(broken_raster_task)) {
-    std::cerr << "task-graph-raster: failed to build mixed compute+raster graph\n";
-    return false;
-  }
-  TaskGraph mixed_graph;
-  if (!mixed_builder.seal(&mixed_graph) || !mixed_graph.publish()) {
-    std::cerr << "task-graph-raster: failed to seal/publish mixed compute+raster graph\n";
-    return false;
-  }
+  vg::test_support::AssemblyOptions mixed_options;
+  mixed_options.timeline_signal = 7;
   vg::hal::ExecutionPlan mixed_plan;
-  mixed_plan.capabilities = metal_device->capabilities();
-  mixed_plan.module = module;
-  mixed_plan.published = true;
-  mixed_plan.task_graph = mixed_graph;
-  mixed_plan.graph_epoch = arena.topology_epoch();
-  mixed_plan.timeline_signal = 7;
-  vg::hal::CompiledPlan mixed_compiled;
   std::string mixed_error;
+  if (!assemble_compute_plan(arena, module, {compute_task, broken_raster_task}, &mixed_plan, &mixed_error,
+                             mixed_options)) {
+    std::cerr << "task-graph-raster: mixed graph assembly failed: " << mixed_error << "\n";
+    return false;
+  }
+  vg::hal::CompiledPlan mixed_compiled;
   if (!metal_device->compile(mixed_plan, &mixed_compiled, &mixed_error)) {
     std::cerr << "task-graph-raster: mixed graph compile failed: " << mixed_error << "\n";
     return false;
@@ -2260,18 +2258,12 @@ bool run_task_graph_raster_depth(const std::string& root) {
   task.vertex_buffer_ref = vertex_ref;
   task.raster_filter = vg::core::FilterMode::Nearest;
   task.raster_wrap = vg::core::WrapMode::Clamp;
-  TaskGraphBuilder builder;
-  TaskGraph graph;
-  if (!builder.append(task) || !builder.seal(&graph) || !graph.publish()) {
-    std::cerr << "task-graph-raster-depth: failed to publish task graph\n";
+  const auto module = make_probe_module(arena);
+  vg::hal::ExecutionPlan plan;
+  if (!assemble_compute_plan(arena, module, {task}, &plan, &error)) {
+    std::cerr << "task-graph-raster-depth: plan assembly failed: " << error << "\n";
     return false;
   }
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal_device->capabilities();
-  plan.module = make_probe_module(arena);
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
   vg::hal::CompiledPlan compiled;
   if (!metal_device->compile(plan, &compiled, &error)) {
     std::cerr << "task-graph-raster-depth: Metal compile failed: " << error << "\n";
@@ -2409,15 +2401,15 @@ bool run_task_graph_raster_user_shader(const std::string& root) {
   // (a) Happy path: a real, valid custom shader whose own formula (solid
   // green) is trivially distinguishable from the built-in sample*tint
   // formula against this non-green source texel pattern.
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal_device->capabilities();
-  plan.user_raster_shader = vg::ir::UserRasterShaderContract{
+  const vg::ir::UserRasterShaderContract shader{
       "vg.test.raster/v1", "vg_user_raster_vertex", "vg_user_raster_fragment",
       vg::ir::kRasterVertexAbiXyzuvPackedV1,
       user_raster_msl_source("vg_user_raster_vertex", "vg_user_raster_fragment")};
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
+  vg::hal::ExecutionPlan plan;
+  if (!assemble_user_raster_plan(arena, shader, {raster_task}, &plan, &error)) {
+    std::cerr << "task-graph-raster-user-shader: plan assembly failed: " << error << "\n";
+    return false;
+  }
 
   vg::hal::CompiledPlan compiled;
   if (!metal_device->compile(plan, &compiled, &error)) {
@@ -2469,15 +2461,15 @@ bool run_task_graph_raster_user_shader(const std::string& root) {
   // source. compile() still succeeds (pipeline is built lazily at submit()),
   // but submit() must report a clean, non-crashing failure via
   // submission.result.
-  vg::hal::ExecutionPlan bad_plan;
-  bad_plan.capabilities = metal_device->capabilities();
-  bad_plan.user_raster_shader = vg::ir::UserRasterShaderContract{
+  const vg::ir::UserRasterShaderContract bad_shader{
       "vg.test.raster/v1", "vg_user_raster_vertex", "vg_does_not_exist_in_source",
       vg::ir::kRasterVertexAbiXyzuvPackedV1,
       user_raster_msl_source("vg_user_raster_vertex", "vg_user_raster_fragment")};
-  bad_plan.published = true;
-  bad_plan.task_graph = graph;
-  bad_plan.graph_epoch = arena.topology_epoch();
+  vg::hal::ExecutionPlan bad_plan;
+  if (!assemble_user_raster_plan(arena, bad_shader, {raster_task}, &bad_plan, &error)) {
+    std::cerr << "task-graph-raster-user-shader: bad-plan assembly failed: " << error << "\n";
+    return false;
+  }
 
   vg::hal::CompiledPlan bad_compiled;
   std::string bad_compile_error;
@@ -2508,9 +2500,10 @@ bool run_task_graph_raster_user_shader(const std::string& root) {
 
   // (c) Mixed compute+MSL-raster rejection: validate() requires every task
   // to be Raster-kind whenever user_raster_shader is set.
+  const auto& user_shader_mixed_root = arena.allocate(4);
   TaskRecord compute_task{};
-  compute_task.node_index = 0;
-  compute_task.root_allocation = 99;
+  compute_task.root_allocation = user_shader_mixed_root.id;
+  compute_task.root_generation = user_shader_mixed_root.generation;
   compute_task.x = 1;
   compute_task.y = 1;
   compute_task.z = 1;
@@ -2529,20 +2522,14 @@ bool run_task_graph_raster_user_shader(const std::string& root) {
     std::cerr << "task-graph-raster-user-shader: failed to seal/publish mixed compute+raster graph\n";
     return false;
   }
-  vg::hal::ExecutionPlan mixed_plan;
-  mixed_plan.capabilities = metal_device->capabilities();
-  mixed_plan.user_raster_shader = plan.user_raster_shader;
-  mixed_plan.published = true;
-  mixed_plan.task_graph = mixed_graph;
-  mixed_plan.graph_epoch = arena.topology_epoch();
-  vg::hal::CompiledPlan mixed_compiled;
   std::string mixed_error;
-  if (metal_device->compile(mixed_plan, &mixed_compiled, &mixed_error)) {
-    std::cerr << "task-graph-raster-user-shader: compile() unexpectedly accepted a mixed compute+"
+  vg::hal::ExecutionPlan mixed_plan;
+  if (assemble_user_raster_plan(arena, shader, {compute_task, mixed_raster_task}, &mixed_plan, &mixed_error)) {
+    std::cerr << "task-graph-raster-user-shader: assembly unexpectedly accepted a mixed compute+"
                  "user_raster_shader graph\n";
     return false;
   }
-  if (mixed_error != "a user_raster_shader submission may only contain raster tasks") {
+  if (mixed_error != "task kind does not match its resolved node execution domain") {
     std::cerr << "task-graph-raster-user-shader: unexpected mixed-graph rejection message: " << mixed_error
               << "\n";
     return false;
@@ -2626,11 +2613,13 @@ bool compile_and_submit_representation(vg::metal::DeviceHal& metal_device, vg::c
                                        const vg::ir::Module& module,
                                        const vg::hal::RepresentationRequest& request,
                                        vg::hal::Submission* submission, std::string* error) {
+  const std::vector<vg::core::RepresentationRequest> requests{request};
+  vg::test_support::AssemblyOptions options;
+  options.representation_requests = &requests;
+  options.facet_pool = &metal_device.facet_pool();
+  vg::test_support::AssembledPlanFixture fixture;
   vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal_device.capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.representation_requests.push_back(request);
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &plan, error, options)) return false;
   vg::hal::CompiledPlan compiled;
   if (!metal_device.compile(plan, &compiled, error)) return false;
   return metal_device.submit(compiled, arena, submission, error);
@@ -2781,41 +2770,24 @@ bool run_consume_input(const std::string& root) {
   {
     vg::core::Arena arena;
     vg::core::CanonicalView view;
-    prepare_image(arena, &view);
-    auto& probe = arena.allocate(64);
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal_device->capabilities();
-    plan.module = make_epoch_probe_module(probe, probe.representation_epoch);
-    plan.published = true;
-    vg::hal::RepresentationRequest request;
-    request.view = view;
-    request.target_kind = vg::core::FacetKind::Sample;
-    request.consume_input = true;
-    plan.representation_requests.push_back(request);
-    std::string validate_error;
-    if (plan.validate(&validate_error)) {
-      std::cerr << "consume-input: incomplete proof unexpectedly validated\n";
-      return false;
-    }
-    std::cout << "consume-input: incomplete proof rejected by plan.validate\n";
-  }
-
-  {
-    vg::core::Arena arena;
-    vg::core::CanonicalView view;
     auto& image = prepare_image(arena, &view);
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal_device->capabilities();
-    plan.module = make_epoch_probe_module(image, image.representation_epoch);
-    plan.published = true;
+    const auto module = make_epoch_probe_module(image, image.representation_epoch);
     vg::hal::RepresentationRequest request;
     request.view = view;
     request.target_kind = vg::core::FacetKind::Sample;
     request.consume_input = true;
     request.consume_proof = complete_consume_proof();
-    plan.representation_requests.push_back(request);
-    vg::hal::CompiledPlan compiled;
     std::string compile_error;
+    const std::vector<vg::core::RepresentationRequest> requests{request};
+    vg::test_support::AssemblyOptions options;
+    options.representation_requests = &requests;
+    options.facet_pool = &metal_device->facet_pool();
+    vg::hal::ExecutionPlan plan;
+    if (!assemble_compute_plan(arena, module, {probe_task(module)}, &plan, &compile_error, options)) {
+      std::cerr << "consume-input: same-allocation plan assembly failed: " << compile_error << "\n";
+      return false;
+    }
+    vg::hal::CompiledPlan compiled;
     if (metal_device->compile(plan, &compiled, &compile_error)) {
       std::cerr << "consume-input: ConsumeInput of an allocation the module also loads must fail compile\n";
       return false;
@@ -2888,12 +2860,26 @@ bool run_consume_input(const std::string& root) {
     request.target_kind = vg::core::FacetKind::Sample;
     request.consume_input = true;
     request.consume_proof = complete_consume_proof();
+    auto& probe = arena.allocate(64);
+    const auto module = make_epoch_probe_module(probe, probe.representation_epoch);
     vg::core::FacetPool pool;
+    const std::vector<vg::core::RepresentationRequest> requests{request};
+    vg::test_support::AssemblyOptions options;
+    options.representation_requests = &requests;
+    // This is an intentionally narrow Stage-7 physical-fault harness, so its
+    // explicit pool is the one commit_representation_operations consumes; it
+    // is not presented as DeviceHal::compile/submit.
+    options.facet_pool = &pool;
+    vg::hal::ExecutionPlan plan;
     vg::hal::Submission submission;
     std::string error;
-    if (vg::hal::run_representation_stage(
-            {request}, arena, pool,
-            [](const vg::hal::RepresentationRequest&, vg::core::FacetRef,
+    if (!assemble_compute_plan(arena, module, {probe_task(module)}, &plan, &error, options)) {
+      std::cerr << "consume-input: fault-during assembly failed: " << error << "\n";
+      return false;
+    }
+    if (vg::hal::commit_representation_operations(
+            plan, {{vg::hal::CompiledPlan::RepresentationOperation::CopyToPrivate, 0, "fault harness"}}, arena, pool,
+            [](const vg::core::RepresentationSemanticPlanItem&, const vg::hal::CompiledPlan::PhysicalRepresentationOperation&, vg::core::FacetRef,
                vg::hal::RepresentationTransformCost*, std::string* physical_error) {
               if (physical_error) *physical_error = "injected physical transform fault";
               return false;
@@ -3026,36 +3012,6 @@ bool run_consume_input(const std::string& root) {
   {
     vg::core::Arena arena;
     vg::core::CanonicalView view;
-    prepare_image(arena, &view);
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal_device->capabilities();
-    auto& probe = arena.allocate(64);
-    plan.module = make_epoch_probe_module(probe, probe.representation_epoch);
-    plan.published = true;
-    vg::hal::RepresentationRequest request;
-    request.view = view;
-    request.target_kind = vg::core::FacetKind::Sample;
-    request.consume_input = true;
-    request.consume_proof = complete_consume_proof();
-    request.consume_proof.no_external_references = false;
-    plan.representation_requests.push_back(request);
-    std::string validate_error;
-    if (plan.validate(&validate_error)) {
-      std::cerr << "consume-input: external-ref proof unexpectedly validated\n";
-      return false;
-    }
-    if (validate_error.find("an external reference to the old representation still exists") ==
-        std::string::npos) {
-      std::cerr << "consume-input: external-ref proof was refused for the wrong reason: "
-                << validate_error << "\n";
-      return false;
-    }
-    std::cout << "consume-input: external-ref proof rejected by plan.validate\n";
-  }
-
-  {
-    vg::core::Arena arena;
-    vg::core::CanonicalView view;
     auto& image = prepare_image(arena, &view);
     vg::core::FacetRef live{};
     std::string error;
@@ -3079,7 +3035,9 @@ bool run_consume_input(const std::string& root) {
       std::cerr << "consume-input: live-facet ConsumeInput must be refused while the token is held\n";
       return false;
     }
-    if (error.find("a facet token still names the old representation") == std::string::npos) {
+    // The live-facet snapshot is a Stage-5 semantic fact, so the assembler
+    // must reject it before Metal lowering or commit is entered.
+    if (error.find("live FacetRef names its source epoch") == std::string::npos) {
       std::cerr << "consume-input: live-facet was refused for the wrong reason: " << error << "\n";
       return false;
     }

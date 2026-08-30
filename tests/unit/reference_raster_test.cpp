@@ -17,6 +17,7 @@
 #include "backends/reference/reference_device_hal.h"
 #include "backends/reference/reference_executor.h"
 #include "core/core.h"
+#include "assembled_plan_fixture.h"
 #include "ir/ir.h"
 
 #include <algorithm>
@@ -735,18 +736,11 @@ int main() {
     raster_task.raster_filter = vg::core::FilterMode::Nearest;
     raster_task.raster_wrap = vg::core::WrapMode::Clamp;
 
-    vg::core::TaskGraphBuilder builder;
-    assert(builder.append(raster_task));
-    vg::core::TaskGraph graph;
-    assert(builder.seal(&graph) && graph.publish());
-
     const auto module = probe_module(arena);
+    vg::test_support::AssembledPlanFixture fixture;
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = device->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.task_graph = graph;
-    plan.graph_epoch = arena.topology_epoch();
+    assert(vg::test_support::assemble_single_node_plan(arena, module, {raster_task},
+                                                        &fixture, &plan, &error));
 
     vg::hal::CompiledPlan compiled;
     assert(device->compile(plan, &compiled, &error));
@@ -788,17 +782,10 @@ int main() {
     vg::core::TaskRecord indexed_task = raster_task;
     indexed_task.index_buffer_ref = index_ref;
     indexed_task.index_count = static_cast<uint32_t>(indices.size());
-    vg::core::TaskGraphBuilder indexed_builder;
-    assert(indexed_builder.append(indexed_task));
-    vg::core::TaskGraph indexed_graph;
-    assert(indexed_builder.seal(&indexed_graph) && indexed_graph.publish());
-
+    vg::test_support::AssembledPlanFixture indexed_fixture;
     vg::hal::ExecutionPlan indexed_plan;
-    indexed_plan.capabilities = device->capabilities();
-    indexed_plan.module = module;
-    indexed_plan.published = true;
-    indexed_plan.task_graph = indexed_graph;
-    indexed_plan.graph_epoch = arena.topology_epoch();
+    assert(vg::test_support::assemble_single_node_plan(arena, module, {indexed_task},
+                                                        &indexed_fixture, &indexed_plan, &error));
     vg::hal::CompiledPlan indexed_compiled;
     std::string indexed_error;
     assert(device->compile(indexed_plan, &indexed_compiled, &indexed_error));
@@ -817,12 +804,9 @@ int main() {
     vg::core::FacetRef wide_index_ref;
     assert(device->facet_pool().acquire(arena, wide_index_view, vg::core::FacetKind::Address, &wide_index_ref, &error));
     indexed_task.index_buffer_ref = wide_index_ref;
-    vg::core::TaskGraphBuilder wide_index_builder;
-    assert(wide_index_builder.append(indexed_task));
-    vg::core::TaskGraph wide_index_graph;
-    assert(wide_index_builder.seal(&wide_index_graph) && wide_index_graph.publish());
-    indexed_plan.task_graph = wide_index_graph;
-    indexed_plan.graph_epoch = arena.topology_epoch();
+    vg::test_support::AssembledPlanFixture wide_index_fixture;
+    assert(vg::test_support::assemble_single_node_plan(arena, module, {indexed_task},
+                                                        &wide_index_fixture, &indexed_plan, &indexed_error));
     vg::hal::CompiledPlan wide_index_compiled;
     assert(device->compile(indexed_plan, &wide_index_compiled, &indexed_error));
     vg::hal::Submission wide_index_submission;
@@ -832,12 +816,9 @@ int main() {
     // Malformed counts are rejected as TriangleList input rather than being
     // truncated to a partial primitive.
     indexed_task.index_count = 4;
-    vg::core::TaskGraphBuilder malformed_index_builder;
-    assert(malformed_index_builder.append(indexed_task));
-    vg::core::TaskGraph malformed_index_graph;
-    assert(malformed_index_builder.seal(&malformed_index_graph) && malformed_index_graph.publish());
-    indexed_plan.task_graph = malformed_index_graph;
-    indexed_plan.graph_epoch = arena.topology_epoch();
+    vg::test_support::AssembledPlanFixture malformed_index_fixture;
+    assert(vg::test_support::assemble_single_node_plan(arena, module, {indexed_task},
+                                                        &malformed_index_fixture, &indexed_plan, &indexed_error));
     vg::hal::CompiledPlan malformed_index_compiled;
     assert(device->compile(indexed_plan, &malformed_index_compiled, &indexed_error));
     vg::hal::Submission malformed_index_submission;
@@ -894,17 +875,9 @@ int main() {
     raster_task.raster_filter = vg::core::FilterMode::Nearest;
     raster_task.raster_wrap = vg::core::WrapMode::Clamp;
 
-    vg::core::TaskGraphBuilder builder;
-    assert(builder.append(raster_task));
-    vg::core::TaskGraph graph;
-    assert(builder.seal(&graph) && graph.publish());
-
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = device->capabilities();
-    // plan.module stays default: a "vg.msl.raster/v1" submission never
-    // carries linear IR (vg_api_execution.cpp's submit()); validate() skips
-    // ir::verify(module) whenever user_raster_shader is set.
-    plan.user_raster_shader = vg::ir::UserRasterShaderContract{
+    // The imported shader is materialized into a CodeObject and assembled
+    // through the same Node/Envelope path as ordinary submissions.
+    const vg::ir::UserRasterShaderContract shader{
         "vg.test.raster/v1", "vg_test_vertex", "vg_test_fragment",
         vg::ir::kRasterVertexAbiXyzuvPackedV1,
         "#include <metal_stdlib>\n"
@@ -921,18 +894,19 @@ int main() {
         "fragment float4 vg_test_fragment(VgRasterVaryings varyings [[stage_in]]) {\n"
         "  return float4(1.0f, 0.0f, 0.0f, 1.0f);\n"
         "}\n"};
-    plan.published = true;
-    plan.task_graph = graph;
-    plan.graph_epoch = arena.topology_epoch();
-
-    // Direct ExecutionPlan construction is an internal test path that does
-    // not pass through JSON parsing. Keep its contract gate explicit too, so
-    // an F3 xyuv declaration cannot bypass the envelope parser.
-    auto stale_vertex_abi_plan = plan;
-    stale_vertex_abi_plan.user_raster_shader->vertex_abi = "vg.raster.vertex.xyuv-packed/v1";
-    assert(!stale_vertex_abi_plan.validate(&error));
-    assert(error == "a user_raster_shader submission requires vertex_abi vg.raster.vertex.xyzuv-packed/v1");
+    auto stale_shader = shader;
+    stale_shader.vertex_abi = "vg.raster.vertex.xyuv-packed/v1";
+    vg::test_support::AssembledPlanFixture stale_fixture;
+    vg::hal::ExecutionPlan stale_plan;
+    assert(!vg::test_support::assemble_single_user_raster_plan(
+        arena, stale_shader, {raster_task}, &stale_fixture, &stale_plan, &error));
+    assert(error.find("vertex_abi") != std::string::npos);
     error.clear();
+
+    vg::test_support::AssembledPlanFixture fixture;
+    vg::hal::ExecutionPlan plan;
+    assert(vg::test_support::assemble_single_user_raster_plan(
+        arena, shader, {raster_task}, &fixture, &plan, &error));
 
     vg::hal::CompiledPlan compiled;
     assert(device->compile(plan, &compiled, &error));

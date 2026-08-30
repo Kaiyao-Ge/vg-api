@@ -8,17 +8,18 @@
     "Material": {
       "kind": "struct",
       "fields": [
-        {"name": "base_color", "type": "f32", "array": 4},
-        {"name": "albedo", "type": "facet_ref", "relocation": "facet"}
+        {"name": "base_color", "type": "f32", "array": 4, "msl_type": "packed_float4"},
+        {"name": "albedo", "type": "facet_ref", "relocation": "facet", "msl_type": "uint2"}
       ]
     },
     "SceneRootRaster": {
       "kind": "struct",
       "fields": [
-        {"name": "camera_clip_from_local", "type": "f32", "array": 16},
-        {"name": "material", "type": "Material"}
+        {"name": "camera_clip_from_local", "type": "f32", "array": 16, "msl_type": "packed_float4", "msl_array": 4},
+        {"name": "material", "type": "Material", "msl_type": "VgSchema_Material"}
       ]
     }
   },
-  "root": "SceneRootRaster"
+  "root": "SceneRootRaster",
+  "msl_types": ["Material", "SceneRootRaster"]
 }

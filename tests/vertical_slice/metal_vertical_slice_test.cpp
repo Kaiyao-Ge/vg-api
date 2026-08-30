@@ -3,6 +3,7 @@
 #include "backends/reference/reference_device_hal.h"
 #include "golden_format.h"
 #include "ir/ir.h"
+#include "../support/assembled_plan_fixture.h"
 
 #include <algorithm>
 #include <fstream>
@@ -54,16 +55,24 @@ bool run_fixture(const std::string& name, const std::string& root) {
   auto reference_device = vg::reference::make_device_hal();
 
   vg::hal::ExecutionPlan metal_plan;
-  metal_plan.capabilities = metal_device->capabilities();
-  metal_plan.module = metal_module;
-  metal_plan.published = true;
-
   vg::hal::ExecutionPlan reference_plan;
-  reference_plan.capabilities = reference_device->capabilities();
-  reference_plan.module = reference_module;
-  reference_plan.published = true;
+  vg::test_support::AssembledPlanFixture metal_fixture;
+  vg::test_support::AssembledPlanFixture reference_fixture;
 
   std::string error;
+  if (!vg::test_support::assemble_single_node_plan(
+          metal_arena, metal_module,
+          {vg::test_support::compute_task(metal_module.instructions.front().allocation,
+                                          metal_module.instructions.front().generation)},
+          &metal_fixture, &metal_plan, &error) ||
+      !vg::test_support::assemble_single_node_plan(
+          reference_arena, reference_module,
+          {vg::test_support::compute_task(reference_module.instructions.front().allocation,
+                                          reference_module.instructions.front().generation)},
+          &reference_fixture, &reference_plan, &error)) {
+    std::cerr << name << ": assembly failed: " << error << "\n";
+    return false;
+  }
   vg::hal::CompiledPlan metal_compiled;
   if (!metal_device->compile(metal_plan, &metal_compiled, &error)) {
     std::cerr << name << ": Metal compile failed: " << error << "\n";

@@ -1,4 +1,10 @@
-/* Public-ABI offscreen triangle sample: ./vg-offscreen-triangle-ppm image.ppm */
+/*
+ * Public-ABI F3--F5 legacy raster sample (not an F6 SceneRoot sample):
+ *   ./vg-offscreen-triangle-ppm /tmp/offscreen-triangle.ppm
+ *
+ * It intentionally remains on the v1.6 source-facet path as a compatibility
+ * regression.  tests/api/vg_f6_scene_root.c is the v1.7 SceneRoot example.
+ */
 #include <vg/vg.h>
 
 #include <stdint.h>
@@ -35,7 +41,11 @@ static void canonical_view(VgCanonicalViewDesc* desc, uint64_t allocation,
 }
 
 int main(int argc, char** argv) {
-  const char* output_path = argc > 1 ? argv[1] : "offscreen_triangle.ppm";
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s OUTPUT.ppm\n", argv[0]);
+    return 1;
+  }
+  const char* output_path = argv[1];
   VgApi api = {0};
   api.size = sizeof(api);
   TRY(vgGetApi(VG_API_VERSION_1_6, &api));

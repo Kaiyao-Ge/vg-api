@@ -491,9 +491,8 @@ const char* to_string(FacetStatus status) {
   return "unknown facet status";
 }
 
-bool FacetPool::acquire(const Arena& arena, const CanonicalView& view, FacetKind kind, FacetRef* out,
-                        std::string* error) {
-  if (out == nullptr) { if (error) *error = "facet ref output is required"; return false; }
+bool validate_facet_target(const Arena& arena, const CanonicalView& view, FacetKind kind,
+                           std::string* error) {
   if (!view.valid(error)) return false;
   if (view.format == PixelFormat::Depth32Float && kind != FacetKind::Attachment) {
     if (error) *error = "Depth32Float canonical views may only acquire Attachment facets";
@@ -510,6 +509,14 @@ bool FacetPool::acquire(const Arena& arena, const CanonicalView& view, FacetKind
     if (error) *error = "canonical view describes more texels than its allocation backs";
     return false;
   }
+  return true;
+}
+
+bool FacetPool::acquire(const Arena& arena, const CanonicalView& view, FacetKind kind, FacetRef* out,
+                        std::string* error) {
+  if (out == nullptr) { if (error) *error = "facet ref output is required"; return false; }
+  if (!validate_facet_target(arena, view, kind, error)) return false;
+  const auto* allocation = arena.lookup(PointerRef{view.allocation, view.allocation_generation});
   FacetSlot slot;
   slot.active = true;
   slot.kind = kind;
@@ -1473,38 +1480,65 @@ bool EnvelopeContinuationTable::take(uint64_t token, std::vector<uint32_t>* left
   return true;
 }
 
-NodeTable::Ref NodeTable::create(const std::string& entry_name) {
+namespace {
+std::atomic<uint64_t> g_next_node_token{(uint64_t{1} << 32) | 1};
+uint64_t node_key(NodeTable::Ref ref) {
+  return (static_cast<uint64_t>(ref.generation) << 32) | ref.index;
+}
+}
+
+NodeTable::NodeTable() = default;
+
+NodeTable::Ref NodeTable::create(std::shared_ptr<const CodeObject> code_object,
+                                 const std::string& entry_name) {
+  std::lock_guard lock(mutex_);
   NodeEntry entry;
+  entry.code_object = std::move(code_object);
   entry.entry_name = entry_name;
-  entry.generation = 1;
+  uint64_t token = g_next_node_token.load(std::memory_order_relaxed);
+  for (;;) {
+    if (token == 0 || token == UINT64_MAX) return {};
+    if (g_next_node_token.compare_exchange_weak(token, token + 1,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed))
+      break;
+  }
+  entry.generation = static_cast<uint32_t>(token >> 32);
   entry.live = true;
-  entries_.push_back(std::move(entry));
   Ref ref;
-  ref.index = static_cast<uint32_t>(entries_.size() - 1);
-  ref.generation = entries_.back().generation;
+  ref.index = static_cast<uint32_t>(token);
+  ref.generation = entry.generation;
+  entries_.emplace(node_key(ref), std::move(entry));
   return ref;
 }
 
 bool NodeTable::destroy(Ref ref) {
-  NodeEntry* entry = lookup(ref);
-  if (!entry) return false;
-  entry->live = false;
-  entry->generation += 1;
+  std::lock_guard lock(mutex_);
+  const auto found = entries_.find(node_key(ref));
+  if (found == entries_.end()) return false;
+  NodeEntry* entry = &found->second;
+  if (!entry->live || entry->generation != ref.generation) return false;
+  entries_.erase(found);
   return true;
 }
 
-NodeEntry* NodeTable::lookup(Ref ref) {
-  if (ref.index >= entries_.size()) return nullptr;
-  NodeEntry& entry = entries_[ref.index];
-  if (!entry.live || entry.generation != ref.generation) return nullptr;
-  return &entry;
+bool NodeTable::snapshot(Ref ref, NodeEntry* out) const {
+  if (out == nullptr) return false;
+  std::lock_guard lock(mutex_);
+  const auto found = entries_.find(node_key(ref));
+  if (found == entries_.end()) return false;
+  const NodeEntry& entry = found->second;
+  if (!entry.live || entry.generation != ref.generation) return false;
+  *out = entry;
+  return true;
 }
 
-const NodeEntry* NodeTable::lookup(Ref ref) const {
-  if (ref.index >= entries_.size()) return nullptr;
-  const NodeEntry& entry = entries_[ref.index];
-  if (!entry.live || entry.generation != ref.generation) return nullptr;
-  return &entry;
+bool NodeTable::contains(Ref ref) const {
+  std::lock_guard lock(mutex_);
+  const auto found = entries_.find(node_key(ref));
+  if (found == entries_.end()) return false;
+  const NodeEntry& entry = found->second;
+  return entry.live && entry.generation == ref.generation;
 }
 
 }  // namespace vg::core

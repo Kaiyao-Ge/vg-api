@@ -52,10 +52,19 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
                std::string* error) override {
     if (compiled == nullptr) { if (error) *error = "compiled plan output is required"; return false; }
     if (!plan.validate(error)) return false;
+    if (!hal::preflight_stage6(plan, capabilities_, hal::BackendKind::Reference, compiled, error)) return false;
+    // Transitional adapter-local bridge for the old single-program paths.
+    // The sealed core plan itself deliberately has no graph-wide module.
+    hal::ExecutionPlan adapter_plan = plan;
+    if (plan.assembled && plan.resolved_nodes.size() == 1) {
+      const auto& node = plan.resolved_nodes.front();
+      if (node.module) adapter_plan.module = *node.module;
+      else adapter_plan.user_raster_shader = node.user_raster_shader;
+    }
     if (plan.requested_certificate_mode == core::AccessCertificateMode::SoftwarePaged ||
         plan.requested_certificate_mode == core::AccessCertificateMode::FaultManaged) {
       compiled->abi_version = hal::kDeviceHalAbiVersion;
-      compiled->plan = plan;
+      compiled->plan = adapter_plan;
       compiled->report = {};
       compiled->report.backend = hal::BackendKind::Reference;
       compiled->report.supported = false;
@@ -64,7 +73,17 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       if (error) *error = compiled->report.diagnostic;
       return false;
     }
-    if (plan.user_raster_shader.has_value()) {
+    const bool node_aware_compute = !plan.resolved_nodes.empty() && !plan.task_graph.tasks().empty() &&
+                                    std::ranges::all_of(plan.task_graph.tasks(), [](const auto& task) {
+                                      return task.kind == core::TaskKind::Compute;
+                                    });
+    if (node_aware_compute && std::ranges::any_of(plan.resolved_nodes, [](const auto& node) {
+          return !node.module.has_value();
+        })) {
+      if (error) *error = "reference per-Node lowering currently supports canonical compute nodes only";
+      return false;
+    }
+    if (adapter_plan.user_raster_shader.has_value()) {
       // F3 (ADR-043 Decision #4): plan.module is default/empty in this mode
       // (vg_api_execution.cpp's submit() leaves it unset when the code
       // object is vg.msl.raster/v1), so building a compute package from it
@@ -74,26 +93,39 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       // submit() below still runs its own fixed C++ shading regardless of
       // what that MSL says (unlike Metal, which really compiles and runs it).
       compiled->abi_version = hal::kDeviceHalAbiVersion;
-      compiled->plan = plan;
+      compiled->plan = adapter_plan;
       compiled->report = {};
       compiled->report.backend = hal::BackendKind::Reference;
       compiled->report.supported = true;
       compiled->report.add("raster_user_shader", hal::LoweringClass::HostAssisted, 1,
-                           plan.user_raster_shader->source.size(),
+                           adapter_plan.user_raster_shader->source.size(),
                            "caller-declared effect contract accepted; shader logic not independently verified; "
                            "reference backend applies fixed C++ shading regardless of supplied MSL text");
+    } else if (node_aware_compute) {
+      compiled->abi_version = hal::kDeviceHalAbiVersion;
+      compiled->plan = adapter_plan;
+      compiled->report = {};
+      compiled->report.backend = hal::BackendKind::Reference;
+      compiled->report.supported = true;
+      for (const auto& node : plan.resolved_nodes) {
+        const auto package = compiler::build_linear_compute_package(*node.module);
+        if (!package.ok) { if (error) *error = package.message; return false; }
+        compiled->node_compute_packages.emplace_back(node.ref, package.package);
+        compiled->report.add("node_compute_package", hal::LoweringClass::Direct, 1,
+                             package.package.bindings.size(), "reference per-Node compute package");
+      }
     } else {
-      const auto package = compiler::build_linear_compute_package(plan.module);
+      const auto package = compiler::build_linear_compute_package(adapter_plan.module);
       if (!package.ok) { if (error) *error = package.message; return false; }
       compiled->abi_version = hal::kDeviceHalAbiVersion;
-      compiled->plan = plan;
+      compiled->plan = adapter_plan;
       compiled->compute_package = package.package;
       compiled->report = {};
       compiled->report.backend = hal::BackendKind::Reference;
       compiled->report.supported = true;
-      compiled->report.add("canonical_ir", hal::LoweringClass::Direct, 1, plan.module.instructions.size(), "reference interpreter");
+      compiled->report.add("canonical_ir", hal::LoweringClass::Direct, 1, adapter_plan.module.instructions.size(), "reference interpreter");
       compiled->report.add("compute_package", hal::LoweringClass::Direct, 1, package.package.bindings.size(), "shared B4 linear package");
-      compiled->report.add("linear_access", hal::LoweringClass::Direct, plan.module.instructions.size(), 0, "checked arena access");
+      compiled->report.add("linear_access", hal::LoweringClass::Direct, adapter_plan.module.instructions.size(), 0, "checked arena access");
     }
     if (!plan.task_graph.tasks().empty()) compiled->report.add("task_publication", hal::LoweringClass::Direct, plan.task_graph.tasks().size(), 0, "immutable task graph");
     if (plan.timeline_signal != 0) compiled->report.add("timeline", hal::LoweringClass::Direct, 1, 0, "reference monotonic timeline");
@@ -104,7 +136,9 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     // epoch/facet/consume bookkeeping with no device pass behind it. Claiming
     // DevicePass would report a pass that does not exist; claiming Unsupported
     // would deny bookkeeping this backend does carry out.
-    for (const auto& request : plan.representation_requests) {
+    for (const auto& request : plan.representation_plan) {
+      compiled->representation_operations.push_back({hal::CompiledPlan::RepresentationOperation::Identity,
+                                                     request.transform_order, "reference identity representation"});
       compiled->report.add("representation_transform", hal::LoweringClass::Direct, 1,
                            request.view.byte_size(),
                            "RepresentationEpoch/facet bookkeeping only; the host byte array is already the "
@@ -152,9 +186,9 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     // account for: the new representation is the same host byte array the view
     // already names, reached with no staging copy and no device-optimal pass.
     std::string representation_error;
-    if (!hal::run_representation_stage(
-            compiled.plan.representation_requests, arena, facet_pool(),
-            [](const hal::RepresentationRequest& request, core::FacetRef,
+    if (!hal::commit_representation_operations(
+            compiled.plan, compiled.representation_operations, arena, facet_pool(),
+            [](const core::RepresentationSemanticPlanItem& request, const hal::CompiledPlan::PhysicalRepresentationOperation&, core::FacetRef,
                hal::RepresentationTransformCost* cost, std::string*) {
               cost->new_backing_bytes = request.view.byte_size();
               cost->temporary_bytes = 0;
@@ -172,7 +206,51 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     // below, and cpu_encode_ns stays 0 since there is no separate encode
     // phase to distinguish it from.
     const auto submit_start = std::chrono::steady_clock::now();
-    if (compiled.plan.user_raster_shader.has_value()) {
+    const bool node_aware_compute = !compiled.plan.resolved_nodes.empty() &&
+                                    !compiled.plan.task_graph.tasks().empty() &&
+                                    std::ranges::all_of(compiled.plan.task_graph.tasks(), [](const auto& task) {
+                                      return task.kind == core::TaskKind::Compute;
+                                    });
+    if (node_aware_compute) {
+      submission->result = core::ExecutionResult{};
+      submission->result.ok = true;
+      const auto& tasks = compiled.plan.task_graph.tasks();
+      std::vector<uint32_t> task_order;
+      std::string order_error;
+      if (!compiled.plan.task_graph.deterministic_order(&task_order, &order_error)) {
+        submission->result.ok = false;
+        submission->result.message = order_error;
+        return true;
+      }
+      for (size_t order_index = 0; order_index < task_order.size(); ++order_index) {
+        const auto& task = tasks[task_order[order_index]];
+        const core::NodeTable::Ref ref{task.node_index, task.node_generation};
+        const auto found = std::ranges::find_if(compiled.plan.resolved_nodes, [ref](const auto& node) {
+          return node.ref.index == ref.index && node.ref.generation == ref.generation;
+        });
+        if (found == compiled.plan.resolved_nodes.end() || !found->module.has_value()) {
+          submission->result.ok = false;
+          submission->result.message = "reference per-Node execution could not resolve a canonical compute Node";
+          break;
+        }
+        const auto package = std::ranges::find_if(compiled.node_compute_packages, [ref](const auto& item) {
+          return item.first.index == ref.index && item.first.generation == ref.generation;
+        });
+        if (package == compiled.node_compute_packages.end() ||
+            package->second.canonical_ir_hash != found->module->hash ||
+            package->second.root_schema != found->module->root_schema) {
+          submission->result.ok = false;
+          submission->result.message =
+              "reference per-Node execution package is missing or disagrees with the resolved immutable module";
+          break;
+        }
+        auto result = execute(*found->module, arena,
+                              compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate,
+                              &timeline_, {.wait = order_index == 0 ? compiled.plan.timeline_wait : 0,
+                                           .signal = order_index + 1 == task_order.size() ? compiled.plan.timeline_signal : 0});
+        if (!result.ok) { submission->result = std::move(result); break; }
+      }
+    } else if (compiled.plan.user_raster_shader.has_value()) {
       // F3 (ADR-043 Decision #4): compiled.plan.module is default/empty in
       // this mode, so there is no compute-module work for execute() to run --
       // calling it would additionally trip its internal ir::verify() rejection
@@ -426,9 +504,16 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     // full-arena DiscoverThenLease scan (ADR-025 / ADR-035).
     if (compiled.plan.requested_certificate_mode.has_value() && compiled.plan.discovery_seeds.empty()) {
       std::vector<core::PointerRef> touched;
-      touched.reserve(compiled.plan.module.instructions.size());
-      for (const auto& instruction : compiled.plan.module.instructions) {
-        touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});
+      if (!compiled.plan.resolved_nodes.empty() && !compiled.plan.task_graph.tasks().empty()) {
+        for (const auto& node : compiled.plan.resolved_nodes) {
+          if (!node.module.has_value()) continue;
+          for (const auto& instruction : node.module->instructions)
+            touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});
+        }
+      } else {
+        touched.reserve(compiled.plan.module.instructions.size());
+        for (const auto& instruction : compiled.plan.module.instructions)
+          touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});
       }
       core::AccessCertificate certificate;
       std::string cert_error;

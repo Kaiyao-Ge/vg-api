@@ -36,6 +36,14 @@ struct MetalSelectContext {
 bool apply_select(const MetalSelectContext& metal, uint32_t task_count, const hal::ExecutionPlan& plan,
                   hal::Submission* submission, DispatchCounters counters, std::string* error);
 
+// Narrow test-only physical-adapter harness.  It owns only the Metal device,
+// queue, and task-ring fields buffer required by Tier2 selection; it does not
+// invoke DeviceHal::compile or pretend that its deliberately minimal request
+// is a core-assembled ExecutionPlan.
+bool run_select_test_harness(const std::vector<uint32_t>& task_node_classes,
+                             const std::vector<uint32_t>& authorized_node_classes,
+                             hal::Submission* submission, std::string* error);
+
 // Debug/test-only readback of the GPU-authored selected class per task
 // (task-vector index order). Compare as a sorted multiset against
 // `reference::select_tier2_nodes`.

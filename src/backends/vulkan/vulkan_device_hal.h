@@ -602,9 +602,9 @@ class DeviceHal final : public vg::hal::DeviceHal {
   };
 
   // Stage 5's physical step for one request, invoked from submit() through
-  // hal::run_representation_stage. Builds the optimal-tiled image for `facet`
+  // Stage-7 representation commit helper. Builds the optimal-tiled image for `facet`
   // and copies the allocation's existing linear buffer into it.
-  bool transform_representation(const vg::core::Arena& arena, const vg::hal::RepresentationRequest& request,
+  bool transform_representation(const vg::core::Arena& arena, const vg::core::RepresentationSemanticPlanItem& request,
                                 vg::core::FacetRef facet, vg::hal::RepresentationTransformCost* cost,
                                 RepresentationStageCounts* counts, std::string* error);
 #endif

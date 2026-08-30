@@ -5,7 +5,43 @@
 #include "compiler/compiler.h"
 #include "core/core.h"
 #include "core/task_schema.h"
+#include "assembled_plan_fixture.h"
 #include <cassert>
+
+namespace {
+
+vg::ir::Module make_representation_probe_module(const vg::core::Allocation& allocation) {
+  vg::ir::Module module;
+  module.version = 1;
+  module.root_schema = "vg.test/v1";
+  vg::ir::Instruction load;
+  load.op = "load";
+  load.allocation = allocation.id;
+  load.generation = allocation.generation;
+  load.representation_epoch = allocation.representation_epoch;
+  load.offset = 0;
+  load.size = 4;
+  module.instructions.push_back(load);
+  module.declared_effects.push_back(
+      {allocation.id, 0, 4, vg::ir::Access::Read, allocation.representation_epoch});
+  return module;
+}
+
+bool assemble_representation_plan(
+    vg::core::Arena& arena, const vg::core::Allocation& probe,
+    const std::vector<vg::core::RepresentationRequest>& requests,
+    const vg::core::FacetPool& pool, vg::test_support::AssembledPlanFixture* fixture,
+    vg::core::ExecutionPlan* plan, std::string* error) {
+  vg::test_support::AssemblyOptions options;
+  options.representation_requests = &requests;
+  options.facet_pool = &pool;
+  return vg::test_support::assemble_single_node_plan(
+      arena, make_representation_probe_module(probe),
+      {vg::test_support::compute_task(probe.id, probe.generation)}, fixture, plan, error,
+      options);
+}
+
+}  // namespace
 
 int main() {
   vg::core::Arena arena;
@@ -186,7 +222,6 @@ int main() {
     // ExecutionPlan::validate(): published==true with a sealed-but-unpublished
     // task_graph must be rejected, not silently accepted.
     vg::hal::ExecutionPlan bad_plan;
-    bad_plan.capabilities = reference_device->capabilities();
     bad_plan.module = compiled_module.module;
     bad_plan.task_graph = sealed_unpublished;
     bad_plan.published = true;
@@ -198,7 +233,6 @@ int main() {
     vg::core::TaskGraph published_graph = sealed_unpublished;
     assert(published_graph.publish());
     vg::hal::ExecutionPlan good_plan;
-    good_plan.capabilities = reference_device->capabilities();
     good_plan.module = compiled_module.module;
     good_plan.task_graph = published_graph;
     good_plan.graph_epoch = task_arena.topology_epoch();
@@ -225,11 +259,6 @@ int main() {
 
     // Full compile()+submit() round trip: task_graph consumption, published_tasks
     // reporting, and real (non-passthrough) timeline wait/signal semantics.
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = reference_device->capabilities();
-    plan.published = true;
-    plan.timeline_signal = 5;
-
     vg::core::Arena fresh_arena;
     auto& fresh_root = fresh_arena.allocate(64);
     auto module_copy = compiled_module.module;
@@ -237,37 +266,38 @@ int main() {
     module_copy.declared_effects[0].allocation = fresh_root.id;
     module_copy.canonical_json = vg::ir::serialize_module(module_copy);
 
-    vg::core::TaskGraphBuilder fresh_builder;
-    vg::core::TaskRecord fresh_task0{}; fresh_task0.node_index = 0; fresh_task0.root_allocation = fresh_root.id;
-    vg::core::TaskRecord fresh_task1{}; fresh_task1.node_index = 1; fresh_task1.root_allocation = fresh_root.id;
-    assert(fresh_builder.append(fresh_task0));
-    assert(fresh_builder.append(fresh_task1));
-    assert(fresh_builder.add_dependency(0, 1));
-    vg::core::TaskGraph fresh_graph;
-    assert(fresh_builder.seal(&fresh_graph));
-    assert(fresh_graph.publish());
-
-    plan.module = module_copy;
-    plan.task_graph = fresh_graph;
-    plan.graph_epoch = fresh_arena.topology_epoch();
+    vg::test_support::AssembledPlanFixture fresh_fixture;
+    vg::hal::ExecutionPlan plan;
+    std::string submit_error;
+    vg::test_support::AssemblyOptions fresh_options;
+    fresh_options.timeline_signal = 5;
+    const std::vector<std::pair<uint32_t, uint32_t>> fresh_dependencies{{0, 1}};
+    fresh_options.dependencies = &fresh_dependencies;
+    assert(vg::test_support::assemble_single_node_plan(
+        fresh_arena, module_copy,
+        {vg::test_support::compute_task(fresh_root.id), vg::test_support::compute_task(fresh_root.id)},
+        &fresh_fixture, &plan, &submit_error, fresh_options));
 
     vg::hal::CompiledPlan compiled;
-    std::string submit_error;
     assert(reference_device->compile(plan, &compiled, &submit_error));
     vg::hal::Submission submission;
     assert(reference_device->submit(compiled, fresh_arena, &submission, &submit_error));
     assert(submission.result.ok);
     assert(submission.published_tasks.size() == 2);
-    assert(submission.published_tasks[0].node_index == 0);
-    assert(submission.published_tasks[1].node_index == 1);
+    assert(submission.published_tasks[0].node_index == fresh_fixture.node.index);
+    assert(submission.published_tasks[1].node_index == fresh_fixture.node.index);
     assert(submission.timeline_value == 5);
 
     // Next submission's wait is satisfied by the prior signal (real device
     // timeline state, not a plan-local passthrough).
-    vg::hal::ExecutionPlan waiting_plan = plan;
-    waiting_plan.task_graph = vg::core::TaskGraph{};
-    waiting_plan.timeline_wait = 5;
-    waiting_plan.timeline_signal = 10;
+    vg::test_support::AssembledPlanFixture waiting_fixture;
+    vg::hal::ExecutionPlan waiting_plan;
+    vg::test_support::AssemblyOptions waiting_options;
+    waiting_options.timeline_wait = 5;
+    waiting_options.timeline_signal = 10;
+    assert(vg::test_support::assemble_single_node_plan(
+        fresh_arena, module_copy, {vg::test_support::compute_task(fresh_root.id)},
+        &waiting_fixture, &waiting_plan, &submit_error, waiting_options));
     vg::hal::CompiledPlan waiting_compiled;
     assert(reference_device->compile(waiting_plan, &waiting_compiled, &submit_error));
     vg::hal::Submission waiting_submission;
@@ -278,10 +308,14 @@ int main() {
     // An unsatisfied wait faults honestly (submit() still returns true --
     // matching the Metal/Vulkan convention that submit() reports host-side
     // acceptance, while submission.result.ok reports execution outcome).
-    vg::hal::ExecutionPlan stuck_plan = plan;
-    stuck_plan.task_graph = vg::core::TaskGraph{};
-    stuck_plan.timeline_wait = 999;
-    stuck_plan.timeline_signal = 1000;
+    vg::test_support::AssembledPlanFixture stuck_fixture;
+    vg::hal::ExecutionPlan stuck_plan;
+    vg::test_support::AssemblyOptions stuck_options;
+    stuck_options.timeline_wait = 999;
+    stuck_options.timeline_signal = 1000;
+    assert(vg::test_support::assemble_single_node_plan(
+        fresh_arena, module_copy, {vg::test_support::compute_task(fresh_root.id)},
+        &stuck_fixture, &stuck_plan, &submit_error, stuck_options));
     vg::hal::CompiledPlan stuck_compiled;
     assert(reference_device->compile(stuck_plan, &stuck_compiled, &submit_error));
     vg::hal::Submission stuck_submission;
@@ -351,14 +385,18 @@ int main() {
     cert_module.module.declared_effects[0].allocation = touched_allocation.id;
     cert_module.module.canonical_json = vg::ir::serialize_module(cert_module.module);
 
+    vg::test_support::AssembledPlanFixture cert_fixture;
     vg::hal::ExecutionPlan cert_plan;
-    cert_plan.capabilities = cert_device->capabilities();
-    cert_plan.module = cert_module.module;
-    cert_plan.published = true;
-    cert_plan.requested_certificate_mode = vg::core::AccessCertificateMode::CertifiedPinned;
+    std::string device_error;
+    vg::test_support::AssemblyOptions cert_options;
+    cert_options.certificate_mode = vg::core::AccessCertificateMode::CertifiedPinned;
+    cert_options.certificate_touched = {{touched_allocation.id, touched_allocation.generation}};
+    assert(vg::test_support::assemble_single_node_plan(
+        cert_arena, cert_module.module,
+        {vg::test_support::compute_task(touched_allocation.id, touched_allocation.generation)},
+        &cert_fixture, &cert_plan, &device_error, cert_options));
 
     vg::hal::CompiledPlan cert_compiled;
-    std::string device_error;
     assert(cert_device->compile(cert_plan, &cert_compiled, &device_error));
     vg::hal::Submission cert_submission;
     assert(cert_device->submit(cert_compiled, cert_arena, &cert_submission, &device_error));
@@ -367,12 +405,15 @@ int main() {
     assert(cert_submission.access_certificate->mode == vg::core::AccessCertificateMode::CertifiedPinned);
     assert(cert_submission.access_certificate->epoch.references().size() == 1);
 
-    vg::hal::ExecutionPlan unsupported_plan = cert_plan;
-    unsupported_plan.requested_certificate_mode = vg::core::AccessCertificateMode::SoftwarePaged;
-    vg::hal::CompiledPlan unsupported_compiled;
+    vg::test_support::AssembledPlanFixture unsupported_fixture;
+    vg::hal::ExecutionPlan unsupported_plan;
+    cert_options.certificate_mode = vg::core::AccessCertificateMode::SoftwarePaged;
     std::string unsupported_error;
-    assert(!cert_device->compile(unsupported_plan, &unsupported_compiled, &unsupported_error));
-    assert(!unsupported_compiled.report.supported);
+    assert(!vg::test_support::assemble_single_node_plan(
+        cert_arena, cert_module.module,
+        {vg::test_support::compute_task(touched_allocation.id, touched_allocation.generation)},
+        &unsupported_fixture, &unsupported_plan, &unsupported_error, cert_options));
+    assert(unsupported_error.find("Unsupported") != std::string::npos);
   }
 
   // --- TASK-C1: FacetPool acquire/lookup/retire, and the "facet generation
@@ -788,6 +829,8 @@ int main() {
   // Arena-scoped fault injector. ---
   {
     vg::core::Arena stage_arena;
+    auto& probe = stage_arena.allocate(16);
+    probe.bytes.assign(16, 0);
     auto& backing = stage_arena.allocate(16);
     backing.bytes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     const auto original = backing.bytes;
@@ -804,11 +847,16 @@ int main() {
     request.consume_input = true;
     request.consume_proof = discharged;
     vg::core::FacetPool pool;
+    const std::vector<vg::core::RepresentationRequest> requests{request};
+    vg::test_support::AssembledPlanFixture fixture;
+    vg::core::ExecutionPlan plan;
     vg::hal::Submission submission;
     std::string stage_error;
-    const bool physical_fault_rejected = !vg::hal::run_representation_stage(
-        {request}, stage_arena, pool,
-        [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost*,
+    assert(assemble_representation_plan(stage_arena, probe, requests, pool, &fixture, &plan,
+                                        &stage_error));
+    const bool physical_fault_rejected = !vg::hal::commit_representation_operations(
+        plan, {{vg::hal::CompiledPlan::RepresentationOperation::CopyToPrivate, 0, "fault harness"}}, stage_arena, pool,
+        [](const vg::core::RepresentationSemanticPlanItem&, const vg::hal::CompiledPlan::PhysicalRepresentationOperation&, vg::core::FacetRef, vg::hal::RepresentationTransformCost*,
            std::string* physical_error) {
           if (physical_error) *physical_error = "injected physical transform fault";
           return false;
@@ -869,6 +917,8 @@ int main() {
 
   {
     vg::core::Arena hold_arena;
+    auto& probe = hold_arena.allocate(16);
+    probe.bytes.assign(16, 0);
     auto& backing = hold_arena.allocate(16);
     backing.bytes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     const auto original = backing.bytes;
@@ -888,26 +938,26 @@ int main() {
     request.target_kind = vg::core::FacetKind::Sample;
     request.consume_input = true;
     request.consume_proof = discharged;
+    const std::vector<vg::core::RepresentationRequest> requests{request};
     vg::hal::Submission submission;
-    const bool live_facet_rejected = !vg::hal::run_representation_stage(
-        {request}, hold_arena, pool,
-        [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost* cost,
-           std::string*) {
-          cost->distinct_backing = true;
-          cost->new_backing_bytes = 16;
-          return true;
-        },
-        &submission, &hold_error);
+    vg::test_support::AssembledPlanFixture blocked_fixture;
+    vg::core::ExecutionPlan blocked_plan;
+    const bool live_facet_rejected = !assemble_representation_plan(
+        hold_arena, probe, requests, pool, &blocked_fixture, &blocked_plan, &hold_error);
     assert(live_facet_rejected);
-    assert(hold_error.find("a facet token still names the old representation") != std::string::npos);
+    assert(hold_error.find("live FacetRef names its source epoch") != std::string::npos);
     assert(backing.bytes == original);
     assert(backing.representation_epoch == epoch_before);
     assert(pool.lookup(hold_arena, live) != nullptr);
     assert(pool.retire(live, &hold_error));
     assert(!pool.references(vg::core::RepresentationRef{backing.id, backing.generation, epoch_before}));
-    const bool consume_after_retire = vg::hal::run_representation_stage(
-        {request}, hold_arena, pool,
-        [](const vg::hal::RepresentationRequest&, vg::core::FacetRef, vg::hal::RepresentationTransformCost* cost,
+    vg::test_support::AssembledPlanFixture fixture;
+    vg::core::ExecutionPlan plan;
+    assert(assemble_representation_plan(hold_arena, probe, requests, pool, &fixture, &plan,
+                                        &hold_error));
+    const bool consume_after_retire = vg::hal::commit_representation_operations(
+        plan, {{vg::hal::CompiledPlan::RepresentationOperation::CopyToPrivate, 0, "fault harness"}}, hold_arena, pool,
+        [](const vg::core::RepresentationSemanticPlanItem&, const vg::hal::CompiledPlan::PhysicalRepresentationOperation&, vg::core::FacetRef, vg::hal::RepresentationTransformCost* cost,
            std::string*) {
           cost->distinct_backing = true;
           cost->new_backing_bytes = 16;
@@ -1084,14 +1134,19 @@ int main() {
     request.view = stage_view;
     request.target_kind = vg::core::FacetKind::Sample;
 
+    const std::vector<vg::core::RepresentationRequest> stage_requests{request};
+    vg::test_support::AssembledPlanFixture stage_fixture;
+    vg::test_support::AssemblyOptions stage_options;
+    stage_options.representation_requests = &stage_requests;
+    stage_options.facet_pool = &stage_device->facet_pool();
     vg::hal::ExecutionPlan stage_plan;
-    stage_plan.capabilities = stage_device->capabilities();
-    stage_plan.module = stage_module.module;
-    stage_plan.published = true;
-    stage_plan.representation_requests.push_back(request);
+    std::string stage_error;
+    assert(vg::test_support::assemble_single_node_plan(
+        stage_arena, stage_module.module,
+        {vg::test_support::compute_task(stage_id, stage_generation)},
+        &stage_fixture, &stage_plan, &stage_error, stage_options));
 
     vg::hal::CompiledPlan stage_compiled;
-    std::string stage_error;
     assert(stage_device->compile(stage_plan, &stage_compiled, &stage_error));
     assert(stage_compiled.representation_supported);
     assert(stage_compiled.report.supported);
@@ -1119,12 +1174,28 @@ int main() {
     assert(stage_submission.consumed_allocation_count == 0);
     assert(stage_submission.completion_delay_ns == 0);
 
+    // The source epoch has an intentionally live target token above.  A
+    // destructive request must be rejected by assembly until that external
+    // reference is retired; after retirement the Reference backend reaches
+    // its honest Stage-6 identity/ConsumeInput Unsupported result.
+    assert(stage_device->facet_pool().retire(stage_facet, &stage_error));
+
     // ConsumeInput: rejected at compile(), with representation_supported
     // false, an Unsupported lowering event and a reason -- never accepted and
     // quietly not performed.
-    vg::hal::ExecutionPlan consume_plan = stage_plan;
-    consume_plan.representation_requests[0].consume_input = true;
-    consume_plan.representation_requests[0].consume_proof = discharged;
+    auto consume_request = request;
+    consume_request.consume_input = true;
+    consume_request.consume_proof = discharged;
+    const std::vector<vg::core::RepresentationRequest> consume_requests{consume_request};
+    vg::test_support::AssembledPlanFixture consume_fixture;
+    vg::test_support::AssemblyOptions consume_options;
+    consume_options.representation_requests = &consume_requests;
+    consume_options.facet_pool = &stage_device->facet_pool();
+    vg::hal::ExecutionPlan consume_plan;
+    assert(vg::test_support::assemble_single_node_plan(
+        stage_arena, stage_module.module,
+        {vg::test_support::compute_task(stage_id, stage_generation)},
+        &consume_fixture, &consume_plan, &stage_error, consume_options));
     vg::hal::CompiledPlan consume_compiled;
     std::string consume_error;
     assert(!stage_device->compile(consume_plan, &consume_compiled, &consume_error));
@@ -1140,35 +1211,64 @@ int main() {
     // An incomplete proof is rejected earlier still, by ExecutionPlan::
     // validate(): the adapter is forbidden from inferring a destructive
     // transform on its own (06 §11).
-    vg::hal::ExecutionPlan unproven_plan = stage_plan;
-    unproven_plan.representation_requests[0].consume_input = true;
+    auto unproven_request = request;
+    unproven_request.consume_input = true;
+    const std::vector<vg::core::RepresentationRequest> unproven_requests{unproven_request};
+    vg::test_support::AssembledPlanFixture unproven_fixture;
+    vg::test_support::AssemblyOptions unproven_options;
+    unproven_options.representation_requests = &unproven_requests;
+    unproven_options.facet_pool = &stage_device->facet_pool();
+    vg::hal::ExecutionPlan unproven_plan;
     vg::hal::CompiledPlan unproven_compiled;
     std::string unproven_error;
-    assert(!stage_device->compile(unproven_plan, &unproven_compiled, &unproven_error));
+    assert(!vg::test_support::assemble_single_node_plan(
+        stage_arena, stage_module.module,
+        {vg::test_support::compute_task(stage_id, stage_generation)},
+        &unproven_fixture, &unproven_plan, &unproven_error, unproven_options));
     assert(unproven_error.find("asks for ConsumeInput but its proof is incomplete") != std::string::npos);
 
     // A Stage 5 target must be a facet a transform can produce: Address and
     // Transfer name how an existing representation is reached.
-    vg::hal::ExecutionPlan address_plan = stage_plan;
-    address_plan.representation_requests[0].target_kind = vg::core::FacetKind::Address;
+    auto address_request = request;
+    address_request.target_kind = vg::core::FacetKind::Address;
+    const std::vector<vg::core::RepresentationRequest> address_requests{address_request};
+    vg::test_support::AssembledPlanFixture address_fixture;
+    vg::test_support::AssemblyOptions address_options;
+    address_options.representation_requests = &address_requests;
+    address_options.facet_pool = &stage_device->facet_pool();
+    vg::hal::ExecutionPlan address_plan;
     vg::hal::CompiledPlan address_compiled;
     std::string address_error;
-    assert(!stage_device->compile(address_plan, &address_compiled, &address_error));
+    assert(!vg::test_support::assemble_single_node_plan(
+        stage_arena, stage_module.module,
+        {vg::test_support::compute_task(stage_id, stage_generation)},
+        &address_fixture, &address_plan, &address_error, address_options));
     assert(address_error.find("must be a Sample, Storage, or Attachment facet") != std::string::npos);
 
     // Two requests racing one allocation's representation in a single
     // submission is rejected, not serialized behind the caller's back.
-    vg::hal::ExecutionPlan racing_plan = stage_plan;
-    racing_plan.representation_requests.push_back(request);
+    const std::vector<vg::core::RepresentationRequest> racing_requests{request, request};
+    vg::test_support::AssembledPlanFixture racing_fixture;
+    vg::test_support::AssemblyOptions racing_options;
+    racing_options.representation_requests = &racing_requests;
+    racing_options.facet_pool = &stage_device->facet_pool();
+    vg::hal::ExecutionPlan racing_plan;
     vg::hal::CompiledPlan racing_compiled;
     std::string racing_error;
-    assert(!stage_device->compile(racing_plan, &racing_compiled, &racing_error));
+    assert(!vg::test_support::assemble_single_node_plan(
+        stage_arena, stage_module.module,
+        {vg::test_support::compute_task(stage_id, stage_generation)},
+        &racing_fixture, &racing_plan, &racing_error, racing_options));
     assert(racing_error.find("must not race two transforms of a single allocation") != std::string::npos);
 
     // A plan carrying no request runs no Stage 5 at all, so a caller that
     // never asked cannot be handed a half-filled epoch.
-    vg::hal::ExecutionPlan plain_plan = stage_plan;
-    plain_plan.representation_requests.clear();
+    vg::test_support::AssembledPlanFixture plain_fixture;
+    vg::hal::ExecutionPlan plain_plan;
+    assert(vg::test_support::assemble_single_node_plan(
+        stage_arena, stage_module.module,
+        {vg::test_support::compute_task(stage_id, stage_generation)},
+        &plain_fixture, &plain_plan, &stage_error));
     vg::hal::CompiledPlan plain_compiled;
     assert(stage_device->compile(plain_plan, &plain_compiled, &stage_error));
     vg::hal::Submission plain_submission;
@@ -1177,9 +1277,9 @@ int main() {
     assert(!plain_submission.representation_epoch.sealed());
     assert(plain_submission.representation_facets.empty());
     assert(plain_submission.old_backing_bytes == 0);
-    // The facet the earlier Stage 5 published is untouched by a submission
-    // that transformed nothing.
-    assert(stage_device->facet_pool().lookup(stage_arena, stage_facet) != nullptr);
+    // The earlier target token was explicitly retired before the destructive
+    // assembly check; this unrelated submission must not recreate it.
+    assert(stage_device->facet_pool().lookup(stage_arena, stage_facet) == nullptr);
 
     // The same plan against a module that still names the pre-transform epoch:
     // Stage 5 really publishes the new epoch, and the interpreter then refuses
@@ -1202,11 +1302,16 @@ int main() {
     stale_request.view.allocation_generation = stale_backing.generation;
     stale_request.target_kind = vg::core::FacetKind::Sample;
 
+    const std::vector<vg::core::RepresentationRequest> stale_requests{stale_request};
+    vg::test_support::AssembledPlanFixture stale_fixture;
+    vg::test_support::AssemblyOptions stale_options;
+    stale_options.representation_requests = &stale_requests;
+    stale_options.facet_pool = &stage_device->facet_pool();
     vg::hal::ExecutionPlan stale_plan;
-    stale_plan.capabilities = stage_device->capabilities();
-    stale_plan.module = stale_module.module;
-    stale_plan.published = true;
-    stale_plan.representation_requests.push_back(stale_request);
+    assert(vg::test_support::assemble_single_node_plan(
+        stale_arena, stale_module.module,
+        {vg::test_support::compute_task(stale_backing.id, stale_backing.generation)},
+        &stale_fixture, &stale_plan, &stage_error, stale_options));
 
     vg::hal::CompiledPlan stale_compiled;
     assert(stage_device->compile(stale_plan, &stale_compiled, &stage_error));
@@ -1298,7 +1403,6 @@ int main() {
     assert(ref_device != nullptr);
     auto compiled = vg::compiler::compile_c_like("@node @effects store(1,0,4,7)");
     assert(compiled.ok);
-    plan.capabilities = ref_device->capabilities();
     plan.module = compiled.module;
     plan.published = true;
     assert(plan.validate());

@@ -282,10 +282,9 @@ int main() {
   api.destroyTaskGraphBuilder(node_ref_builder);
   api.destroyCodeObject(node_ref_code_object);
 
-  // Fix #1 regression: submit() must reject a task graph whose code object
-  // was destroyed after sealing but before submit() -- previously this
-  // dereferenced freed VgCodeObject_T memory (code_object->code.bytes)
-  // instead of checking is_valid_code_object() first.
+  // ADR-053 lifecycle regression: a live Node retains its materialized
+  // package, so destroying the host CodeObject handle after sealing must not
+  // make the graph stale or dereference freed wrapper memory at submit.
   {
     VgArenaDesc uaf1_arena_desc = arena_desc;
     VgArena uaf1_arena = nullptr;
@@ -352,8 +351,8 @@ int main() {
     check(api.createExecutionEnvelope(device, &uaf1_envelope_desc, &uaf1_envelope) == VG_SUCCESS,
           "createExecutionEnvelope (UAF#1 setup)");
 
-    // Destroy the code object AFTER the graph is sealed but BEFORE submit --
-    // this is the exact UAF window Fix #1 closes.
+    // The Node, not the host CodeObject handle, owns the immutable package
+    // needed by this graph.
     api.destroyCodeObject(uaf1_code);
 
     VgSubmitDesc uaf1_submit_desc{};
@@ -362,12 +361,12 @@ int main() {
     uaf1_submit_desc.graph = uaf1_graph;
     uaf1_submit_desc.envelope = uaf1_envelope;
     VgSubmission uaf1_submission = nullptr;
-    check(api.submit(device, &uaf1_submit_desc, &uaf1_submission) == VG_ERROR_STALE_HANDLE,
-          "submit() rejects a task graph whose code object was destroyed (Fix #1 regression)");
+    check(api.submit(device, &uaf1_submit_desc, &uaf1_submission) == VG_SUCCESS,
+          "submit succeeds after CodeObject host handle destruction while Node remains live");
 
-    // Fix #2 regression, exercised for free here: uaf1_node->code_object is
-    // already-destroyed at this point, so destroyNode() below must not
-    // dereference it -- it must still erase the node handle without UB.
+    api.destroySubmission(uaf1_submission);
+    // destroyNode must retire the Device NodeTable entry without following a
+    // destroyed CodeObject wrapper.
     api.destroyExecutionEnvelope(uaf1_envelope);
     api.destroyTaskGraph(uaf1_graph);
     api.destroyTaskGraphBuilder(uaf1_builder);
@@ -412,13 +411,9 @@ int main() {
     api.destroyArena(uaf3_arena_b);
   }
 
-  // Fix #4 regression (sequential UAF, no concurrency required): taskGraphAppend
-  // and sealTaskGraph must reject a builder whose code object was destroyed
-  // after createTaskGraphBuilder() succeeded but before either function runs
-  // -- previously these dereferenced freed VgCodeObject_T memory
-  // (builder->code_object->nodes.lookup(...) in taskGraphAppend, and an
-  // unchecked copy of the dangling pointer into the new VgTaskGraph_T in
-  // sealTaskGraph) instead of checking is_valid_code_object() first.
+  // ADR-053 builder regression: builder/graph own the Device and NodeRefs,
+  // not a CodeObject handle.  Appending and sealing after that host handle is
+  // destroyed remains valid while the Node is live.
   {
     VgCodeObjectDesc uaf4_code_desc{};
     uaf4_code_desc.header.type = VG_STRUCTURE_CODE_OBJECT_DESC;
@@ -446,32 +441,70 @@ int main() {
     check(api.createTaskGraphBuilder(device, &uaf4_builder_desc, &uaf4_builder) == VG_SUCCESS,
           "createTaskGraphBuilder (UAF#4 setup)");
 
-    // Destroy the code object AFTER the builder is created but BEFORE
-    // taskGraphAppend/sealTaskGraph -- this is the exact UAF window Fix #4
-    // closes.
+    // The compatibility hint may disappear after builder creation; it must
+    // not be dereferenced by append or seal.
     api.destroyCodeObject(uaf4_code);
 
     VgTaskRecord uaf4_task{};
     uaf4_task.node = uaf4_node_ref;
-    uaf4_task.root = 0;
-    uaf4_task.root_generation = 0;
+    uaf4_task.root = allocation_id;
+    uaf4_task.root_generation = allocation_generation;
     uaf4_task.shape = {1, 1, 1, 0};
     VgTaskId uaf4_id{};
-    check(api.taskGraphAppend(uaf4_builder, &uaf4_task, 1, &uaf4_id) == VG_ERROR_STALE_HANDLE,
-          "taskGraphAppend rejects a builder whose code object was destroyed (Fix #4 regression)");
+    check(api.taskGraphAppend(uaf4_builder, &uaf4_task, 1, &uaf4_id) == VG_SUCCESS,
+          "taskGraphAppend accepts a live Node after CodeObject handle destruction");
 
     VgSealDesc uaf4_seal_desc{};
     uaf4_seal_desc.header.type = VG_STRUCTURE_SEAL_DESC;
     uaf4_seal_desc.header.size = sizeof(uaf4_seal_desc);
     VgTaskGraph uaf4_graph = nullptr;
-    check(api.sealTaskGraph(uaf4_builder, &uaf4_seal_desc, &uaf4_graph) == VG_ERROR_STALE_HANDLE,
-          "sealTaskGraph rejects a builder whose code object was destroyed (Fix #4 regression)");
+    check(api.sealTaskGraph(uaf4_builder, &uaf4_seal_desc, &uaf4_graph) == VG_SUCCESS,
+          "sealTaskGraph accepts a live Node after CodeObject handle destruction");
 
-    // uaf4_node->code_object is already-destroyed here too -- destroyNode
-    // (Fix #2 precedent) must not dereference it, and destroyTaskGraphBuilder
-    // must still cleanly erase the handle despite the rejected calls above.
+    VgExecutionEnvelopeDesc uaf4_envelope_desc{};
+    uaf4_envelope_desc.header.type = VG_STRUCTURE_EXECUTION_ENVELOPE_DESC;
+    uaf4_envelope_desc.header.size = sizeof(uaf4_envelope_desc);
+    uaf4_envelope_desc.arena = arena;
+    VgExecutionEnvelope uaf4_envelope = nullptr;
+    check(api.createExecutionEnvelope(device, &uaf4_envelope_desc, &uaf4_envelope) == VG_SUCCESS,
+          "createExecutionEnvelope (UAF#4 setup)");
+
+    VgSubmitDesc uaf4_submit_desc{};
+    uaf4_submit_desc.header.type = VG_STRUCTURE_SUBMIT_DESC;
+    uaf4_submit_desc.header.size = sizeof(uaf4_submit_desc);
+    uaf4_submit_desc.graph = uaf4_graph;
+    uaf4_submit_desc.envelope = uaf4_envelope;
+    VgSubmission uaf4_submission = nullptr;
+    check(api.submit(device, &uaf4_submit_desc, &uaf4_submission) == VG_SUCCESS,
+          "submit accepts a live Node after CodeObject handle destruction");
+
+    api.destroySubmission(uaf4_submission);
+    api.destroyTaskGraph(uaf4_graph);
     api.destroyTaskGraphBuilder(uaf4_builder);
+
+    // A graph not yet accepted by submit must not retain Node ownership.
+    // After Node retirement, its recorded generation is stale at submit.
+    VgTaskGraphBuilderDesc uaf4_stale_builder_desc = uaf4_builder_desc;
+    uaf4_stale_builder_desc.code_object = nullptr;
+    VgTaskGraphBuilder uaf4_stale_builder = nullptr;
+    check(api.createTaskGraphBuilder(device, &uaf4_stale_builder_desc, &uaf4_stale_builder) == VG_SUCCESS,
+          "createTaskGraphBuilder without destroyed CodeObject hint (UAF#4 stale-node setup)");
+    VgTaskId uaf4_stale_id{};
+    check(api.taskGraphAppend(uaf4_stale_builder, &uaf4_task, 1, &uaf4_stale_id) == VG_SUCCESS,
+          "taskGraphAppend accepts live Node before UAF#4 stale-node setup");
+    VgTaskGraph uaf4_stale_graph = nullptr;
+    check(api.sealTaskGraph(uaf4_stale_builder, &uaf4_seal_desc, &uaf4_stale_graph) == VG_SUCCESS,
+          "sealTaskGraph accepts live Node before UAF#4 stale-node setup");
+
     api.destroyNode(uaf4_node);
+    uaf4_submit_desc.graph = uaf4_stale_graph;
+    VgSubmission uaf4_stale_submission = nullptr;
+    check(api.submit(device, &uaf4_submit_desc, &uaf4_stale_submission) == VG_ERROR_STALE_HANDLE,
+          "submit rejects an unaccepted graph whose Node ref became stale");
+
+    api.destroyTaskGraph(uaf4_stale_graph);
+    api.destroyTaskGraphBuilder(uaf4_stale_builder);
+    api.destroyExecutionEnvelope(uaf4_envelope);
   }
 
   api.destroyArena(arena);
@@ -1303,6 +1336,18 @@ int main() {
     check(v15_api.version == VG_API_VERSION_1_5, "v1.5 api.version");
     check(v15_api.size == offsetof(VgApi, writeAllocation), "v1.5 api.size == v1.6 boundary");
     check(v15_api.taskGraphAppendV2 != nullptr, "v1.5 reuses taskGraphAppendV2");
+  }
+
+  // F6 publishes a v1.7 SceneRoot contract without extending VgApi.  Keep
+  // this explicit so the table-neutral version cannot drift from v1.6.
+  {
+    VgApi v17_api{};
+    v17_api.size = sizeof(v17_api);
+    check(vgGetApi(VG_API_VERSION_1_7, &v17_api) == VG_SUCCESS, "vgGetApi v1.7");
+    check(v17_api.version == VG_API_VERSION_1_7, "v1.7 api.version");
+    check(v17_api.size == sizeof(VgApi), "v1.7 reuses the v1.6 API-table boundary");
+    check(v17_api.writeAllocation != nullptr && v17_api.readAllocation != nullptr,
+          "v1.7 retains F7 allocation I/O entry points");
   }
 
   return g_ok ? 0 : 1;

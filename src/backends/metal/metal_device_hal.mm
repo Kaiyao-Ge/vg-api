@@ -4,6 +4,7 @@
 #include "backends/reference/reference_executor.h"
 #include "compiler/pipeline_classification.h"
 #include "core/scene_root.h"
+#include "vg_scene_root_layout.h"
 #include "ir/sha256.h"
 
 #import <Foundation/Foundation.h>
@@ -17,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
@@ -164,7 +166,13 @@ hal::CapabilitySnapshot make_hal_snapshot(id<MTLDevice> device, DeviceSnapshot* 
                    static_cast<uint64_t>(hal::Capability::UserShaderImport);
   if (shared_events) bits |= static_cast<uint64_t>(hal::Capability::Timeline);
   if (indirect) bits |= static_cast<uint64_t>(hal::Capability::IndirectTier1);
-  if (gpu_addresses) bits |= static_cast<uint64_t>(hal::Capability::LinearAddress);
+  if (gpu_addresses) {
+    bits |= static_cast<uint64_t>(hal::Capability::LinearAddress);
+    // The indexed package is the GPU-address argument-table lowering; do
+    // not advertise the prerequisite address domain while rejecting the
+    // capability that this adapter actually implements with it.
+    bits |= static_cast<uint64_t>(hal::Capability::IndexedBinding);
+  }
   caps.capability_bits = bits;
 
   if (out != nullptr) {
@@ -457,6 +465,7 @@ struct DeviceHal::Impl {
   Impl& operator=(Impl&&) = delete;
   ~Impl() {
     for (auto& entry : allocation_map) release_buffer(entry.second.buffer);
+    release_buffer(identity_scene_root_buffer);
     for (auto& entry : facet_map) release_facet_textures(entry.second);
   }
 
@@ -531,6 +540,10 @@ struct DeviceHal::Impl {
   id<MTLComputePipelineState> pipeline = nil;
   std::string cached_ir_hash;
   std::unordered_map<uint64_t, MetalAllocationRecord> allocation_map;
+  // One device-owned legacy root. It is immutable after creation and is
+  // reused for every pre-F6 draw, avoiding a per-draw Metal allocation.
+  id<MTLBuffer> identity_scene_root_buffer = nil;
+  std::mutex identity_scene_root_mutex;
 
   // Lazily created on first timeline_wait/timeline_signal use. Its
   // signaledValue is the single source of truth for the device's timeline
@@ -737,14 +750,23 @@ struct DeviceHal::Impl {
     return it->second.buffer;
   }
 
-  id<MTLBuffer> make_identity_scene_root_buffer() {
-    constexpr size_t kSceneRootBytes = 16 * sizeof(float) + 4 * sizeof(float) + 2 * sizeof(uint32_t);
-    id<MTLBuffer> buffer = [device newBufferWithLength:kSceneRootBytes options:MTLResourceStorageModeShared];
-    if (buffer == nil) return nil;
-    std::memset([buffer contents], 0, kSceneRootBytes);
-    auto* matrix = static_cast<float*>([buffer contents]);
+  // `created` is only observability for the submission report: it distinguishes
+  // the one device-local allocation from subsequent legacy draws without
+  // exposing the Metal object outside this adapter.
+  id<MTLBuffer> make_identity_scene_root_buffer(bool* created = nullptr) {
+    std::lock_guard<std::mutex> lock(identity_scene_root_mutex);
+    if (identity_scene_root_buffer != nil) {
+      if (created != nullptr) *created = false;
+      return identity_scene_root_buffer;
+    }
+    identity_scene_root_buffer = [device newBufferWithLength:VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE
+                                                     options:MTLResourceStorageModeShared];
+    if (identity_scene_root_buffer == nil) return nil;
+    std::memset([identity_scene_root_buffer contents], 0, VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE);
+    auto* matrix = static_cast<float*>([identity_scene_root_buffer contents]);
     matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
-    return buffer;
+    if (created != nullptr) *created = true;
+    return identity_scene_root_buffer;
   }
 
   // Commit a completed GPU buffer write to the canonical F7 byte store and
@@ -2356,6 +2378,10 @@ bool plan_computes_over_allocation(const hal::ExecutionPlan& plan, uint64_t allo
 // regardless of which path executed the submission.
 void attach_access_certificate(const hal::CompiledPlan& compiled, const core::Arena& arena, hal::Submission* submission) {
   if (!submission->result.ok || !compiled.plan.requested_certificate_mode.has_value()) return;
+  // Stage 0--5 plans are sealed by core.  Rebuilding from this adapter's
+  // legacy module projection would both duplicate policy and lose the
+  // canonical witness for a multi-Node graph.
+  if (compiled.plan.assembled) return;
   // TASK-D2 / ADR-036: a non-empty seed list already attached the
   // discovered (strict subset) certificate in run_discovery_stage.
   // build_access_certificate here would overwrite it with the B-era
@@ -2407,6 +2433,11 @@ struct DeviceHal::CompileOps {
 
   static bool reject_unsupported(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
                                  std::string* error) {
+    if (plan.resolved_nodes.size() > 1) {
+      init(compiled, plan);
+      return fail(compiled, "per_node_lowering",
+                  "Metal per-Node lowering is Unsupported for multi-CodeObject task graphs", error);
+    }
     if (plan.requested_certificate_mode == core::AccessCertificateMode::SoftwarePaged ||
         plan.requested_certificate_mode == core::AccessCertificateMode::FaultManaged) {
       init(compiled, plan);
@@ -2414,10 +2445,15 @@ struct DeviceHal::CompileOps {
                   "requested access certificate mode is not implemented on this backend", error);
     }
     const bool indexed_binding = !is_pointer_graph_module(plan.module) && plan.request_indexed_binding;
-    if (indexed_binding && (!plan.effect_dag_passes.empty() || !plan.task_graph.tasks().empty())) {
+    // Every Stage-6 plan now carries its assembled TaskGraph.  Indexed
+    // binding remains incompatible with explicit multi-pass EffectDag
+    // scheduling, but a graph containing the single semantic compute task
+    // is not a second execution mode and must not reintroduce a legacy
+    // unassembled-plan exception.
+    if (indexed_binding && !plan.effect_dag_passes.empty()) {
       init(compiled, plan);
       return fail(compiled, "compute_package",
-                  "indexed binding combined with effect DAG passes or a task graph is out of scope (TASK-B16)",
+                  "indexed binding combined with explicit effect DAG passes is out of scope (TASK-B16)",
                   error);
     }
     return true;
@@ -2471,8 +2507,8 @@ struct DeviceHal::CompileOps {
 
   static bool representation_requests(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
                                      std::string* error) {
-    for (size_t index = 0; index < plan.representation_requests.size(); ++index) {
-      const auto& request = plan.representation_requests[index];
+    for (size_t index = 0; index < plan.representation_plan.size(); ++index) {
+      const auto& request = plan.representation_plan[index];
       std::string request_error;
       if (!view_expressible(request.view, request.target_kind, request.view.byte_size(), &request_error)) {
         compiled->representation_supported = false;
@@ -2495,6 +2531,8 @@ struct DeviceHal::CompileOps {
                            request.view.byte_size(),
                            "blit every subresource of the linear backing into a Private device-optimal "
                            "MTLTexture and publish a new RepresentationEpoch at submit()");
+      compiled->representation_operations.push_back({hal::CompiledPlan::RepresentationOperation::CopyToPrivate,
+                                                     request.transform_order, "Metal private texture copy"});
       if (request.consume_input)
         compiled->report.add("consume_input", hal::LoweringClass::Direct, 1, 0,
                              "recorded for submit(): the Private texture is storage distinct from the linear "
@@ -2637,11 +2675,21 @@ bool DeviceHal::compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compi
     return false;
   }
   if (!plan.validate(error)) return false;
-  if (!CompileOps::reject_unsupported(plan, compiled, error)) return false;
-  if (!CompileOps::select_package(*this, plan, compiled, error)) return false;
-  if (!CompileOps::representation_requests(plan, compiled, error)) return false;
-  if (!CompileOps::timeline(*this, plan, compiled, error)) return false;
-  return CompileOps::pipelines(*this, plan, compiled, error);
+  if (!hal::preflight_stage6(plan, capabilities(), hal::BackendKind::Metal, compiled, error)) return false;
+  // Transitional adapter-local bridge: the core plan never selects a graph
+  // "main module". Metal has not yet gained per-Node lowering, so it may
+  // inspect exactly one already resolved node and rejects every other graph.
+  hal::ExecutionPlan adapter_plan = plan;
+  if (plan.assembled && plan.resolved_nodes.size() == 1) {
+    const auto& node = plan.resolved_nodes.front();
+    if (node.module) adapter_plan.module = *node.module;
+    else adapter_plan.user_raster_shader = node.user_raster_shader;
+  }
+  if (!CompileOps::reject_unsupported(adapter_plan, compiled, error)) return false;
+  if (!CompileOps::select_package(*this, adapter_plan, compiled, error)) return false;
+  if (!CompileOps::representation_requests(adapter_plan, compiled, error)) return false;
+  if (!CompileOps::timeline(*this, adapter_plan, compiled, error)) return false;
+  return CompileOps::pipelines(*this, adapter_plan, compiled, error);
 }
 
 
@@ -2710,9 +2758,9 @@ struct DeviceHal::SubmitOps {
   static bool stage5(DeviceHal& metal, const hal::CompiledPlan& compiled, core::Arena& arena,
                      hal::Submission* submission, std::string* error) {
     std::string representation_error;
-    if (!hal::run_representation_stage(
-            compiled.plan.representation_requests, arena, metal.facet_pool(),
-            [&](const hal::RepresentationRequest& request, core::FacetRef facet,
+    if (!hal::commit_representation_operations(
+            compiled.plan, compiled.representation_operations, arena, metal.facet_pool(),
+            [&](const core::RepresentationSemanticPlanItem& request, const hal::CompiledPlan::PhysicalRepresentationOperation&, core::FacetRef facet,
                 hal::RepresentationTransformCost* cost, std::string* physical_error) {
               Impl::TransformCost transform_cost;
               if (!metal.impl_->transform_into_private_facet(arena, metal.facet_pool(), request.view,
@@ -2778,6 +2826,7 @@ struct DeviceHal::SubmitOps {
       std::array<float, 4> tint = task.raster_tint;
       std::optional<core::ResolvedSceneRootRaster> scene_root;
       id<MTLBuffer> scene_root_buffer = nil;
+      bool identity_buffer_created = false;
       if (uses_scene_root) {
         scene_root.emplace();
         if (!core::resolve_scene_root_raster(arena, task, &*scene_root, &task_error)) {
@@ -2791,11 +2840,20 @@ struct DeviceHal::SubmitOps {
         // The built-in shader always reads slot 1 after F6. Bind an explicit
         // identity root for every pre-F6 task so its pixels and PSO key stay
         // unchanged rather than relying on an unbound Metal buffer.
-        scene_root_buffer = metal.impl_->make_identity_scene_root_buffer();
+        scene_root_buffer = metal.impl_->make_identity_scene_root_buffer(&identity_buffer_created);
       }
       if (scene_root_buffer == nil) {
         if (out_message) *out_message = "Metal SceneRoot buffer allocation failed";
         return false;
+      }
+      if (!uses_scene_root) {
+        submission->report.add(identity_buffer_created ? "identity_scene_root_buffer_create"
+                                                       : "identity_scene_root_buffer_reuse",
+                               hal::LoweringClass::Direct, 1,
+                               identity_buffer_created ? VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE : 0,
+                               identity_buffer_created
+                                   ? "one immutable device-local legacy SceneRoot buffer created"
+                                   : "reused immutable device-local legacy SceneRoot buffer; no draw allocation");
       }
       // Address facets are just as much GPU-visible capabilities as sample
       // and attachment facets. Hold vertex (and, below, index) slots until
@@ -4364,7 +4422,8 @@ std::unique_ptr<DeviceHal> make_device_hal() {
   id<MTLBuffer> buffer = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
   if (buffer != nil && [buffer respondsToSelector:@selector(gpuAddress)] && [buffer gpuAddress] != 0) {
     impl->snapshot.supports_gpu_addresses = true;
-    impl->snapshot.hal.capability_bits |= static_cast<uint64_t>(hal::Capability::LinearAddress);
+    impl->snapshot.hal.capability_bits |= static_cast<uint64_t>(hal::Capability::LinearAddress) |
+                                           static_cast<uint64_t>(hal::Capability::IndexedBinding);
   }
   return std::unique_ptr<DeviceHal>(new DeviceHal(std::move(impl)));
 }
@@ -4406,7 +4465,8 @@ std::unique_ptr<DeviceHal> make_device_hal(const uint8_t uuid[16], std::string* 
   id<MTLBuffer> buffer = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
   if (buffer != nil && [buffer respondsToSelector:@selector(gpuAddress)] && [buffer gpuAddress] != 0) {
     impl->snapshot.supports_gpu_addresses = true;
-    impl->snapshot.hal.capability_bits |= static_cast<uint64_t>(hal::Capability::LinearAddress);
+    impl->snapshot.hal.capability_bits |= static_cast<uint64_t>(hal::Capability::LinearAddress) |
+                                           static_cast<uint64_t>(hal::Capability::IndexedBinding);
   }
   return std::unique_ptr<DeviceHal>(new DeviceHal(std::move(impl)));
 }

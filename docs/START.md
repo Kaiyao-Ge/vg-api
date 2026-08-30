@@ -7,13 +7,19 @@
 ## 当前事实状态
 
 Correction（2026-08-23，执行入口，不是 `vg-project/*` 原文）：仓库已经有
-CMake presets、公共 C ABI（`VG_API_VERSION_1_0` / `vgGetApi`）、portable
+CMake presets、版本化公共 C ABI（当前 header/API 至 `VG_API_VERSION_1_7`，通过
+`vgGetApi` 协商）、portable
 core、CPU reference、Metal adapter、Vulkan compile-review-only 源码、
 `vg-exp` phase-a–phase-e、以及 A/B/D 的 gate 记录。Phase C 为
 `not-closed`（layer1 complete）。Phase D 是研究记录（ADR-041），不是
 Phase E 的自动入口。Phase E（Research Alpha）按 ADR-042 记录为
 对外复现汇总，不是产品关门。干净 checkout 的构建与复现命令见
 [reports/external-repro-runbook.md](reports/external-repro-runbook.md)。
+
+Phase F 的 TaskGraph 已由 ADR-053 重新收紧为 device-scoped、generation-checked
+`NodeRef` authority：ADR-044 的单 `CodeObject` builder narrowing 不再是合同。
+当前 multi-CodeObject lowering 只由 Reference canonical-compute 路径支持；Metal/
+Vulkan 必须明确拒绝，且 ADR-047/ADR-052 的 compute+raster scope cut 不变。
 
 上一版「尚未建立 CMake / runtime / 测试」的句子描述的是文档初稿时的仓库，
 不再是当前 checkout 的事实。规范冲突优先级不变。
@@ -126,3 +132,4 @@ Agent 不得把 `NativeAdapter` 的成功写成“VG 已经是比 Vulkan/Metal �
 | [11-agent-workflow.md](vg-project/11-agent-workflow.md) | Agent 如何接单、修改、测试、交接 |
 | [12-roadmap-and-risks.md](vg-project/12-roadmap-and-risks.md) | 里程碑、决策记录、风险和停止条件 |
 | [13-repository-layout.md](vg-project/13-repository-layout.md) | 建议代码仓库和产物布局 |
+| [decisions/](decisions/) | 决策记录（当前最高：ADR-053；ADR-053 supersedes ADR-044 的单 CodeObject narrowing） |

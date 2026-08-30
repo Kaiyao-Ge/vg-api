@@ -24,6 +24,8 @@ set(VG_SCHEMA_HEADER "${VG_GENERATED_DIR}/vg_task_root.h")
 set(VG_SCHEMA_REFLECTION "${VG_GENERATED_DIR}/vg_task_root.reflection.json")
 set(VG_SCHEMA_GOLDEN "${VG_GENERATED_DIR}/vg_task_root.layout.json")
 set(VG_SCENE_ROOT_HEADER "${VG_GENERATED_DIR}/vg_scene_root.h")
+set(VG_SCENE_ROOT_LAYOUT_HEADER "${VG_GENERATED_DIR}/vg_scene_root_layout.h")
+set(VG_SCENE_ROOT_MSL_HEADER "${VG_GENERATED_DIR}/vg_scene_root_msl.h")
 set(VG_SCENE_ROOT_REFLECTION "${VG_GENERATED_DIR}/vg_scene_root.reflection.json")
 set(VG_SCENE_ROOT_GOLDEN "${VG_GENERATED_DIR}/vg_scene_root.layout.json")
 add_custom_command(
@@ -35,7 +37,7 @@ add_custom_command(
   VERBATIM
 )
 add_custom_command(
-  OUTPUT "${VG_SCENE_ROOT_HEADER}" "${VG_SCENE_ROOT_REFLECTION}" "${VG_SCENE_ROOT_GOLDEN}"
+  OUTPUT "${VG_SCENE_ROOT_HEADER}" "${VG_SCENE_ROOT_LAYOUT_HEADER}" "${VG_SCENE_ROOT_MSL_HEADER}" "${VG_SCENE_ROOT_REFLECTION}" "${VG_SCENE_ROOT_GOLDEN}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${VG_GENERATED_DIR}"
   COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/vg-schema/vg_schema.py"
           "${VG_SCENE_ROOT_SCHEMA_INPUT}" --out-dir "${VG_GENERATED_DIR}"
@@ -43,7 +45,7 @@ add_custom_command(
   VERBATIM
 )
 add_custom_target(vg_schema_generate DEPENDS "${VG_SCHEMA_HEADER}" "${VG_SCHEMA_REFLECTION}" "${VG_SCHEMA_GOLDEN}"
-                                                "${VG_SCENE_ROOT_HEADER}" "${VG_SCENE_ROOT_REFLECTION}" "${VG_SCENE_ROOT_GOLDEN}")
+                                                "${VG_SCENE_ROOT_HEADER}" "${VG_SCENE_ROOT_LAYOUT_HEADER}" "${VG_SCENE_ROOT_MSL_HEADER}" "${VG_SCENE_ROOT_REFLECTION}" "${VG_SCENE_ROOT_GOLDEN}")
 
 add_library(vg_ir STATIC
     src/ir/json.cpp
@@ -53,7 +55,7 @@ add_library(vg_ir STATIC
 target_compile_features(vg_ir PUBLIC cxx_std_20)
 target_include_directories(vg_ir PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-add_library(vg_core STATIC src/core/core.cpp src/core/task_schema.cpp src/core/scene_root.cpp)
+add_library(vg_core STATIC src/core/core.cpp src/core/execution_plan.cpp src/core/task_schema.cpp src/core/scene_root.cpp)
 target_compile_features(vg_core PUBLIC cxx_std_20)
 target_include_directories(vg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(vg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -73,7 +75,9 @@ add_library(vg_compiler STATIC
 )
 target_compile_features(vg_compiler PUBLIC cxx_std_20)
 target_include_directories(vg_compiler PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(vg_compiler PRIVATE "${VG_GENERATED_DIR}")
 target_link_libraries(vg_compiler PUBLIC vg_ir)
+add_dependencies(vg_compiler vg_schema_generate)
 
 add_library(vg_backend_reference STATIC
     src/backends/device_hal.cpp
@@ -116,6 +120,7 @@ if(VG_ENABLE_METAL)
   )
   target_compile_features(vg_backend_metal PUBLIC cxx_std_20)
   target_include_directories(vg_backend_metal PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_include_directories(vg_backend_metal PRIVATE "${VG_GENERATED_DIR}")
   # vg_backend_reference is a deliberate exception to the one-directional
   # layer dependency: Metal's HostAssisted fallback reuses the reference
   # executor's byte-exact CPU implementation rather than duplicating it.
@@ -170,8 +175,10 @@ add_executable(vg-replay tools/vg-replay.cpp)
 target_link_libraries(vg-replay PRIVATE vg_capture vg_backend_reference)
 target_compile_features(vg-replay PRIVATE cxx_std_20)
 
-# A standalone public-C-ABI sample.  It deliberately includes only <vg/vg.h>
-# and writes the read-back color attachment as a portable PPM image.
+# A standalone public-C-ABI F3--F5 legacy-raster sample. It deliberately
+# includes only <vg/vg.h>; the caller supplies an explicit PPM output path so
+# running it never drops a generated artifact in the repository root. F6's
+# v1.7 SceneRoot path is covered by api.f6-scene-root-c instead.
 add_executable(vg-offscreen-triangle-ppm tools/vg-offscreen-triangle-ppm.c)
 target_link_libraries(vg-offscreen-triangle-ppm PRIVATE vg_api)
 
@@ -208,6 +215,25 @@ if(BUILD_TESTING)
   target_link_libraries(vg_c_abi_conformance_test PRIVATE vg_api)
   target_compile_features(vg_c_abi_conformance_test PRIVATE cxx_std_17)
   add_test(NAME api.c-abi-conformance COMMAND vg_c_abi_conformance_test)
+
+  # Device-scoped Node capability conformance: two canonical compute
+  # CodeObjects must execute per Task in one graph.  This stays a small,
+  # public-ABI-only acceptance test rather than adding more cases to the
+  # historical C ABI monolith.
+  add_executable(vg_multicode_taskgraph_conformance_test
+                 tests/api/vg_multicode_taskgraph_conformance_test.cpp)
+  target_link_libraries(vg_multicode_taskgraph_conformance_test PRIVATE vg_api)
+  target_compile_features(vg_multicode_taskgraph_conformance_test PRIVATE cxx_std_17)
+  add_test(NAME api.multicode-taskgraph-conformance COMMAND vg_multicode_taskgraph_conformance_test)
+
+  # Stress the Device-owned NodeTable separately from the historical API
+  # conformance executable.  C++20 provides deterministic barrier scheduling
+  # without sleeps, and vg_core exposes the table's snapshot semantics.
+  add_executable(vg_node_table_concurrency_test tests/unit/node_table_concurrency_test.cpp)
+  target_link_libraries(vg_node_table_concurrency_test PRIVATE vg_core)
+  target_compile_features(vg_node_table_concurrency_test PRIVATE cxx_std_20)
+  add_test(NAME core.node-table-concurrency COMMAND vg_node_table_concurrency_test)
+
   add_executable(vg_f7_checkpoint_a_test tests/api/vg_f7_checkpoint_a.c)
   target_link_libraries(vg_f7_checkpoint_a_test PRIVATE vg_api)
   add_test(NAME api.f7-checkpoint-a-c COMMAND vg_f7_checkpoint_a_test)
@@ -234,8 +260,23 @@ if(BUILD_TESTING)
 
   add_executable(vg_core_test tests/unit/core_test.cpp)
   target_link_libraries(vg_core_test PRIVATE vg_backend_reference vg_capture)
+  target_include_directories(vg_core_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
   target_compile_features(vg_core_test PRIVATE cxx_std_20)
   add_test(NAME core.unit COMMAND vg_core_test)
+
+  add_executable(vg_execution_plan_test tests/unit/execution_plan_test.cpp)
+  target_link_libraries(vg_execution_plan_test PRIVATE vg_core vg_backend_reference)
+  target_compile_features(vg_execution_plan_test PRIVATE cxx_std_20)
+  add_test(NAME core.execution-plan COMMAND vg_execution_plan_test)
+
+  # F6's generated root contract is validated in core, independently of the
+  # Reference/Metal physical raster paths.  This owns the malformed root and
+  # capture-v1 rejection matrix rather than duplicating it in an adapter test.
+  add_executable(vg_scene_root_contract_test tests/unit/scene_root_contract_test.cpp)
+  target_link_libraries(vg_scene_root_contract_test PRIVATE vg_capture vg_backend_reference)
+  target_compile_features(vg_scene_root_contract_test PRIVATE cxx_std_20)
+  add_test(NAME core.scene-root-contract COMMAND vg_scene_root_contract_test)
+
 
   add_executable(vg_ir_test tests/unit/ir_test.cpp)
   target_link_libraries(vg_ir_test PRIVATE vg_compiler)
@@ -255,6 +296,7 @@ if(BUILD_TESTING)
 
   add_executable(vg_reference_raster_test tests/unit/reference_raster_test.cpp)
   target_link_libraries(vg_reference_raster_test PRIVATE vg_backend_reference)
+  target_include_directories(vg_reference_raster_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
   target_compile_features(vg_reference_raster_test PRIVATE cxx_std_20)
   add_test(NAME reference.facet-oracles COMMAND vg_reference_raster_test)
 
@@ -312,6 +354,14 @@ if(BUILD_TESTING)
     target_compile_features(vg_metal_vertical_slice_test PRIVATE cxx_std_20)
     add_test(NAME vertical-slice.metal COMMAND vg_metal_vertical_slice_test ${CMAKE_CURRENT_SOURCE_DIR})
 
+    add_executable(vg_metal_identity_scene_root_cache_test
+                   tests/vertical_slice/metal_identity_scene_root_cache_test.cpp)
+    target_link_libraries(vg_metal_identity_scene_root_cache_test PRIVATE vg_backend_metal vg_core)
+    target_compile_features(vg_metal_identity_scene_root_cache_test PRIVATE cxx_std_20)
+    add_test(NAME vertical-slice.metal.identity-scene-root-cache
+             COMMAND vg_metal_identity_scene_root_cache_test)
+    set_tests_properties(vertical-slice.metal.identity-scene-root-cache PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(vg_metal_task_timeline_test tests/vertical_slice/metal_task_timeline_test.cpp)
     target_link_libraries(vg_metal_task_timeline_test PRIVATE vg_backend_metal vg_backend_reference vg_core
                           vg_capture)
@@ -342,6 +392,13 @@ if(BUILD_TESTING)
     # registered -- under VG_ENABLE_METAL, matching every ctest it depends on.
     add_test(NAME tooling.phase-b-runner COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_phase_b_runner.py ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
   endif()
+
+  # No Vulkan device or SDK is needed: guards against capability advertising
+  # or a compile-time linear fallback that a driver-dependent vertical slice
+  # cannot observe on development hosts.
+  add_test(NAME vertical-slice.vulkan.capability-contract
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/vertical_slice/vulkan_capability_contract_test.py
+                   ${CMAKE_CURRENT_SOURCE_DIR})
 
   if(VG_ENABLE_VULKAN)
     add_executable(vg_vulkan_bda_vertical_slice_test tests/vertical_slice/vulkan_bda_vertical_slice_test.cpp)

@@ -2,6 +2,7 @@
 #define VG_BACKENDS_DEVICE_HAL_H_
 
 #include "core/core.h"
+#include "core/execution_plan.h"
 #include "compiler/compiler.h"
 #include "ir/ir.h"
 
@@ -52,6 +53,12 @@ enum class Capability : uint32_t {
   // HostAssisted, never a silently upgraded fully-verified status. A backend
   // with no restricted-import path leaves the bit clear.
   UserShaderImport = 1u << 9,
+  // Tier 2 is GPU selection among pre-authorized Node/state buckets.  It is
+  // not Tier 1 indirect dispatch, and an adapter must advertise it separately.
+  IndirectTier2Select = 1u << 10,
+  // Indexed bindings have their own descriptor/address-table contract; they
+  // must not be inferred from (or collapsed into) LinearAddress.
+  IndexedBinding = 1u << 11,
 };
 
 struct CapabilitySnapshot {
@@ -122,132 +129,19 @@ struct LoweringReport {
 // One Stage 5 (03 §7 "Representation") item: a Region's required facet and
 // representation version, fixed before the adapter is allowed to see the plan
 // (03 §8: "每个 Region 的所需 facet 与 representation version 已固定").
-struct RepresentationRequest {
-  core::CanonicalView view;
-  core::FacetKind target_kind{core::FacetKind::Sample};
-  // 02 §4.2 / 06 §11. Default false is the documented safe behaviour: the old
-  // backing is retained until the relevant command buffer completes. Setting
-  // it true additionally requires a complete `consume_proof`; the adapter is
-  // forbidden from inferring a destructive transform on its own (06 §11:
-  // "adapter 不自行推断破坏性转换").
-  bool consume_input{};
-  core::ConsumeProof consume_proof;
-};
-
-struct ExecutionPlan {
-  uint32_t abi_version{kDeviceHalAbiVersion};
-  CapabilitySnapshot capabilities;
-  ir::Module module;
-  core::Certificate certificate;
-  core::TaskGraph task_graph;
-  uint64_t graph_epoch{};
-  uint64_t timeline_wait{};
-  uint64_t timeline_signal{};
-  bool published{};
-  // E004: when set, submit() builds an AccessCertificate for this mode over
-  // the live arena and reports it via Submission::access_certificate/report.
-  // Unset (the default) preserves every pre-E004 caller's behavior exactly:
-  // no certificate is built, no report event is added.
-  std::optional<core::AccessCertificateMode> requested_certificate_mode;
-  // TASK-B13 (E009): when true (and the backend advertises
-  // Capability::IndirectTier1), submit() follows Tier0 task publication with
-  // a real GPU-indirect dispatch pass -- each published task's own x/y/z
-  // dispatch dims (already GPU-resident from Tier0, never read back to the
-  // host before dispatching) drive dispatchThreadgroupsWithIndirectBuffer:.
-  // Default false preserves every pre-B13 caller's behavior exactly
-  // (Tier0-only, as before). Meaningless on backends with no real GPU
-  // dispatch concept (reference); those simply ignore it.
-  bool request_tier1_indirect{};
-  // TASK-B14 (E012): when non-empty, describes a general Effect DAG of
-  // independently-compiled passes rather than the single `module` above.
-  // `module` must still be one of the passes (by convention, pass 0) so
-  // ExecutionPlan::validate()'s existing ir::verify(module) call keeps
-  // working unmodified -- effect_dag_passes is what actually drives
-  // submit()'s multi-encoder/fence dispatch when non-empty; `module` alone
-  // is never separately (re-)dispatched in that case. Default empty
-  // preserves every pre-B14 caller's behavior exactly (single-module path).
-  std::vector<ir::Module> effect_dag_passes;
-  // Dependency edges between effect_dag_passes indices (before, after),
-  // mirroring TaskGraphBuilder::add_dependency's (before, after) pair shape.
-  // Meaningless when effect_dag_passes is empty.
-  std::vector<std::pair<uint32_t, uint32_t>> effect_dag_dependencies;
-  // TASK-B16 (E007): when true, compile() lowers plan.module through
-  // compiler::build_indexed_compute_package instead of build_linear_compute_
-  // package -- same load/store-only IR, deliberately compiled two different
-  // ways so E007 can compare the resulting binding counts (N buffer(N)
-  // slots vs. one argument-buffer-style table). Following the
-  // requested_certificate_mode precedent above: this is an ExecutionPlan
-  // field, not a second virtual method, since DeviceHal::compile/submit stay
-  // fixed at two methods and all per-submission variance is a plan field.
-  // Meaningless (ignored) when plan.module contains any pointer-graph opcode
-  // (load_ref/load_via/store_via) -- those always take the CachedObject
-  // path regardless of this flag. Default false preserves every pre-B16
-  // caller's behavior exactly (linear lowering, as before).
-  bool request_indexed_binding{};
-  // Stage 5's input (03 §7): one entry per Region whose required facet and
-  // representation version this submission fixes. Empty (the default)
-  // preserves every existing caller exactly -- submit() then runs no Stage 5
-  // bookkeeping, seals no RepresentationEpoch, and leaves every
-  // representation field of Submission at its default.
-  std::vector<RepresentationRequest> representation_requests;
-  // 03 §12's four profiles. A profile changes diagnosis, instrumentation and
-  // scheduling determinism only, never the meaning of a legal program, which
-  // is why it is a plain per-submission input rather than a field of any
-  // sealed object. CheckedNative (the default) asks for the in-shader
-  // facet-generation check of 06 §6.4; a backend that cannot honour it must
-  // say so by leaving Capability::CheckedFacetGeneration clear rather than
-  // silently running the submission unchecked.
-  core::ValidationProfile validation_profile{core::ValidationProfile::CheckedNative};
-  // TASK-D1 / ADR-035: unset preserves every pre-D caller. TASK-D3:
-  // submit() enforces a set working_set_budget via apply_working_set_budget()
-  // -- requested bytes that exceed it are a hard refuse (the
-  // WorkingSetBudget::allows error), never a silent clamp. validate() still
-  // rejects lease.byte_limit > budget.byte_limit before submit.
-  std::optional<core::WorkingSetBudget> working_set_budget;
-  std::optional<core::WorkingSetLease> working_set_lease;
-  std::optional<core::EnvelopeOverflow> pending_overflow;
-  // TASK-D2 / ADR-036: caller-supplied seeds for a DiscoverThenLease walk
-  // (02 §7.2). Default empty = no discovery stage, so every pre-D2 caller
-  // -- including B-era DiscoverThenLease's full-arena scan -- is unchanged.
-  std::vector<core::PointerRef> discovery_seeds;
-  // TASK-D5 / ADR-039: per-submit envelope cap on how many tasks this
-  // commit may publish. Unset = no envelope cap (every pre-D5 caller).
-  // Distinct from TaskGraphBuilder::set_quota (ADR-010, build-time only).
-  // 0 is a set cap of zero, not "unset". Crossing the cap is overflow
-  // buffer + next submit, never a silent enlarge.
-  std::optional<uint32_t> envelope_task_quota;
-  // TASK-D4 (E010): when true, submit() selects among
-  // `authorized_node_classes` (>=2 pre-authorized Node classes). Metal
-  // prefers a GPU-encoded ICB (DevicePass) and falls back to bucket +
-  // per-Node indirect (EmulatedDevicePass). Default false / empty list
-  // leaves every pre-D4 caller unchanged. A backend that host-walks
-  // selection must classify Serialized/HostAssisted -- never DevicePass.
-  bool request_tier2_select{};
-  std::vector<uint32_t> authorized_node_classes;
-  // F3 (ADR-043 Decision #4): when set, this submission carries a restricted-
-  // import hand-written MSL raster shader instead of `module`'s linear IR --
-  // `module` stays default/empty and validate() skips ir::verify(module)
-  // entirely in that case, since there is no IR to verify. Meaningless (and
-  // never set) unless the backend advertises Capability::UserShaderImport.
-  std::optional<ir::UserRasterShaderContract> user_raster_shader;
-
-  bool validate(std::string* error = nullptr) const;
-  // Checked separately from validate() because it needs the live arena: a
-  // task graph is only meaningful against the topology it was built against,
-  // so graph_epoch must match arena.topology_epoch() at submit() time. A
-  // plan with no tasks is exempt (graph_epoch is unused/zero in that case,
-  // matching every pre-B7 caller that never set it).
-  bool graph_epoch_matches(const core::Arena& arena, std::string* error = nullptr) const;
-};
-
+using RepresentationRequest = core::RepresentationRequest;
+using ExecutionPlan = core::ExecutionPlan;
 struct CompiledPlan {
   uint32_t abi_version{kDeviceHalAbiVersion};
   ExecutionPlan plan;
   // B4's target-neutral package.  It is deliberately source/metadata only;
   // B5/B6 attach private pipeline objects outside this contract.
   std::optional<compiler::ComputePackage> compute_package;
-  // TASK-B16 (E007): populated instead of compute_package when
-  // plan.request_indexed_binding was true and plan.module qualified (load/
+  // One package per resolved Node when a graph has multiple compute programs.
+  // Backends without Node-aware lowering must reject that graph explicitly.
+  std::vector<std::pair<core::NodeTable::Ref, compiler::ComputePackage>> node_compute_packages;
+  // TASK-B16 (E007): populated instead of compute_package when the sealed
+  // plan requires indexed binding and plan.module qualified (load/
   // store only, no pointer-graph opcodes). Exactly one of compute_package /
   // indexed_compute_package is ever set for a given CompiledPlan -- never
   // both, never neither, on a successful compile().
@@ -271,7 +165,23 @@ struct CompiledPlan {
   // backend never drops a request and then reports a successful compile as if
   // none had been asked for.
   bool representation_supported{true};
+  // Stage-6 result: one descriptor per frozen Stage-5 item.  It contains no
+  // authority or epoch derivation; submit only executes this already selected
+  // physical form and fails closed on a snapshot mismatch.
+  enum class RepresentationOperation : uint32_t { Identity, CopyToPrivate, CopyToImage, Unsupported };
+  struct PhysicalRepresentationOperation {
+    RepresentationOperation operation{RepresentationOperation::Unsupported};
+    uint32_t semantic_order{};
+    std::string diagnostic;
+  };
+  std::vector<PhysicalRepresentationOperation> representation_operations;
 };
+
+// Stage 6 capability gate.  The plan remains core-owned; adapters supply
+// their own immutable snapshot here instead of receiving a caller snapshot.
+bool preflight_stage6(const ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
+                      BackendKind expected_backend, CompiledPlan* compiled,
+                      std::string* error = nullptr);
 
 // F2 (ADR-046): the backend-neutral subset of Metal's RasterResult /
 // reference's RasterResult -- both already mirror each other field for
@@ -420,7 +330,7 @@ struct RepresentationTransformCost {
   // backing only frees anything if the new representation is not that same
   // backing. A backend whose transform is the identity (the reference
   // interpreter: a host byte array is already its own optimal representation)
-  // reports false, and run_representation_stage() then refuses a consume
+  // reports false, and commit_representation_operations() then refuses a consume
   // instead of "releasing" the only copy of the data the facet points at.
   bool distinct_backing{};
 };
@@ -452,21 +362,18 @@ struct RepresentationTransformCost {
 // distinct backing is refused rather than quietly skipped.
 //
 // A failure leaves `submission` claiming no successful transform.
-bool run_representation_stage(const std::vector<RepresentationRequest>& requests,
+bool commit_representation_operations(const core::ExecutionPlan& plan,
+                              const std::vector<CompiledPlan::PhysicalRepresentationOperation>& operations,
                               core::Arena& arena, core::FacetPool& pool,
-                              const std::function<bool(const RepresentationRequest&, core::FacetRef,
+                              const std::function<bool(const core::RepresentationSemanticPlanItem&, const CompiledPlan::PhysicalRepresentationOperation&, core::FacetRef,
                                                        RepresentationTransformCost*,
                                                        std::string*)>& physical,
                               Submission* submission, std::string* error = nullptr);
 
-// TASK-D3 / ADR-037: this-submit residency, not the address graph. If
-// plan.working_set_lease is set, requested bytes are the sum of those
-// allocations' sizes (missing/stale lookup is a refuse). Else if
-// working_set_budget is set, requested bytes are Universe -- every Active
-// allocation->size. A set budget that does not allow the request fails
-// with WorkingSetBudget::allows's "working-set budget exceeded"; never a
-// silent clamp, and unified memory is never treated as infinite. No-op
-// when neither field is set, so every pre-D3 caller is unchanged.
+// Stage 7 physical working-set accounting. Core Stage 0--5 already selects
+// a proven lease (or Universe accounting), freezes its byte count, and
+// applies the hard budget refusal. HAL only records that sealed request; it
+// never scans the Arena or chooses an access policy.
 //
 // LoweringReport events (stable names): working_set_requested /
 // working_set_committed / working_set_proxy. Reasons say "proxy" because
@@ -476,16 +383,10 @@ bool run_representation_stage(const std::vector<RepresentationRequest>& requests
 bool apply_working_set_budget(const ExecutionPlan& plan, core::Arena& arena,
                               Submission* submission, std::string* error = nullptr);
 
-// TASK-D2 / ADR-036: HostAssisted discovery stage (02 §7.2). Empty
-// discovery_seeds is a no-op so pre-D2 callers are unchanged. A non-empty
-// list host-walks 12-byte PointerRefs in allocation bytes, freezes
-// topology_epoch, seals a certificate over seeds+reachable, and fills a
-// WorkingSetLease from that set via lease.add(ref, discovered, ...).
-// Witness beyond the certificate (including a plan.working_set_lease that
-// names an extra allocation) is a refuse. Classification is always
-// HostAssisted -- never DevicePass: this is a host walk / host
-// round-trip, a semantic reachable set / proxy, not OS page migration.
-// SoftwarePaged / FaultManaged stay Unsupported.
+// Stage 7 report/physical-operation hook for core-sealed discovery. The
+// host walk, topology freeze, witness/certificate/lease construction and
+// authority checks are solely ExecutionPlanAssembler work. HAL records the
+// selected operation as HostAssisted and must not derive another set.
 bool run_discovery_stage(const ExecutionPlan& plan, core::Arena& arena,
                          Submission* submission, std::string* error = nullptr);
 

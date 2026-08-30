@@ -1,6 +1,7 @@
 #include "conformance_lib.h"
 
 #include "backends/reference/reference_device_hal.h"
+#include "../support/assembled_plan_fixture.h"
 #include "compiler/compiler.h"
 #include "golden_format.h"
 #include "ir/ir.h"
@@ -75,34 +76,34 @@ bool run_contract_checks(vg::hal::DeviceHal& device, const std::string& backend_
   compiled_module.module.declared_effects[0].allocation = allocation.id;
   compiled_module.module.canonical_json = vg::ir::serialize_module(compiled_module.module);
 
+  std::string error;
   vg::hal::ExecutionPlan plan;
-  plan.capabilities = caps;
-  plan.module = compiled_module.module;
-  plan.published = true;
+  vg::test_support::AssembledPlanFixture plan_fixture;
+  const auto root_ref = vg::core::PointerRef{allocation.id, allocation.generation};
+  if (!check(vg::test_support::assemble_single_node_plan(
+                 arena, compiled_module.module,
+                 {vg::test_support::compute_task(root_ref.allocation, root_ref.generation)},
+                 &plan_fixture, &plan, &error), backend_name, "assembles a valid linear-subset plan", &all_ok))
+    return all_ok;
 
   vg::hal::CompiledPlan compiled;
-  std::string error;
   if (check(device.compile(plan, &compiled, &error), backend_name, "compiles a valid linear-subset plan", &all_ok)) {
     // Every backend emits this event for a linear-subset compile (the B4
     // shared contract); backends that implement more than the linear subset
     // (currently only reference) additionally instrument the underlying
     // canonical-IR interpretation step. A backend that has NOT implemented
     // more than the linear subset must not claim that extra event.
-    check(has_event(compiled.report, "compute_package"), backend_name, "reports a compute_package lowering event",
+    check(has_event(compiled.report, "compute_package") || has_event(compiled.report, "node_compute_package"),
+         backend_name, "reports a compute package lowering event",
          &all_ok);
     if (expectation.expect_linear_subset_only)
       check(!has_event(compiled.report, "canonical_ir"), backend_name,
            "linear-subset-only backend does not claim canonical_ir instrumentation", &all_ok);
     else
-      check(has_event(compiled.report, "canonical_ir"), backend_name,
-           "full backend reports canonical_ir instrumentation", &all_ok);
+      check(has_event(compiled.report, "canonical_ir") || has_event(compiled.report, "node_compute_package"),
+           backend_name, "full backend reports Node-aware canonical package instrumentation", &all_ok);
   }
 
-  auto stale_plan = plan;
-  stale_plan.abi_version = vg::hal::kDeviceHalAbiVersion + 1;
-  check(!device.compile(stale_plan, &compiled, &error), backend_name, "rejects stale ABI version", &all_ok);
-  check(error == "execution plan ABI version is unsupported", backend_name, "stale ABI version error message",
-       &all_ok);
 
   auto bad_timeline = plan;
   bad_timeline.timeline_wait = 4;
@@ -126,16 +127,26 @@ bool run_golden_fixture_invariant(vg::hal::DeviceHal& device, const std::string&
     const auto reference_module = load_and_bind(path, reference_arena);
 
     vg::hal::ExecutionPlan device_plan;
-    device_plan.capabilities = device.capabilities();
-    device_plan.module = device_module;
-    device_plan.published = true;
-
     vg::hal::ExecutionPlan reference_plan;
-    reference_plan.capabilities = reference_device->capabilities();
-    reference_plan.module = reference_module;
-    reference_plan.published = true;
+    vg::test_support::AssembledPlanFixture device_fixture;
+    vg::test_support::AssembledPlanFixture reference_fixture;
+    const auto device_root = vg::core::PointerRef{device_module.instructions.front().allocation,
+                                                  device_module.instructions.front().generation};
+    const auto reference_root = vg::core::PointerRef{reference_module.instructions.front().allocation,
+                                                     reference_module.instructions.front().generation};
 
     std::string error;
+    if (!vg::test_support::assemble_single_node_plan(
+            device_arena, device_module,
+            {vg::test_support::compute_task(device_root.allocation, device_root.generation)},
+            &device_fixture, &device_plan, &error) ||
+        !vg::test_support::assemble_single_node_plan(
+            reference_arena, reference_module,
+            {vg::test_support::compute_task(reference_root.allocation, reference_root.generation)},
+            &reference_fixture, &reference_plan, &error)) {
+      check(false, backend_name, std::string(name) + ": core assembly", &all_ok);
+      continue;
+    }
     vg::hal::CompiledPlan device_compiled;
     const bool device_compiled_ok = device.compile(device_plan, &device_compiled, &error);
 

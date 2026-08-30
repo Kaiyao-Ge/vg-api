@@ -3,15 +3,34 @@
 #include "backends/reference/reference_executor.h"
 #include "backends/vulkan/vulkan_device_hal.h"
 #include "ir/ir.h"
+#include "../support/assembled_plan_fixture.h"
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
 using vg::core::TaskGraph;
 using vg::core::TaskGraphBuilder;
 using vg::core::TaskRecord;
+
+bool assemble_compute_plan(vg::core::Arena& arena, vg::ir::Module module,
+                           std::vector<TaskRecord> tasks, vg::hal::ExecutionPlan* out,
+                           std::string* error,
+                           const vg::test_support::AssemblyOptions& options = {}) {
+  vg::test_support::AssembledPlanFixture fixture;
+  return vg::test_support::assemble_single_node_plan(
+      arena, std::move(module), tasks, &fixture, out, error, options);
+}
+
+TaskRecord probe_task(const vg::ir::Module& module) {
+  TaskRecord task{};
+  task.root_allocation = module.instructions.front().allocation;
+  task.root_generation = module.instructions.front().generation;
+  task.x = task.y = task.z = 1;
+  return task;
+}
 
 // A minimal single-load module. Its only purpose is to give compile()/
 // submit() a valid linear compute package to run so the timeline/task-ring
@@ -52,39 +71,20 @@ bool same_task(const TaskRecord& a, const TaskRecord& b) {
 // since no Linux/NVIDIA hardware is available to actually run this binary.
 bool run_task_tier0(const std::string& root) {
   (void)root;
-  TaskGraphBuilder builder;
-  TaskRecord task0{};
-  task0.node_index = 0;
-  task0.root_allocation = 42;
+  vg::core::Arena arena;
+  const auto module = make_probe_module(arena);
+  TaskRecord task0 = probe_task(module);
   task0.x = 3;
   task0.y = 2;
   task0.z = 1;
   task0.payload_size = 8;
-  TaskRecord task1{};
-  task1.node_index = 1;
-  task1.root_allocation = 42;
+  TaskRecord task1 = probe_task(module);
   task1.x = 1;
   task1.y = 1;
   task1.z = 1;
   task1.flags = 7;
   task1.contract_index = 3;
   task1.payload_or_offset = 0x1'0000'0001ULL;
-  if (!builder.append(task0) || !builder.append(task1) || !builder.add_dependency(0, 1)) {
-    std::cerr << "task-tier0: failed to build task graph\n";
-    return false;
-  }
-  TaskGraph graph;
-  if (!builder.seal(&graph) || !graph.publish()) {
-    std::cerr << "task-tier0: failed to seal/publish task graph\n";
-    return false;
-  }
-
-  auto oracle = vg::reference::execute_task_graph(graph);
-  if (!oracle.ok || oracle.published_tasks.size() != 2) {
-    std::cerr << "task-tier0: reference oracle failed: " << oracle.message << "\n";
-    return false;
-  }
-
   std::string device_error;
   auto vulkan_device = vg::vulkan::make_device_hal(&device_error);
   if (vulkan_device == nullptr) {
@@ -92,18 +92,21 @@ bool run_task_tier0(const std::string& root) {
     return false;
   }
 
-  vg::core::Arena arena;
-  const auto module = make_probe_module(arena);
-
   vg::hal::ExecutionPlan plan;
-  plan.capabilities = vulkan_device->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-
-  vg::hal::CompiledPlan compiled;
   std::string error;
+  const std::vector<std::pair<uint32_t, uint32_t>> dependencies{{0, 1}};
+  vg::test_support::AssemblyOptions options;
+  options.dependencies = &dependencies;
+  if (!assemble_compute_plan(arena, module, {task0, task1}, &plan, &error, options)) {
+    std::cerr << "task-tier0: plan assembly failed: " << error << "\n";
+    return false;
+  }
+  auto oracle = vg::reference::execute_task_graph(plan.task_graph);
+  if (!oracle.ok || oracle.published_tasks.size() != 2) {
+    std::cerr << "task-tier0: reference oracle failed: " << oracle.message << "\n";
+    return false;
+  }
+  vg::hal::CompiledPlan compiled;
   if (!vulkan_device->compile(plan, &compiled, &error)) {
     std::cerr << "task-tier0: Vulkan compile failed: " << error << "\n";
     return false;
@@ -155,11 +158,13 @@ bool run_timeline(const std::string& root) {
   const auto module = make_probe_module(arena);
   std::string error;
 
+  vg::test_support::AssemblyOptions signal_options;
+  signal_options.timeline_signal = 5;
   vg::hal::ExecutionPlan signal_plan;
-  signal_plan.capabilities = vulkan_device->capabilities();
-  signal_plan.module = module;
-  signal_plan.published = true;
-  signal_plan.timeline_signal = 5;
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &signal_plan, &error, signal_options)) {
+    std::cerr << "timeline: assembly (signal) failed: " << error << "\n";
+    return false;
+  }
   vg::hal::CompiledPlan signal_compiled;
   if (!vulkan_device->compile(signal_plan, &signal_compiled, &error)) {
     std::cerr << "timeline: compile (signal) failed: " << error << "\n";
@@ -175,12 +180,14 @@ bool run_timeline(const std::string& root) {
     return false;
   }
 
+  vg::test_support::AssemblyOptions wait_options;
+  wait_options.timeline_wait = 5;
+  wait_options.timeline_signal = 10;
   vg::hal::ExecutionPlan wait_plan;
-  wait_plan.capabilities = vulkan_device->capabilities();
-  wait_plan.module = module;
-  wait_plan.published = true;
-  wait_plan.timeline_wait = 5;
-  wait_plan.timeline_signal = 10;
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &wait_plan, &error, wait_options)) {
+    std::cerr << "timeline: assembly (wait) failed: " << error << "\n";
+    return false;
+  }
   vg::hal::CompiledPlan wait_compiled;
   if (!vulkan_device->compile(wait_plan, &wait_compiled, &error)) {
     std::cerr << "timeline: compile (wait) failed: " << error << "\n";
@@ -196,12 +203,14 @@ bool run_timeline(const std::string& root) {
     return false;
   }
 
+  vg::test_support::AssemblyOptions stuck_options;
+  stuck_options.timeline_wait = 999;
+  stuck_options.timeline_signal = 1000;
   vg::hal::ExecutionPlan stuck_plan;
-  stuck_plan.capabilities = vulkan_device->capabilities();
-  stuck_plan.module = module;
-  stuck_plan.published = true;
-  stuck_plan.timeline_wait = 999;
-  stuck_plan.timeline_signal = 1000;
+  if (!assemble_compute_plan(arena, module, {probe_task(module)}, &stuck_plan, &error, stuck_options)) {
+    std::cerr << "timeline: assembly (stuck) failed: " << error << "\n";
+    return false;
+  }
   vg::hal::CompiledPlan stuck_compiled;
   if (!vulkan_device->compile(stuck_plan, &stuck_compiled, &error)) {
     std::cerr << "timeline: compile (stuck) failed: " << error << "\n";
@@ -253,26 +262,13 @@ bool run_raster_rejected(const std::string& root) {
   // inspects FacetRef contents.
   TaskRecord raster_task{};
   raster_task.kind = vg::core::TaskKind::Raster;
-  TaskGraphBuilder builder;
-  if (!builder.append(raster_task)) {
-    std::cerr << "raster-rejected: failed to append raster task\n";
-    return false;
-  }
-  TaskGraph graph;
-  if (!builder.seal(&graph) || !graph.publish()) {
-    std::cerr << "raster-rejected: failed to seal/publish task graph\n";
-    return false;
-  }
-
   vg::hal::ExecutionPlan plan;
-  plan.capabilities = vulkan_device->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-
-  vg::hal::CompiledPlan compiled;
   std::string error;
+  if (!assemble_compute_plan(arena, module, {raster_task}, &plan, &error)) {
+    std::cerr << "raster-rejected: plan assembly failed: " << error << "\n";
+    return false;
+  }
+  vg::hal::CompiledPlan compiled;
   if (vulkan_device->compile(plan, &compiled, &error)) {
     std::cerr << "raster-rejected: compile() unexpectedly accepted a Raster-kind task\n";
     return false;
@@ -300,18 +296,12 @@ bool run_raster_rejected(const std::string& root) {
   return true;
 }
 
-// F3 (ADR-043 Decision #4): a restricted-import "vg.msl.raster/v1"
-// submission (plan.user_raster_shader set, plan.module left default) needed
-// zero new Vulkan code -- ExecutionPlan::validate() already skips
-// ir::verify(module) whenever user_raster_shader is set (so the default/
-// empty module here no longer chokes it), and this backend's pre-existing
-// task.kind==Raster rejection loop above (run_raster_rejected) runs right
-// after validate() succeeds and rejects the task before pack_task_record
-// ever sees it, identically to the plain-raster case. This is a cheap
-// regression guard that the two features compose correctly, not a new
-// code path: same "raster tasks not supported on Vulkan backend" message,
-// same Unsupported "raster_task" LoweringEvent. Compile-review-only here
-// since no Linux/NVIDIA hardware is available to actually run this binary.
+// F3 (ADR-043 Decision #4): the restricted-import raster contract is placed
+// in a real CodeObject/Node by assemble_single_user_raster_plan, producing
+// an assembled plan whose resolved node carries the shader contract. Vulkan
+// intentionally projects that transitional raster shape to its explicit
+// Unsupported path before task-ring packing; it must retain the same named
+// raster_task diagnostic rather than reinterpret it as compute.
 bool run_raster_msl_rejected(const std::string& root) {
   (void)root;
   std::string device_error;
@@ -325,37 +315,22 @@ bool run_raster_msl_rejected(const std::string& root) {
   // rejection, same as raster-rejected above.
   TaskRecord raster_task{};
   raster_task.kind = vg::core::TaskKind::Raster;
-  TaskGraphBuilder builder;
-  if (!builder.append(raster_task)) {
-    std::cerr << "raster-msl-rejected: failed to append raster task\n";
-    return false;
-  }
-  TaskGraph graph;
-  if (!builder.seal(&graph) || !graph.publish()) {
-    std::cerr << "raster-msl-rejected: failed to seal/publish task graph\n";
-    return false;
-  }
-
   vg::core::Arena arena;
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = vulkan_device->capabilities();
-  // plan.module stays default (never set): a "vg.msl.raster/v1" submission
-  // never carries linear IR (vg_api_execution.cpp's submit()). Without
-  // user_raster_shader set, ExecutionPlan::validate() would instead run
-  // ir::verify(module) on this default/empty module and fail there --
-  // before ever reaching the Raster-kind rejection below, which is exactly
-  // the "chokes on the empty module in MSL-mode" case F3 fixed in
-  // validate() so the two paths compose (see device_hal.cpp).
-  plan.user_raster_shader = vg::ir::UserRasterShaderContract{
+  // Do not hand-build a plan with an empty module here: the fixture below
+  // materializes the imported contract into the resolved Node snapshot.
+  const vg::ir::UserRasterShaderContract shader{
       "vg.test.raster/v1", "vg_test_vertex", "vg_test_fragment",
       vg::ir::kRasterVertexAbiXyzuvPackedV1,
       "#version 450\nvoid main() {}\n"};
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-
-  vg::hal::CompiledPlan compiled;
+  vg::test_support::AssembledPlanFixture fixture;
+  vg::hal::ExecutionPlan plan;
   std::string error;
+  if (!vg::test_support::assemble_single_user_raster_plan(
+          arena, shader, {raster_task}, &fixture, &plan, &error)) {
+    std::cerr << "raster-msl-rejected: plan assembly failed: " << error << "\n";
+    return false;
+  }
+  vg::hal::CompiledPlan compiled;
   if (vulkan_device->compile(plan, &compiled, &error)) {
     std::cerr << "raster-msl-rejected: compile() unexpectedly accepted a user_raster_shader Raster-kind task\n";
     return false;

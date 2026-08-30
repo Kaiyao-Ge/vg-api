@@ -38,6 +38,13 @@ int main(void) {
   io_api.size = sizeof(io_api);
   if (vgGetApi(VG_API_VERSION_1_6, &io_api) != VG_SUCCESS ||
       io_api.writeAllocation == NULL || io_api.readAllocation == NULL) return 10;
+  /* F6 is a v1.7 semantic/schema contract, not a function-table growth.
+   * The negotiated table must therefore remain the same v1.6-sized ABI. */
+  VgApi scene_api = {0};
+  scene_api.size = sizeof(scene_api);
+  if (vgGetApi(VG_API_VERSION_1_7, &scene_api) != VG_SUCCESS ||
+      scene_api.version != VG_API_VERSION_1_7 || scene_api.size != sizeof(VgApi) ||
+      scene_api.writeAllocation == NULL || scene_api.readAllocation == NULL) return 11;
 
   VgRuntimeDesc bad = VG_INIT_STRUCT(VgRuntimeDesc, VG_STRUCTURE_RUNTIME_DESC);
   bad.allocate = (VgAllocateFn)log_callback;

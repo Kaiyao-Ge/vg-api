@@ -3,6 +3,7 @@
 #include "backends/vulkan/vulkan_device_hal.h"
 #include "golden_format.h"
 #include "ir/ir.h"
+#include "../support/assembled_plan_fixture.h"
 
 #include <algorithm>
 #include <fstream>
@@ -55,15 +56,27 @@ bool run_fixture(const std::string& name, const std::string& root) {
   }
   auto reference_device = vg::reference::make_device_hal();
 
+  vg::test_support::AssembledPlanFixture vulkan_fixture;
+  vg::test_support::AssembledPlanFixture reference_fixture;
   vg::hal::ExecutionPlan vulkan_plan;
-  vulkan_plan.capabilities = vulkan_device->capabilities();
-  vulkan_plan.module = vulkan_module;
-  vulkan_plan.published = true;
-
   vg::hal::ExecutionPlan reference_plan;
-  reference_plan.capabilities = reference_device->capabilities();
-  reference_plan.module = reference_module;
-  reference_plan.published = true;
+  std::string assembly_error;
+  const auto vulkan_root = vulkan_module.instructions.front();
+  const auto reference_root = reference_module.instructions.front();
+  if (!vg::test_support::assemble_single_node_plan(
+          vulkan_arena, vulkan_module,
+          {vg::test_support::compute_task(vulkan_root.allocation, vulkan_root.generation)},
+          &vulkan_fixture, &vulkan_plan, &assembly_error)) {
+    std::cerr << name << ": Vulkan plan assembly failed: " << assembly_error << "\n";
+    return false;
+  }
+  if (!vg::test_support::assemble_single_node_plan(
+          reference_arena, reference_module,
+          {vg::test_support::compute_task(reference_root.allocation, reference_root.generation)},
+          &reference_fixture, &reference_plan, &assembly_error)) {
+    std::cerr << name << ": Reference plan assembly failed: " << assembly_error << "\n";
+    return false;
+  }
 
   std::string error;
   vg::hal::CompiledPlan vulkan_compiled;

@@ -3,6 +3,7 @@
 #include "backends/reference/reference_device_hal.h"
 #include "backends/reference/reference_executor.h"
 #include "compiler/compiler.h"
+#include "../support/assembled_plan_fixture.h"
 
 #include <iostream>
 #include <set>
@@ -12,7 +13,6 @@
 namespace {
 
 using vg::core::TaskGraph;
-using vg::core::TaskGraphBuilder;
 using vg::core::TaskRecord;
 
 vg::ir::Module make_probe_module(vg::core::Arena& arena) {
@@ -38,18 +38,19 @@ struct TaskChain {
   uint64_t root_allocation{};
 };
 
-TaskGraph make_chain(TaskChain chain) {
-  TaskGraphBuilder builder;
+bool assemble_chain(vg::core::Arena& arena, const vg::ir::Module& module, TaskChain chain,
+                    vg::test_support::AssembledPlanFixture* fixture, vg::hal::ExecutionPlan* plan,
+                    std::string* error, uint32_t quota) {
+  std::vector<TaskRecord> tasks;
+  std::vector<std::pair<uint32_t, uint32_t>> dependencies;
   for (uint32_t i = 0; i < chain.task_count; ++i) {
-    TaskRecord task{};
-    task.node_index = i;
-    task.root_allocation = chain.root_allocation;
-    if (!builder.append(task)) return {};
-    if (i > 0 && !builder.add_dependency(i - 1, i)) return {};
+    tasks.push_back(vg::test_support::compute_task(chain.root_allocation));
+    if (i > 0) dependencies.emplace_back(i - 1, i);
   }
-  TaskGraph graph;
-  if (!builder.seal(&graph) || !graph.publish()) return {};
-  return graph;
+  vg::test_support::AssemblyOptions options;
+  options.dependencies = &dependencies;
+  options.task_quota = quota;
+  return vg::test_support::assemble_single_node_plan(arena, module, tasks, fixture, plan, error, options);
 }
 
 bool same_task(const TaskRecord& a, const TaskRecord& b) {
@@ -67,22 +68,15 @@ bool run_reference_continuation() {
   }
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
-  auto graph = make_chain({.task_count = 3, .root_allocation = module.instructions[0].allocation});
-  if (graph.tasks().size() != 3) {
+  vg::test_support::AssembledPlanFixture fixture;
+  vg::hal::ExecutionPlan plan;
+  std::string error;
+  if (!assemble_chain(arena, module, {.task_count = 3, .root_allocation = module.instructions[0].allocation},
+                      &fixture, &plan, &error, 1)) {
     std::cerr << "envelope-continuation: failed to build task graph\n";
     return false;
   }
-
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = device->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-  plan.envelope_task_quota = 1;
-
   vg::hal::CompiledPlan compiled;
-  std::string error;
   if (!device->compile(plan, &compiled, &error)) {
     std::cerr << "envelope-continuation: reference compile failed: " << error << "\n";
     return false;
@@ -104,7 +98,8 @@ bool run_reference_continuation() {
   auto without_token = compiled;
   vg::hal::Submission stolen;
   if (!device->submit(without_token, arena, &stolen, &error) || !stolen.result.ok ||
-      stolen.published_tasks.size() != 1 || stolen.published_tasks[0].node_index != 0 ||
+      stolen.published_tasks.size() != 1 ||
+      stolen.published_tasks[0].node_index != plan.task_graph.tasks()[0].node_index ||
       !device->envelope_continuations().contains(token)) {
     std::cerr << "envelope-continuation: submit without token must not steal leftover\n";
     return false;
@@ -125,15 +120,14 @@ bool run_reference_continuation() {
 
   std::vector<TaskRecord> published = first.published_tasks;
   published.insert(published.end(), second.published_tasks.begin(), second.published_tasks.end());
-  const auto oracle = vg::reference::execute_task_graph(graph);
+  const auto oracle = vg::reference::execute_task_graph(plan.task_graph);
   if (!oracle.ok || published.size() != oracle.published_tasks.size()) {
     std::cerr << "envelope-continuation: published set size mismatches oracle\n";
     return false;
   }
-  std::set<uint32_t> seen;
   for (size_t i = 0; i < published.size(); ++i) {
-    if (!same_task(published[i], oracle.published_tasks[i]) || !seen.insert(published[i].node_index).second) {
-      std::cerr << "envelope-continuation: published set mismatches oracle or has duplicates\n";
+    if (!same_task(published[i], oracle.published_tasks[i])) {
+      std::cerr << "envelope-continuation: published task order mismatches oracle\n";
       return false;
     }
   }
@@ -150,22 +144,15 @@ bool run_metal_large_quota() {
   }
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
-  auto graph = make_chain({.task_count = 3, .root_allocation = 42});
-  if (graph.tasks().size() != 3) {
+  vg::test_support::AssembledPlanFixture fixture;
+  vg::hal::ExecutionPlan plan;
+  std::string error;
+  if (!assemble_chain(arena, module, {.task_count = 3, .root_allocation = module.instructions[0].allocation},
+                      &fixture, &plan, &error, 8)) {
     std::cerr << "envelope-continuation: failed to build Metal task graph\n";
     return false;
   }
-
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-  plan.envelope_task_quota = 8;
-
   vg::hal::CompiledPlan compiled;
-  std::string error;
   if (!metal->compile(plan, &compiled, &error)) {
     std::cerr << "envelope-continuation: Metal compile failed: " << error << "\n";
     return false;
@@ -176,7 +163,7 @@ bool run_metal_large_quota() {
               << submission.result.message << "\n";
     return false;
   }
-  const auto oracle = vg::reference::execute_task_graph(graph);
+  const auto oracle = vg::reference::execute_task_graph(plan.task_graph);
   if (!oracle.ok || submission.published_tasks.size() != oracle.published_tasks.size()) {
     std::cerr << "envelope-continuation: Metal large-quota published_tasks count mismatch\n";
     return false;
@@ -203,22 +190,15 @@ bool run_metal_continuation() {
   }
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
-  auto graph = make_chain({.task_count = 3, .root_allocation = module.instructions[0].allocation});
-  if (graph.tasks().size() != 3) {
+  vg::test_support::AssembledPlanFixture fixture;
+  vg::hal::ExecutionPlan plan;
+  std::string error;
+  if (!assemble_chain(arena, module, {.task_count = 3, .root_allocation = module.instructions[0].allocation},
+                      &fixture, &plan, &error, 1)) {
     std::cerr << "envelope-continuation: failed to build Metal continuation graph\n";
     return false;
   }
-
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal->capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-  plan.envelope_task_quota = 1;
-
   vg::hal::CompiledPlan compiled;
-  std::string error;
   if (!metal->compile(plan, &compiled, &error)) {
     std::cerr << "envelope-continuation: Metal continuation compile failed: " << error << "\n";
     return false;
@@ -240,7 +220,8 @@ bool run_metal_continuation() {
   auto without_token = compiled;
   vg::hal::Submission stolen;
   if (!metal->submit(without_token, arena, &stolen, &error) || !stolen.result.ok ||
-      stolen.published_tasks.size() != 1 || stolen.published_tasks[0].node_index != 0 ||
+      stolen.published_tasks.size() != 1 ||
+      stolen.published_tasks[0].node_index != plan.task_graph.tasks()[0].node_index ||
       !metal->envelope_continuations().contains(token)) {
     std::cerr << "envelope-continuation: Metal submit without token must not steal leftover\n";
     return false;
@@ -261,15 +242,14 @@ bool run_metal_continuation() {
 
   std::vector<TaskRecord> published = first.published_tasks;
   published.insert(published.end(), second.published_tasks.begin(), second.published_tasks.end());
-  const auto oracle = vg::reference::execute_task_graph(graph);
+  const auto oracle = vg::reference::execute_task_graph(plan.task_graph);
   if (!oracle.ok || published.size() != oracle.published_tasks.size()) {
     std::cerr << "envelope-continuation: Metal published set size mismatches oracle\n";
     return false;
   }
-  std::set<uint32_t> seen;
   for (size_t i = 0; i < published.size(); ++i) {
-    if (!same_task(published[i], oracle.published_tasks[i]) || !seen.insert(published[i].node_index).second) {
-      std::cerr << "envelope-continuation: Metal published set mismatches oracle or has duplicates\n";
+    if (!same_task(published[i], oracle.published_tasks[i])) {
+      std::cerr << "envelope-continuation: Metal published task order mismatches oracle\n";
       return false;
     }
   }

@@ -1,0 +1,48 @@
+---
+description: Persistent orchestration and review discipline for the project remediation program
+alwaysApply: true
+---
+
+# Remediation Orchestration Memory
+
+Apply this rule whenever planning, delegating, implementing, reviewing, or reporting work from
+`docs/reports/thermo-nuclear-code-quality-review-main.md`.
+
+## Freeze a work package before delegation
+
+- Map it to exact report sections and semantic invariants.
+- Record current facts, required deliverables, exact file inventory, non-goals, validation commands,
+  expected test counts, and static-search acceptance conditions.
+- Build the inventory before assigning an agent; never use "all remaining fixtures" without listing
+  or mechanically identifying them.
+- Prefer one closable semantic invariant over a task scoped to one symptom or one line of code.
+
+## Give agents a hard Definition of Done
+
+- State allowed production areas, forbidden shortcuts, platform requirements, and documentation work.
+- Require every discovered occurrence to be classified as a production path, assembler-driven test,
+  narrow physical harness, or semantic-boundary negative test.
+- A final report must list modified files, disposition of the frozen inventory, static-search results,
+  exact commands, expected/actual test counts, and unverified platform gaps.
+- "Partially complete" is valid. An agent must not claim completion while an inventory item or required
+  gate remains open.
+- Metal device validation must run outside the sandbox when sandbox execution cannot see `MTLDevice`;
+  lack of a Metal device inside the sandbox is not a blocker.
+
+## Review without changing scope
+
+- Review first against the frozen package Definition of Done.
+- Separate findings into `current-package blockers` and `later remediation items`.
+- Do not make a real but out-of-scope architectural debt block a narrower package.
+- Do not lower semantic, ownership, authority, or Stage 0--7 requirements merely to obtain green tests.
+- Consolidate all in-scope findings into one return-to-agent pass; avoid serial one-finding microtasks.
+
+## Control progress and context
+
+- Maintain a remediation ledger: report item, owner, status, evidence, remaining gap, and next dependency.
+- Use fresh agents for newly frozen packages instead of repeatedly extending an agent with accumulated,
+  conflicting scope. Reuse an agent only for one bounded correction pass.
+- Close each package at four levels: implemented, locally verified, platform-verified, documented.
+- Do not start the next dependent package until the current package's required levels are closed.
+- Optimize for closing report invariants, not for maximizing test count or minimizing diff size.
+

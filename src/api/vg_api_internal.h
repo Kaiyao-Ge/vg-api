@@ -31,6 +31,7 @@ struct VgAdapter_T {
 struct VgDevice_T {
   std::unique_ptr<vg::hal::DeviceHal> hal;
   vg::core::Timeline timeline;
+  vg::core::NodeTable nodes;
 };
 
 struct VgAddressDomain_T {
@@ -42,30 +43,29 @@ struct VgArena_T {
 };
 
 struct VgCodeObject_T {
-  vg::core::CodeObject code;
-  vg::core::NodeTable nodes;
+  VgDevice_T* owner_device{};
+  std::shared_ptr<const vg::core::CodeObject> code;
 };
 
 struct VgNode_T {
-  VgCodeObject_T* code_object{};
+  VgDevice_T* owner_device{};
   vg::core::NodeTable::Ref ref{};
 };
 
 struct VgTaskGraphBuilder_T {
   vg::core::TaskGraphBuilder builder;
-  // v1.1 narrowing (ADR-044): every task appended runs against this one
-  // CodeObject's module, per VgTaskGraphBuilderDesc.code_object.
-  VgCodeObject_T* code_object{};
+  VgDevice_T* owner_device{};
   uint32_t next_task_id{};
 };
 
 struct VgTaskGraph_T {
   vg::core::TaskGraph graph;
-  VgCodeObject_T* code_object{};
+  VgDevice_T* owner_device{};
 };
 
 struct VgExecutionEnvelope_T {
   vg::core::ExecutionEnvelope envelope;
+  VgDevice_T* owner_device{};
   // The arena submit() runs against, per VgExecutionEnvelopeDesc.arena
   // (04-public-c-abi.md Sec.17: the envelope, not VgSubmitDesc, carries the
   // arena). Non-owning: the caller must keep the arena alive at least until

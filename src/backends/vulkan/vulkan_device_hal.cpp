@@ -1752,7 +1752,7 @@ bool DeviceHal::ensure_raster_pipeline(vg::compiler::PipelineClassificationCache
 }
 
 bool DeviceHal::transform_representation(const vg::core::Arena& arena,
-                                         const vg::hal::RepresentationRequest& request,
+                                         const vg::core::RepresentationSemanticPlanItem& request,
                                          vg::core::FacetRef facet,
                                          vg::hal::RepresentationTransformCost* cost,
                                          RepresentationStageCounts* counts, std::string* error) {
@@ -2063,7 +2063,7 @@ const vg::hal::CapabilitySnapshot& DeviceHal::capabilities() const {
 // compile as if none had been asked for (START.md §4, invariant 10).
 bool DeviceHal::can_lower_representation_requests(const vg::hal::ExecutionPlan& plan,
                                                   std::string* reason) const {
-  if (plan.representation_requests.empty()) return true;
+  if (plan.representation_plan.empty()) return true;
 #if !defined(VG_HAS_VULKAN)
   if (reason != nullptr)
     *reason = "Stage 5 representation transform is Unsupported: the Vulkan adapter is unavailable in "
@@ -2077,8 +2077,8 @@ bool DeviceHal::can_lower_representation_requests(const vg::hal::ExecutionPlan& 
                 "layout barriers and an optimal-tiled image path for the target facet";
     return false;
   }
-  for (size_t index = 0; index < plan.representation_requests.size(); ++index) {
-    const auto& request = plan.representation_requests[index];
+  for (size_t index = 0; index < plan.representation_plan.size(); ++index) {
+    const auto& request = plan.representation_plan[index];
     const std::string label = "representation request " + std::to_string(index);
     const FormatSupport& support = format_support(request.view.format);
     if (!support.transfer_dst || !support.transfer_src) {
@@ -2139,10 +2139,66 @@ bool DeviceHal::compile(const vg::hal::ExecutionPlan& plan,
                         std::string* error) {
   if (!compiled) { set_error(error, "compiled plan output is null"); return false; }
   if (!plan.validate(error)) return false;
-  if (plan.capabilities.backend != vg::hal::BackendKind::Vulkan) {
-    set_error(error, "execution plan backend does not match Vulkan adapter");
-    return false;
+  // See Metal's matching bridge: Vulkan has no per-Node lowering yet, but
+  // may lower one verified resolved node without reintroducing a core-wide
+  // main-module projection.
+  vg::hal::ExecutionPlan adapter_plan = plan;
+  if (plan.assembled && plan.resolved_nodes.size() == 1) {
+    const auto& node = plan.resolved_nodes.front();
+    if (node.module) adapter_plan.module = *node.module;
+    else adapter_plan.user_raster_shader = node.user_raster_shader;
   }
+
+  // Keep Vulkan's advertised capabilities tied to command sequences this
+  // adapter actually records.  These checks deliberately precede the shared
+  // Stage-6 preflight: several of the unsupported requests have no distinct
+  // Capability bit (Tier2, indexed binding, discovery, and working-set), and
+  // EffectDag must not inherit a promise merely because synchronization2 is
+  // available.  In every case return a complete, Vulkan-owned Unsupported
+  // report rather than accepting the plan and silently using the linear path.
+  const auto reject_plan_requirement = [&](const char* operation, const std::string& message) {
+    compiled->abi_version = vg::hal::kDeviceHalAbiVersion;
+    compiled->plan = plan;
+    compiled->representation_supported = false;
+    compiled->report = {};
+    compiled->report.backend = vg::hal::BackendKind::Vulkan;
+    compiled->report.supported = false;
+    compiled->report.diagnostic = message;
+    compiled->report.add(operation, vg::hal::LoweringClass::Unsupported, 1, 0, message);
+    set_error(error, message.c_str());
+    return false;
+  };
+  if (adapter_plan.resolved_nodes.size() > 1)
+    return reject_plan_requirement("per_node_lowering",
+                                   "Vulkan per-Node lowering is Unsupported for multi-CodeObject task graphs");
+  if (!plan.effect_dag_passes.empty())
+    return reject_plan_requirement("effect_dag_lowering",
+                                   "EffectDag is Unsupported on Vulkan: synchronization2 barriers do not lower "
+                                   "ExecutionPlan::effect_dag_passes");
+  if (plan.request_tier2_select)
+    return reject_plan_requirement("tier2_select",
+                                   "Tier2 selection is Unsupported on Vulkan: only Tier1 vkCmdDispatchIndirect "
+                                   "is implemented");
+  if (plan.request_indexed_binding)
+    return reject_plan_requirement("indexed_binding",
+                                   "indexed binding is Unsupported on Vulkan: this adapter has no indexed compute "
+                                   "package dispatch and will not fall back to linear binding");
+  if (!plan.discovery_seeds.empty())
+    return reject_plan_requirement("discovery",
+                                   "discovery is Unsupported on Vulkan: no host-assisted reachable-set walk is "
+                                   "implemented by this adapter");
+  if (plan.working_set_budget.has_value() || plan.working_set_lease.has_value())
+    return reject_plan_requirement("working_set_sparse",
+                                   "working-set residency is Unsupported on Vulkan: sparse binding is not an "
+                                   "automatic fault-managed working-set implementation");
+  if (adapter_plan.user_raster_shader.has_value())
+    return reject_plan_requirement("user_raster_shader",
+                                   "user raster shader import is Unsupported on Vulkan");
+  for (const auto& task : adapter_plan.task_graph.tasks()) {
+    if (task.kind == vg::core::TaskKind::Raster)
+      return reject_plan_requirement("raster_task", "raster tasks not supported on Vulkan backend");
+  }
+  if (!vg::hal::preflight_stage6(plan, capabilities(), vg::hal::BackendKind::Vulkan, compiled, error)) return false;
   // F2 (ADR-046) wired TaskGraph-driven rasterization through compile()/
   // submit() for the reference and Metal backends only; this backend's own
   // raster machinery (ensure_raster_pipeline/run_raster_facet below) is
@@ -2153,55 +2209,31 @@ bool DeviceHal::compile(const vg::hal::ExecutionPlan& plan,
   // x=y=z=1 compute dispatch. Rejected here for every raster shape, including
   // F5 indexed draws (START.md §4, invariant 10: "任何无法在当前
   // 硬件表达的语义必须返回 Unsupported...不允许静默伪装").
-  for (const auto& task : plan.task_graph.tasks()) {
-    if (task.kind == vg::core::TaskKind::Raster) {
-      compiled->abi_version = vg::hal::kDeviceHalAbiVersion;
-      compiled->plan = plan;
-      compiled->report = {};
-      compiled->report.backend = vg::hal::BackendKind::Vulkan;
-      compiled->report.supported = false;
-      compiled->report.diagnostic = "raster tasks not supported on Vulkan backend";
-      compiled->report.add("raster_task", vg::hal::LoweringClass::Unsupported, 1, 0,
-                           compiled->report.diagnostic);
-      set_error(error, compiled->report.diagnostic.c_str());
-      return false;
-    }
-  }
   std::string representation_reason;
-  if (!can_lower_representation_requests(plan, &representation_reason)) {
+  if (!can_lower_representation_requests(adapter_plan, &representation_reason)) {
     compiled->abi_version = vg::hal::kDeviceHalAbiVersion;
-    compiled->plan = plan;
+    compiled->plan = adapter_plan;
     compiled->representation_supported = false;
     compiled->report = {};
     compiled->report.backend = vg::hal::BackendKind::Vulkan;
     compiled->report.supported = false;
     compiled->report.diagnostic = representation_reason;
     compiled->report.add("representation_transform", vg::hal::LoweringClass::Unsupported,
-                         plan.representation_requests.size(), 0, representation_reason);
+                         adapter_plan.representation_plan.size(), 0, representation_reason);
     set_error(error, compiled->report.diagnostic.c_str());
     return false;
   }
-  const auto package = vg::compiler::build_linear_compute_package(plan.module);
+  // build_linear_compute_package(plan.module) was the old core projection;
+  // this adapter-local bridge is the only remaining single-Node use.
+  const auto package = vg::compiler::build_linear_compute_package(adapter_plan.module);
   if (!package.ok) { if (error) *error = package.message; return false; }
   compiled->abi_version = vg::hal::kDeviceHalAbiVersion;
-  compiled->plan = plan;
+  compiled->plan = adapter_plan;
   compiled->compute_package = package.package;
   compiled->report = {};
   compiled->report.backend = vg::hal::BackendKind::Vulkan;
   compiled->report.add("compute_package", vg::hal::LoweringClass::Direct, 1, package.package.bindings.size(),
                        "GLSL source generated by B4");
-
-  // TASK-D3 / ADR-037 (compile-review-only): Vulkan sparse binding is an
-  // explicit queue-owned map/unmap of pages. It is not an automatic page
-  // fault on ordinary pointer dereference, and this adapter does not
-  // implement sparse residency or recoverable fault. The event is recorded
-  // only when the plan actually asks about working-set residency; it is
-  // not a runtime sparse path (no fake bind/unbind).
-  if (plan.working_set_budget.has_value() || plan.working_set_lease.has_value()) {
-    compiled->report.add("working_set_sparse", vg::hal::LoweringClass::Unsupported, 1, 0,
-                         "Vulkan sparse binding is explicit map/unmap, not automatic page fault; "
-                         "sparse residency is Unsupported on this adapter (compile-review-only)");
-  }
 
   // Accepted Stage 5 work, described before it runs so a caller can see what
   // submit() has committed to (03 §7's stage 6 output is the LoweringReport,
@@ -2209,8 +2241,10 @@ bool DeviceHal::compile(const vg::hal::ExecutionPlan& plan,
   // because 07 §7 requires a layout transition and a representation transform
   // to be reported apart, and 02 §4.2/06 §11 make a ConsumeInput a distinct
   // decision from the transform that made it possible.
-  if (!plan.representation_requests.empty()) {
-    for (const auto& request : plan.representation_requests) {
+  if (!adapter_plan.representation_plan.empty()) {
+    for (const auto& request : adapter_plan.representation_plan) {
+      compiled->representation_operations.push_back({vg::hal::CompiledPlan::RepresentationOperation::CopyToImage,
+                                                     request.transform_order, "Vulkan buffer-to-image copy"});
       compiled->report.add("representation_transform", vg::hal::LoweringClass::DevicePass, 1,
                            request.view.byte_size(),
                            "linear->optimal transfer pass: an optimal-tiled VkImage plus one "
@@ -2358,7 +2392,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
   // compile() already refused the one combination that cannot be authored at
   // all (a ConsumeInput of an allocation the same module reads or writes).
   RepresentationStageCounts representation_counts{};
-  if (!compiled.plan.representation_requests.empty()) {
+  if (!compiled.plan.representation_plan.empty()) {
     if (!compiled.representation_supported) {
       set_error(error,
                 "compiled plan carries representation requests this backend did not accept; refusing to "
@@ -2373,9 +2407,9 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
     // and writing the RepresentationEvent into the submission (02 §4.2, 06
     // §11). This backend supplies only the physical step below, which is why
     // ConsumeInput is never inferred here.
-    if (!vg::hal::run_representation_stage(
-            compiled.plan.representation_requests, arena, facet_pool(),
-            [&](const vg::hal::RepresentationRequest& request, vg::core::FacetRef facet,
+    if (!vg::hal::commit_representation_operations(
+            compiled.plan, compiled.representation_operations, arena, facet_pool(),
+            [&](const vg::core::RepresentationSemanticPlanItem& request, const vg::hal::CompiledPlan::PhysicalRepresentationOperation&, vg::core::FacetRef facet,
                 vg::hal::RepresentationTransformCost* cost, std::string* physical_error) {
               return transform_representation(arena, request, facet, cost, &representation_counts,
                                               physical_error);
@@ -2417,7 +2451,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
     // saving E005 measures never materializes on the device side at all. Safe
     // here only because the stage's command buffers were waited on above.
     if (submission->consumed_allocation_count != 0) {
-      for (const auto& request : compiled.plan.representation_requests) {
+      for (const auto& request : compiled.plan.representation_plan) {
         if (!request.consume_input) continue;
         const vg::core::Allocation* allocation =
             arena.lookup(core::PointerRef{request.view.allocation, request.view.allocation_generation});
@@ -3862,12 +3896,11 @@ std::unique_ptr<DeviceHal> DeviceHal::create_impl(const uint8_t* uuid, std::stri
   if (bda) adapter->capabilities_.capability_bits |= static_cast<uint64_t>(vg::hal::Capability::LinearAddress);
   if (bda) adapter->capabilities_.address_width = 64;
   if (timeline) adapter->capabilities_.capability_bits |= static_cast<uint64_t>(vg::hal::Capability::Timeline);
-  if (sync2) adapter->capabilities_.capability_bits |= static_cast<uint64_t>(vg::hal::Capability::EffectDag);
-  if (sync2) {
+  if (sync2 && spirv_compiler_available) {
     // Task ring's Tier0 publish -> Tier1 indirect-dispatch conversion relies
-    // on vkCmdPipelineBarrier2 (see dispatch_task_ring_and_tier1), so both
-    // bits are gated on sync2 rather than claimed unconditionally now that
-    // B7/B8 actually wire task-graph submission through this backend.
+    // on vkCmdPipelineBarrier2 and the task-ring shader (see
+    // dispatch_task_ring_and_tier1).  Unlike synchronization2 alone, this is
+    // the complete executable implementation of TaskPublication/Tier1.
     adapter->capabilities_.capability_bits |= static_cast<uint64_t>(vg::hal::Capability::TaskPublication);
     adapter->capabilities_.capability_bits |= static_cast<uint64_t>(vg::hal::Capability::IndirectTier1);
   }
@@ -3885,21 +3918,16 @@ std::unique_ptr<DeviceHal> DeviceHal::create_impl(const uint8_t* uuid, std::stri
   // queue actually supporting transfer, and on RGBA8Unorm genuinely being
   // copyable both ways under optimal tiling. Per-request format checks still
   // run in compile(); this bit is the device-wide precondition.
-  const bool representation_transform = sync2 && transfer_capable &&
+  const bool representation_transform = sync2 && transfer_capable && spirv_compiler_available &&
                                         adapter->rgba8_support_.transfer_dst &&
                                         adapter->rgba8_support_.transfer_src;
   if (representation_transform)
     adapter->capabilities_.capability_bits |=
         static_cast<uint64_t>(vg::hal::Capability::RepresentationTransform);
-  // Raster: a real dynamic-rendering draw of raster_facet_vulkan_source(),
-  // which needs a graphics-capable queue, the dynamicRendering feature, an
-  // attachment format that can actually be rendered to, a sampled format for
-  // the fragment stage's read, and a SPIR-V compiler to build the two stages.
-  // A backend with no raster path leaves this clear rather than approximating
-  // a draw with a compute blit (device_hal.h, Capability::Raster).
-  if (adapter->supports_dynamic_rendering_ && graphics_capable && spirv_compiler_available &&
-      adapter->rgba8_support_.color_attachment && adapter->rgba8_support_.sampled_image)
-    adapter->capabilities_.capability_bits |= static_cast<uint64_t>(vg::hal::Capability::Raster);
+  // Do not advertise Raster.  The standalone facet helper has reviewed
+  // vkCmdBeginRendering code, but ExecutionPlan Raster tasks are explicitly
+  // rejected above and therefore the DeviceHal capability contract is not
+  // fulfilled.  A standalone helper must not upgrade an unsupported plan.
   // CheckedFacetGeneration: the in-shader guard of 06 §6.4, which exists here
   // only because sample_facet_vulkan_source() is specialized with constant_id 0
   // = true and the token/generation-table/slot-count/violation bindings are

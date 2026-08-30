@@ -1,8 +1,12 @@
 # Thermo-Nuclear 代码质量审查记录
 
-本文含两次审查。第一至三节是 2026-08-26 对 `main` @ `b6bd6db` 的 `src/`、`tools/`、`include/` 快照。第四节起是 F6 SceneRoot 落地后的第二次审查：范围扩大到整个仓库（含 `tests/`、`CMakeLists.txt`、`schemas/`、公共样例与文档—代码一致性），并单独核对 F6 差量。两次审查的正文都不改写对方的观察；后一次若修正前一次的范围限制，会显式标明。
+本文含两次事实审查，以及一次对整改方案本身的设计复核。第一至三节是 2026-08-26 对 `main` @ `b6bd6db` 的 `src/`、`tools/`、`include/` 快照。第四节起是 F6 SceneRoot 落地后的第二次审查：范围扩大到整个仓库（含 `tests/`、`CMakeLists.txt`、`schemas/`、公共样例与文档—代码一致性），并单独核对 F6 差量。第七至十节是在重新对照 `docs/START.md`、`vg-project/01`—`05`、`12`、ADR-043、ADR-046—052 以及当前代码关系后形成的执行版整改计划。
 
-所用标准始终是 Cursor Team Kit 的 `thermo-nuclear-code-quality-review` skill：通过门槛不是「行为看起来正确」，而是没有明显的结构退化、没有可见却未做的大幅度简化、没有无正当理由的超大文件、没有靠在既有控制流上叠加特判来增长功能、没有把实现细节泄漏到错误的分层。
+第一至六节保留当时看到的事实、判断和原始建议，作为审查历史；其中第三、六节的处方不是独立的规范来源。若它们与第七至十节冲突，以第七至十节为准。尤其是“整个提交只有一种主意图”的顶层 tagged union、要求三个后端全功能可替换、以及以文件行数直接构成阶段否决，均未被采纳为执行方案。
+
+本文是 `docs/reports` 下的整改记录，不得覆盖上位规范。权威顺序仍是 `START.md` 的硬边界 > 01/02 的目标与语义不变量 > 03/04/05 的架构、ABI 与 IR 合同 > accepted ADR > 本报告。涉及公共语义、ABI 或阶段治理的新决定必须另写 ADR；本报告只能恢复既有合同、整理实现和定义验证方法。
+
+前两次事实审查使用 Cursor Team Kit 的 `thermo-nuclear-code-quality-review` skill：它关注的不只是「行为看起来正确」，还包括结构退化、可见却未做的大幅度简化、无正当理由的超大文件、在既有控制流上叠加特判，以及实现细节泄漏到错误分层。第七至十节保留这些信号作为工程证据，但是否构成项目 gate 以 VG 上位规范、风险和 ADR 治理为准。
 
 ---
 
@@ -316,12 +320,27 @@ Vulkan 具体类上的额外公开方法包括 `run_sample_facet`（一套，带
 
 | 函数 | 职责（按头文件注释） |
 |---|---|
-| `run_representation_stage` | Stage 5：epoch / facet / consume 的跨后端簿记；后端只提供 `physical` 回调 |
+| `run_representation_stage` | 审查快照中的混合 helper；已由 SR-4 移除 |
 | `apply_working_set_budget` | 本 submit 的 residency 上限，超限拒绝而非静默截断 |
 | `run_discovery_stage` | host 侧 DiscoverThenLease；空 seeds 为 no-op |
 | `apply_envelope_continuation` | 按 quota 切分 `TaskGraph::deterministic_order` |
 
 Metal `SubmitOps::begin` 调用 discovery 与 working-set；`stage5` 调用 representation stage。Reference `submit` 调用上述四个中的 discovery、working-set、representation，并在任务图路径上调用 envelope continuation。Vulkan `submit` 在本次快照中不调用 discovery / working-set 这两个 helper。
+
+整改后更新（SR-4）：Core assembler 冻结 representation semantic plan（view、allocation generation、
+source/target epoch、facet requirement、proof、order）；Stage 6 仅生成 physical operation（Reference
+identity、Metal private copy、Vulkan image copy 或 Unsupported）；Stage 7 仅提交这些冻结项和操作。
+Reference 与 Metal 消费相同的 Core 事实；Vulkan 仍仅有 capability-contract/静态边界，未声称真实运行。
+此记录不表示 per-Node lowering、完整 Semantic Runtime 或 §9.2 其余项目已完成。
+
+SR-4 收尾核验（2026-08-29）：Stage 5 与 `FacetPool::acquire` 共用同一
+`validate_facet_target`，因此超出 Allocation 的 view、非法 format/facet 组合、stale generation
+和持有 source epoch 的 live `FacetRef` 都在 HAL 前拒绝。测试中的成功计划与窄物理故障 harness
+也必须经真实 `ExecutionPlanAssembler`，不再手工封存 representation facts；plan validation 会逐字段
+核对完整 swizzle、ConsumeProof、transform order 与相邻 source/target epoch。静态门禁对
+`run_representation_stage`、backend 回读 raw request、以及测试手工设置
+`representation_plan_derived`/`representation_plan` 均为零命中；Reference 33/33、真实 Metal
+Device 65/65 回归通过。
 
 ---
 
@@ -420,7 +439,9 @@ ADR-024 把 Vulkan 定为 compile-review-only，这是项目级的证据政策�
 
 ---
 
-## 三、思路
+## 三、思路（第一次审查当时的建议；执行方案已由第七至十节修订）
+
+本节保留第一次审查如何从事实推导处方，便于追溯；它不再是可直接执行的计划。3.1 的顶层“单一主意图”联合、3.3 的跨层 submit skeleton 以及 3.8 由它们推导的顺序，已在第七节否决或改写。3.2、3.4—3.7 中不涉及这些假设的局部简化，经第九节重新编排后仍可采用。
 
 这一节写打算如何改。原则是：先删除一类复杂度，再考虑搬家；行为在公开 C ABI 与已关门实验上保持不变；Vulkan 的「本机不跑」政策可以保留，但不能再以散文充当实现。
 
@@ -759,9 +780,11 @@ F6 证明：可以在不扩大 `ExecutionPlan` 积类型的前提下加入每帧
 
 ---
 
-## 六、思路（第二次，在第一次 3.x 之上）
+## 六、思路（第二次审查当时的建议；执行方案已由第七至十节修订）
 
-第一次 3.1–3.8 仍然适用，不在此重复。下面只写 **F6 差量使顺序变化之后** 应先做的事，以及整仓新暴露的测试/文档债。原则不变：先删除一类双写或一层反转，再搬家；F6 的公开 ABI 行为（同一密封图、改 root 字节、红/绿/相机）保持为回归锁。
+本节的 F6 局部修复大多保留，但“F6 功能不批准”和“整树因 thermo-nuclear rubric 自动阻断 F8”的治理含义已由 10.2—10.3 修订。实施时使用第 9.1 组的合同修复和第十节 gate，不直接照抄本节顺序。
+
+以下文字记录第二次审查当时仍以第一次 3.1–3.8 为前提的增量建议。当前执行版不再接受该完整前提；只保留由第九节重新确认的 F6 局部修复与测试/文档债。F6 的公开 ABI 行为（同一密封图、改 root 字节、红/绿/相机）继续作为回归锁。
 
 ### 6.1 切断 `vg_core` 对 `include/vg/vg.h` 的编译依赖
 
@@ -848,3 +871,380 @@ F6 差量上额外不做：不把混合 compute+raster 顺手做进这次修复�
 | 可读性 | 5.4 冒烟当规格、PPM 工件 |
 
 第一次附录表仍然描述 `b6bd6db` 快照。本表描述 F6 之后的工作树。
+
+---
+
+## 七、对整改方案本身的设计复核（当前执行裁决）
+
+### 7.1 复核边界
+
+本节不重新争论第一至六节已经记录的代码事实，而是回答两个更高优先级的问题：
+
+1. 原建议是否只是恢复 VG 已有设计，还是偷偷引入了新的语义、阶段政策或长期限制；
+2. 整改后的内部形状能否继续容纳 raster、ray tracing、tensor/neural、video 等执行域，而不为每个域建立一套资源生命周期、提交 API 或平行 runtime。
+
+复核依据是既有规范，不引入新的项目原语：
+
+- `01-project-charter.md` G2 已规定 tensor/ray 访问仍由 `Region + Layout + Access + ExecutionContract` 表达；
+- `02-principles-and-semantics.md` 已把 `Tensor`、`Accel`、`Video` 列为 layout/representation trait，而不是新资源生命周期；
+- 同文件已规定 Node 携带 `ExecutionDomain/Contract`，Task 是引用 Node、root、shape 和 contract 的不可变记录；
+- `03-system-architecture.md` 已规定 Stage 0—5 属于 Semantic Runtime 的验证/规范化，Stage 6—7 属于 DeviceHAL 的 lowering/commit；
+- `05-compiler-language-ir.md` 已规定 CodeObject、Node contract、schema、effect IR、facet lowering 和 capability requirements 的来源；
+- ADR-046 已明确把 raster 放入统一 TaskGraph，以保留未来 compute↔raster 依赖，而不是建立平行 raster pass 列表。
+
+### 7.2 保留的诊断
+
+下列诊断是在恢复既有合同，不是新策略，继续成立：
+
+- `ExecutionPlan` 目前允许许多无意义或未集中验证的字段组合；部分 backend 会忽略请求或在不同位置补拒绝规则；
+- Semantic Runtime 尚未在调用 DeviceHAL 前完成原设计要求的 Stage 0—5 规范化；`ExecutionPlan::validate()` 与若干共享阶段仍落在 `src/backends`；
+- API 层承担 CodeObject 格式分派和 IR/MSL 解析，backend 工厂也泄漏进 API；
+- core 认识 HAL 计划对象、F6 又使 `vg_core` 编译依赖完整公共 `vg.h`；
+- Task ring、SceneRoot host layout、MSL/GLSL 声明和手算 buffer size 存在多个事实来源；
+- Metal/Vulkan 主文件和部分测试文件职责混杂，增加变更风险；
+- capability 被广告后必须履行，不能静默忽略；不支持的域或合同必须明确 `Unsupported`；
+- 文档、ABI 版本矩阵、测试所有权和实验 runner 的重复必须消除。
+
+### 7.3 不采纳或需要改写的建议
+
+**不采纳“整个提交只有一种主意图”的顶层 tagged union。** 原建议把 linear/indexed compute、effect DAG、restricted MSL、certificate-only、host-assisted 放在同一个和类型中，但这些概念不在同一维度：执行域属于 Node/Task，IR/MSL 属于 CodeObject 输入格式，effect DAG 属于 TaskGraph 关系，certificate 属于 Access/Residency，`HostAssisted` 属于 lowering 结果。把它们声明为互斥会把当前实现的阶段性限制写成长期架构，并阻塞异构 TaskGraph、compute↔raster 依赖以及未来 ray/neural 与 compute 的组合。
+
+**不采纳“所有 DeviceHAL 子类必须全功能可替换”的判断。** 原设计要求共享 portable contract 与 capability rejection，不要求 Metal、Vulkan、Reference 对所有 optional domain 提供相同实现。真正的错误是广告能力后不执行、接受请求后静默弱化、或把 compile-review-only 写成执行通过。验收应按 capability profile，而不是按全功能 Liskov 等价。
+
+**不采纳把验证、物理转换和 dispatch 全部放进一个 `run_submit_stages(..., physical, ...)`。** 调用顺序需要唯一，但原始边界也必须恢复：Semantic Runtime 负责 Stage 0—5 并产出不可变、已验证的 `ExecutionPlan`；DeviceHAL 负责 Stage 6 lowering 和 Stage 7 commit。共享的 representation/discovery/working-set/envelope 逻辑应按“语义规划”与“物理执行”拆开，不能为了共享顺序再次把 core 与 adapter 焊在一起。
+
+**不把 1000 行作为项目语义 gate。** 超大文件是职责混杂的强信号，可以触发拆分；但阶段能否进入下一步仍按 capability、conformance、P0/P1 风险、可复现实验和文档一致性决定。文件行数不能单独推翻已成立的功能证据，也不能替代 ADR 的阶段治理。
+
+**不把某一种 HandleRegistry 实现升级成语义要求。** 原合同要求 opaque、可验证、stale-safe、不可解引用伪造值。让 `VgAllocation` 与其它句柄采用一致包装是合理整改，但具体使用 registry、拥有 wrapper 或 index/generation table 是实现选择；只要 ABI、并发和退休语义满足既有合同即可。
+
+### 7.4 原建议遗漏的更深层原因
+
+当前 C ABI 实现把一个 `VgTaskGraphBuilder_T` / `VgTaskGraph_T` 绑定到单一 `VgCodeObject_T`，`submit()` 再把整张图解释为这一份 module 或 restricted-MSL envelope。原始设计却是：CodeObject 定义程序包，Node 把某个入口及 ExecutionContract 注册成 capability，Task 只引用 Node。
+
+这不是可长期保留的 profile 收窄，而是必须整改的结构缺陷：
+
+- 每个 `VgCodeObject_T` 各有一张 `NodeTable`，所以两个 CodeObject 都可能发出相同的 `{index = 0, generation = 1}`；`VgNodeRef` 离开“哪一张 CodeObject 表”的隐含上下文就不唯一；
+- `VgTaskGraphBuilderDesc.code_object` 和 `builder->code_object` 被迫提供这份隐含上下文，`taskGraphAppend` 只能在这一张表里验证 NodeRef；
+- `VgTaskGraph_T` 继承同一 CodeObject 指针，`submit()` 因而只能给整张图装配一份 `plan.module` 或 `plan.user_raster_shader`；
+- Reference/Metal 的主 compute 路径仍把这份 module 当作整次 submission 的程序执行，TaskGraph 主要承担 publication/raster 附加路径，而不是按 Task.node 驱动每个 Node 的执行；
+- `ExecutionEnvelope` 是 device-scoped，却没有 device-scoped NodeTable 可查，只能丢掉 generation，把 `allowed_nodes[i].index` 降成 `allowed_node_classes`；
+- 结果是 Node identity、Node class、CodeObject ownership 和整图 shader format 四个概念被一个局部 index 偶然绑在一起。
+
+顶层“主意图” variant 会固化这个错误。整改目标必须是真正恢复原始所有权方向：Device 拥有 Node capability namespace；Node 绑定 CodeObject 入口与 ExecutionContract；TaskGraph 只保存 NodeRef 和依赖；submit 按每个 Node 解析并降低，而不是按整张图选择一份 CodeObject。
+
+这会改变 ADR-044 明确记录的 v1.1 narrowing，因此实施前必须写一份 superseding/revisit ADR；但问题本身不再标为 Deferred/Profile，也不等待 ray/neural 或 F9 才处理。它属于第 9.2 组的结构修复前置项。
+
+### 7.5 单 CodeObject TaskGraph 的具体整改蓝图
+
+整改不增加新的公共 handle、TaskGraph 类型或 submit 入口。它修正的是现有对象的所有权和内部索引作用域。完成后的最小对象关系应为：
+
+```text
+VgDevice_T
+  └─ core::NodeTable                         // Device-scoped
+       └─ NodeEntry[index, generation]
+            ├─ retained CodeObject package   // immutable materialized code
+            ├─ entry + ExecutionContract
+            └─ ExecutionDomain/capabilities
+
+VgTaskGraphBuilder_T { device, builder, quota }
+VgTaskGraph_T        { device, sealed graph }
+TaskRecord.node      ────────────────┘  // full NodeRef, no hidden CodeObject context
+
+ExecutionPlan
+  └─ resolved Nodes keyed by NodeRef         // Stage 0—5 snapshot
+CompiledPlan
+  └─ backend packages keyed by NodeRef       // Stage 6 result
+```
+
+图中的 “resolved Nodes” 和 “backend packages keyed by NodeRef” 是现有 `ExecutionPlan` / `CompiledPlan` 的内部字段组织，不是新公共原语。
+
+#### 7.5.1 对象字段按以下方式迁移
+
+| 当前状态 | 整改后 | 必须保持的语义 |
+|---|---|---|
+| `VgCodeObject_T { code, nodes }` | `{ owner_device, immutable materialized code }`；移除私有 NodeTable | CodeObject 仍是程序包，不变成调度器 |
+| `VgDevice_T` 无统一 Node namespace | 持有线程安全的 `core::NodeTable` | `{index,generation}` 在一个 Device 内唯一且 stale-safe |
+| `VgNode_T { raw code_object*, ref }` | `{ owner_device, ref }`；NodeEntry 内部强持有程序包 | host handle 销毁不产生悬空程序指针 |
+| Builder/Graph 持有 `code_object*` | Builder/Graph 只持有 owner Device 和 core graph | 图可引用同一 Device 上任意 CodeObject 创建的 Node |
+| Envelope 只复制 `NodeRef.index` | Core 保留并验证完整 `NodeRef` | 授权身份不丢 generation；backend class 另行派生 |
+| `ExecutionPlan.module/user_raster_shader` 是整图唯一程序 | 按图中唯一 NodeRef 保存已解析 Node/Contract/package snapshot | Task 决定执行哪个程序 |
+| `CompiledPlan` 只有整图 package/pipeline | 按唯一 NodeRef 保存 lowering 结果与报告 | 同图不同 Node 可以来自不同 CodeObject/执行域 |
+
+这里应复用现有 handle registry、generation check、延迟退休和 immutable plan 机制；如果实现需要给 NodeEntry 增加内部引用计数或 shared ownership，那是现有 Node/CodeObject 生命周期的实现手段，不构成新的 authority。
+
+#### 7.5.2 创建、建图和提交路径必须改成以下唯一流程
+
+1. `loadCodeObject(device, ...)` 在加载阶段解析 `format_tag`，物化不可变程序包/contract metadata，记录 owner Device；不再把原始文本留到 `submit()` 才判别。
+2. `createNode(code_object, entry)` 从 CodeObject 得到 owner Device，在该 Device 的 NodeTable 分配 `NodeRef`，NodeEntry 保留程序包、entry、ExecutionContract 和 domain。
+3. `createTaskGraphBuilder(device, desc)` 创建 device-scoped builder。`desc.code_object` 只执行兼容性检查，不再成为 Node 查找上下文。
+4. `taskGraphAppend` 用 builder 的 Device 查完整 `{index,generation}`，拒绝 unknown、stale 或 cross-device NodeRef；成功后 TaskRecord 仍只保存 NodeRef。
+5. `seal` 产出 device-scoped immutable graph，不复制或推断任何“整图 CodeObject”。
+6. `submit` 的 Stage 0—5 遍历图中唯一 NodeRef，再次做 generation、Envelope、Contract、Effect、Access 和 Representation 验证，并把 NodeEntry/CodeObject 的不可变 snapshot 保留到 submission retirement。
+7. DeviceHAL Stage 6 对每个唯一 Node 编译或命中缓存，产生 `NodeRef -> backend package/pipeline + LoweringReport`；不再先选整图唯一 module。
+8. DeviceHAL Stage 7 按 TaskGraph 的拓扑与 effect 顺序访问每个 Task 的 NodeRef，取对应 package 执行该 Task；publication、fault、poison 和 timeline 仍按现有 submission 合同汇总。
+
+因此，“同图多 CodeObject”不是把多份 module 塞进一个数组后依次全局执行。正确语义是 `Task -> NodeRef -> NodeEntry -> CodeObject entry -> backend package`，依赖边约束 Task，而不是约束一组脱离 Task 的 module。
+
+#### 7.5.3 ABI 兼容迁移
+
+`VgNodeRef`、`VgTaskRecord`、`VgTaskGraphBuilderDesc` 的二进制布局和函数表都不需要变化。需要改变的是已协商的语义：
+
+- 旧调用方仍传非空 `desc.code_object`；当前 runtime 验证它有效且 owner Device 匹配，但不据此限制 append 的 Node 集；
+- `desc.code_object == NULL` 是 ADR-053 已冻结的当前兼容语义修复，不要求或引入新的 `vgGetApi` 版本边界；
+- 新 header 把该字段标记为 deprecated compatibility hint，删除 ADR-044 中“every task runs against this one CodeObject”的注释；
+- ABI conformance 继续断言结构大小、offset 和函数表不变，新增版本矩阵断言旧调用方式在新 runtime 上仍可用。
+
+ADR-053 已将其冻结为一次无函数表增长、无结构布局变化的兼容语义修复：真实最高 header/API 版本仍为 v1.7。非空字段仍兼容；`NULL` 是当前语义的一部分，而不是等待新版本协商的可选提案。
+
+#### 7.5.4 生命周期必须在 ADR 中一次冻结
+
+目标语义是：`destroyCodeObject` 释放应用持有的 CodeObject handle；已创建且仍 live 的 Node 以及已接受的 submission 保留内部不可变程序包，因此不会 UAF。`destroyNode` 使 Device NodeTable 中 generation 失效，之后尚未接受的 graph submit 必须报 stale；已经通过 Stage 0—5 并保留 snapshot 的 in-flight submission 则按现有 retirement/timeline 合同完成。Builder 和 sealed Graph 不拥有 Node/CodeObject，只保存引用，因此不会通过对象析构隐式改变程序生命周期。
+
+#### 7.5.5 第一批验收测试必须证明执行语义，而不只是容器能装下
+
+最小闭环不是“append 两个 Node 成功”，而是以下反例全部成立：
+
+1. 从两份 canonical compute CodeObject 各创建一个 Node；即使它们在旧实现中都会得到局部 `{0,1}`，新实现也必须返回不同的 device-scoped Ref；
+2. 同一 graph 的 Task A 执行 CodeObject A、Task B 执行 CodeObject B，A 写入、B 读取并产生可观察结果，依赖边反转或删除时验证器/结果按合同变化；
+3. 同一 Node 的多个 Task 只编译/cache 一份 package，但各 Task 的 root、shape、payload 独立生效；
+4. cross-device Ref、错误 generation、Envelope 中仅 index 相同但 generation 不同都必须拒绝；
+5. CodeObject host handle 在 Node 创建后释放，live Node 仍按 ADR 冻结的内部保留语义工作；Node 在 submit 接受前销毁则 graph submit 报 stale；
+6. submit 接受后立即销毁 Node/CodeObject handle 不得 UAF，in-flight 工作完成后才能退休内部 snapshot；
+7. Reference 与 Metal 的报告能逐 Node 对应实际 package/执行结果；Vulkan 若没有相应执行能力，必须清除 capability 或明确 `Unsupported`，不能退回整图只执行一份 module；
+8. effect、certificate、timeline、fault/poison 和 graph repeat-submit 在多 Node/多 CodeObject 情况下仍满足原有合同。
+
+只有上述测试通过，才算解决单 CodeObject TaskGraph。随后才可以用独立 ADR 和 mixed-domain conformance 解除 ADR-047/052 的 compute+raster 阶段性拒绝；多 CodeObject namespace 修复与 mixed-domain 能力开放是前后相邻但不同的两个交付。
+
+---
+
+## 八、长期可扩展且不增加新原语的目标形状
+
+### 8.1 唯一扩展规则
+
+未来 raster、ray tracing、tensor/neural、video 或其它执行域都必须复用以下既有代数：
+
+```text
+数据与身份        Region / Allocation / Arena / typed reference
+专用硬件表示      Layout / RepresentationEpoch / Facet
+程序与授权        CodeObject / Node / ExecutionContract
+工作              immutable Task / TaskGraph
+访问与顺序        Effect / AccessCertificate / happens-before / Timeline
+提交授权          ExecutionEnvelope / WorkingSetLease
+后端实现          CapabilitySnapshot / DeviceHAL / LoweringReport
+```
+
+允许扩展现有枚举、schema、Node contract 字段、Task payload schema、facet kind 和 backend package；不允许因为出现一个新执行域就增加一套平行的 Arena、资源生命周期、TaskGraph、submit、Timeline 或 fault 模型。需要公共 ABI 变化时按既有版本/ADR 纪律处理，但不得把 backend handle 或厂商对象提升为核心语义。
+
+### 8.2 `ExecutionPlan` 是已验证提交，不是特性开关袋，也不是单一域联合
+
+整改继续使用现有 `ExecutionPlan` 概念，不创建新的公共对象或语义原语。内部结构应围绕原有 Stage 0—7 收敛：
+
+| 阶段 | 责任层 | 写入既有计划的内容 |
+|---|---|---|
+| 0 Freeze | Core | sealed、published、不可变的 TaskGraph |
+| 1 Authority | Core | 已解析的 Node/Envelope/handle identity 与授权结果 |
+| 2 Lifetime | Core | allocation/facet/epoch 的稳定引用与退休约束 |
+| 3 Effect | Core | 已验证的 effect DAG 与 happens-before |
+| 4 Access | Core | certificate、lease、discovery/Universe 选择及其 soundness |
+| 5 Representation | Core | 每个 Region 的 representation/facet 要求与 transform plan |
+| 6 Lowering | DeviceHAL | backend package、pipeline/encoder/descriptor/command 计划与 LoweringReport |
+| 7 Commit | DeviceHAL | timeline、submission、fault/poison 与执行结果 |
+
+`ExecutionPlan` 进入 DeviceHAL 时必须已经满足 Stage 0—5。`published`、未解析 handle、原始 extension chain、未经验证的 capability 请求不应继续作为 backend 需要猜测的字段。可以用内部构造器、不可公开构造的字段或 debug assertion 保证这一点；这些是已有对象的实现状态，不是新语义。
+
+### 8.3 正交信息保持正交
+
+计划内部按既有概念组织，而不是按里程碑或后端组织：
+
+- TaskGraph 保存 Task/Node 和依赖；compute、raster 以及未来域的差异落在 Node contract、execution domain 和 Task payload；
+- effect DAG 是图的顺序/访问事实，不是 compute 的竞争模式；
+- certificate、working set、discovery 和 envelope 是提交约束，可与任意被授权执行域组合；
+- representation request 是 Region/facet 的物理要求，可被 raster、ray 或 neural Node 共同使用；
+- `HostAssisted`、`EmulatedDevicePass`、`Unsupported` 是 lowering 结果，不能作为调用方选择的主执行意图；
+- capability requirement 从 Node contracts、Task shapes、effects 和 representation requirements 推导，不再依赖散落的 `request_*` 布尔由各 backend 自行解释。
+
+确实互斥的内容可以使用内部 tagged union，例如一个已物化 CodeObject 的输入是 canonical IR 或 restricted imported library；某个 Task 的 domain payload 是 compute、raster 或未来域之一。联合的作用域必须是“本来就互斥的一个对象”，不能提升为“整次 submission 只能有一个域”。
+
+### 8.4 Task ABI 的长期扩展点已经存在
+
+原始 Task 语义的稳定头是 NodeRef、root、ExecutionShape、contract 和 payload。当前 `VgTaskRecordV2` 已被冻结，不得继续尾扩展。未来 ray/neural 等域优先使用已经存在的 `payload_size` / `payload_or_offset`、root schema 和 Node contract：
+
+- domain-specific 参数由 schema generator 产生布局，放在 Arena/root/payload 普通数据中；
+- Task 继续只携带 Node capability、root identity、shape、contract index 和 payload 引用；
+- backend 从 Node contract 与生成 schema 得到 pipeline/acceleration/tensor lowering metadata；
+- 若现有 `TaskKind` 需要增加枚举值，它只是既有分类的扩展；若公共 record 形状确实不足，必须新建版本化 record/append 入口并写 ADR，不能修改 V2 stride；
+- GPU task ring 若只接受 compute，应把编码器定义域命名并类型化为 compute-task payload；若接受多个域，则 schema 必须带可验证 discriminator。不能继续用“丢掉 kind，再在某个 backend 入口循环拒绝”的补丁。
+
+这一做法让未来域扩展 schema 和 contract，而不是让 `ExecutionPlan` 每次增加 `optional<RayPlan>`、`optional<NeuralPlan>` 或新的平行任务列表。
+
+### 8.5 CodeObject、Node 与 TaskGraph
+
+CodeObject 应在加载/物化阶段完成 `format_tag` 分派、语法解析、contract 读取和稳定 hash 计算；`submit()` 不再解析原始文本。Node 绑定 CodeObject 的入口和 ExecutionContract；TaskGraph 只保存 NodeRef、root/payload 与依赖。单 CodeObject graph 绑定按以下方案删除。
+
+**NodeRef 改为 Device 作用域。** 继续使用现有 `{index, generation}` ABI，不增加字段；把现有 `core::NodeTable` 从 `VgCodeObject_T` 移到 `VgDevice_T`。`VgCodeObject_T` 记录 owner Device，`createNode(code_object, ...)` 在该 Device 的 NodeTable 中分配唯一 Ref。跨 Device NodeRef 在 append/envelope/submit 时拒绝。NodeRef 的二进制布局不变，但“CodeObject 内唯一”改为“Device 内 capability”，必须由 superseding ADR 和头文件语义版本记录。
+
+**NodeEntry 保留程序合同。** 现有 `NodeEntry` 从只有 `entry_name/generation/live` 扩为持有既有 CodeObject 的不可变内部所有权、入口、ExecutionDomain/Contract、materialized package/hash。这里没有新增语义对象：只是让原本已经存在的 Node 真正携带 `02`/`03`/`05` 规定的内容。销毁 CodeObject host handle 只释放应用引用；仍被 live Node 或 in-flight plan 使用的内部程序包按现有延迟退休规则保留。销毁 Node 使 generation 失效；尚未接受 submit 的 graph 再引用它必须报 stale。
+
+**Builder 和 Graph 不再拥有 CodeObject。** `VgTaskGraphBuilder_T` 保存 owner Device、core builder 和 quota；`VgTaskGraph_T` 保存 sealed graph 与 owner Device。`taskGraphAppend` 在 Device NodeTable 中验证完整 NodeRef；`seal`/plan assembly 再验证所有唯一 NodeRef，并在一次 submit 被接受时把不可变 Node/CodeObject/Contract 引用保留到 submission retirement，消除当前 raw pointer/UAF 链。
+
+**兼容处理现有 descriptor。** `VgTaskGraphBuilderDesc.code_object` 的字段和 offset 保留，旧二进制继续传入原值。ADR-053 已将该字段定为 deprecated compatibility hint：
+
+- 非空时只验证它属于 builder 的 Device，不限制后续 Task 的 Node；
+- `NULL` 当前即允许，因为 `createTaskGraphBuilder` 已显式接收 Device；
+- 旧调用方传非空值与当前 runtime 保持兼容；不新增 API/header 版本，也不能以 `vgGetApi` 虚构一个可空语义边界；
+- 不新增 builder 类型、Graph 类型或 submit 入口。
+
+ADR-053 已裁决这项无函数表增长的语义修复保持真实的 v1.7 边界：v1.0—v1.7 的既有非空调用方式继续兼容，`NULL` 且不限制 Node 集是当前 runtime 的语义。版本协商不新增原语或版本号。
+
+**ExecutionEnvelope 保留完整授权。** `allowed_nodes` 使用 Device NodeTable 验证完整 `{index, generation}`，Core envelope/plan 不再丢 generation。Tier2 若只需要 GPU-visible class/index，必须在完整 Node 授权通过后从 Node contract 派生 backend class table；Node identity 与 Node class 不再共用一个未经验证的 `uint32_t` 语义。
+
+**ExecutionPlan/CompiledPlan 按 Node 工作。** 删除整图唯一的 `module/user_raster_shader` 所有权假设。现有 ExecutionPlan 增加的是“已解析 Node 集”的内部表示，而不是新公共原语：每个唯一 NodeRef 对应其 materialized CodeObject、Contract、ExecutionDomain 与 capability requirements；TaskGraph 仍以 NodeRef 引用它。DeviceHAL Stage 6 按唯一 Node 编译/cache，CompiledPlan 按 NodeRef 保存 backend package/pipeline；Stage 7 沿 TaskGraph 的拓扑/effect 顺序逐 Task 取其 Node 执行，而不是先全局执行一次 module、再把 TaskGraph 仅作为 publication 附件。linear/indexed/raster/ray/neural 的差异因此留在 Node/Task，而不是成为整图 optional 字段。
+
+结构修复可以先用“两份 canonical compute CodeObject 的同图执行”证明多 CodeObject 基础正确，再处理 restricted-MSL raster 与 compute 的组合。ADR-047/052 当前 mixed-domain 拒绝只有在新的 Node-aware compile/submit、effect、fault 和结果合并测试完成后才能由后续 ADR 解除；不能因为表示已能容纳就无证据地宣称 mixed execution 已支持。
+
+### 8.6 Schema、host/device ABI 与专用硬件表示
+
+Schema 继续是 host/device/capture 的单一真相。一个 schema 定义应机械地产生或验证：
+
+- C/C++ host layout 与 `offsetof`/`sizeof`；
+- core 可读取且不依赖完整公共 `vg.h` 的布局声明；
+- IR type/reflection/relocation map；
+- MSL/GLSL/SPIR-V 侧结构或可机器比较的布局描述；
+- capture migration/拒绝所需 metadata；
+- task ring pack/unpack 和 dump 所依赖的 word layout。
+
+专用硬件对象仍停留在 Facet/representation/lowering：raster texture、ray acceleration structure、tensor-native tile/matrix representation 可以有不同 backend token 和缓存，但共享 Allocation、Region、epoch、effect、certificate 和 lifetime。禁止为了“统一”把所有硬件表示拼成最大 ViewRecord，也禁止把 `MTLTexture`、`VkAccelerationStructureKHR` 或厂商 neural handle 暴露为公共资源生命周期。
+
+### 8.7 后端能力不是最低公分母
+
+DeviceHAL 的一致性定义为：对广告的 capability/profile 实现同一 VG 合同；对未广告或无法表达的合同返回明确 lowering。测试矩阵至少分三层：
+
+1. portable core conformance：所有参与的后端共享；
+2. capability-specific conformance：Raster、Ray、Tensor、Task Tier、fault 等按广告能力运行；
+3. evidence policy：Metal/reference 真跑、Vulkan compile-review-only 等环境限制继续按 accepted ADR 诚实标注。
+
+因此未来加入光追或神经方法时，不要求所有后端同时实现，也不把最弱后端拖成核心语义；但任何后端都不能接受后静默忽略，或用另一种算法冒充同一合同。
+
+### 8.8 未来执行域的映射检查
+
+下面是架构可扩展性检查，不是本次要实现的新功能：
+
+| 需求 | Raster | Ray tracing | Tensor / neural | 使用的既有机制 |
+|---|---|---|---|---|
+| 普通数据 | vertex/material/root | geometry/instance/SBT-like data | tensor/weight/activation | typed Region + root schema |
+| 专用表示 | sample/attachment facet | acceleration representation/facet | tensor-native representation/facet | Layout + Facet + RepresentationEpoch |
+| 程序入口 | raster Node | ray-domain Node | tensor/compute-domain Node | CodeObject + Node + ExecutionContract |
+| 工作记录 | draw-shaped payload | trace/build-shaped payload | dispatch/operator payload | immutable Task + generated payload schema |
+| 访问证明 | sample/write effects | accel read/build/write effects | tensor read/write/atomic effects | Effect + AccessCertificate |
+| 顺序与所有权 | render 依赖/timeline | build→trace/timeline | upload→execute→readback | happens-before + Timeline + Envelope |
+| 后端差异 | render PSO/pass | native RT 或 device pass | matrix/tensor intrinsic 或 compute fallback | Capability + LoweringReport |
+
+若未来域不能按这张表表达，应先检查是既有概念缺少一个取值/contract 字段，还是出现了真正新的 authority。只有后者才可能需要新语义原语，并且必须通过上位规范与 ADR；不得由一次代码质量整改提前发明。
+
+---
+
+## 九、修订后的整改顺序
+
+### 9.1 第一组：F6 可独立完成的合同修复
+
+这组工作不改变公开语义，可先执行并用现有红/绿/相机行为锁回归：
+
+1. 从 `vg_core` 切断对完整 `include/vg/vg.h` 的编译依赖；同一 schema 生成 core layout 与公共 C 视图，两者做布局断言；
+2. SceneRoot 的 C/core/MSL layout、relocation 和 identity bytes 消费同一 schema 事实；删除手算 88 字节；
+3. identity SceneRoot buffer 变为设备级缓存或等价的无 per-draw allocation 路径，并在 LoweringReport/测试中确认没有新增热路径分配；
+4. 合并 raster-only 谓词和 API 版本边界计算；限制仍保持 ADR-047/052 当前含义，不顺手开放 mixed submission；
+5. 把 resolver、非法 affine/non-finite/短 allocation/source/tint、capture 拒绝放进拥有语义的 reference/core 测试；Metal submit 测 slot 1 与跨 submit 更新；公共 C 测试覆盖版本协商和至少 reference 路径；
+6. Metal 与 Reference 可以保留不同物理执行方式，但必须消费同一合同并通过容差内结果/拒绝行为对照；不要求为了“共享代码”改变 GPU/CPU 职责；
+7. 修正文档中的虚构 SceneRoot helper，并明确 legacy PPM 样例或升级到现有 v1.7 路径；产物不落在仓库根。
+
+完成条件是行为、布局、分层和测试所有权闭合，不是文件行数下降。
+
+**F6 集成收尾记录（2026-08-28）。** 本组已按上述边界完成：core 使用生成的
+layout header，C/core/MSL 与 identity-root cache 都消费同一 schema 常量；
+`ExecutionPlan` 的 raster-only 限制收敛为一个谓词，`vgGetApi` 使用连续 v1.x
+版本边界；`core.scene-root-contract` 覆盖 resolver 的 affine/non-finite/短根/
+source/tint/depth 与 capture-v1 拒绝，`api.f6-scene-root-c` 在 Reference 和真实
+Metal adapter 上验证同一 sealed graph 的 root 更新，Metal identity cache test 验证
+create/reuse report。legacy PPM 样例明确保留为 F3--F5/v1.6 compatibility path，并
+要求调用方传入输出路径，因而不再默认在仓库根产生工件。ADR-047/052 的 mixed
+compute+raster 拒绝没有改变。
+
+### 9.2 第二组：恢复原设计的 Stage 0—7 边界
+
+1. 先写 superseding/revisit ADR，明确废除 ADR-044 的单 CodeObject graph narrowing、NodeRef 改为 Device-scoped capability、`VgTaskGraphBuilderDesc.code_object` 的兼容/弃用语义，以及当前 mixed-domain 拒绝暂不自动解除；
+2. CodeObject 在 load/materialize 时解析并缓存 canonical IR 或 restricted import contract，并记录 owner Device；API submit 不再解析文本；
+3. 把既有 NodeTable 移到 Device；NodeEntry 持有 CodeObject/entry/ExecutionDomain/Contract，NodeRef 在 Device 内唯一且 generation 可验证；
+4. Builder/Graph 删除 CodeObject 所有权，只保存 Device 与 TaskGraph；append/seal/envelope/submit 都在 Device NodeTable 上验证完整 NodeRef，已接受 submission 保留所需不可变 Node/CodeObject 引用；
+5. 先实现两个 canonical compute CodeObject 在同一 graph 中由不同 Task 各自执行，依赖边决定可观察顺序；覆盖旧 per-CodeObject 表会发生的重复局部 index、cross-device ref、stale generation、CodeObject handle 释放、effect/certificate 合并和 graph 重复 submit；
+6. ExecutionPlan 从整图单一 `module/user_raster_shader` 改为按唯一 NodeRef 保存已解析 CodeObject/Contract；CompiledPlan 按 NodeRef 保存 backend package/pipeline；
+7. 在 Semantic Runtime 建立唯一 plan assembly/validation 路径，按 Stage 0—5 应用 TaskGraph、Envelope、epoch、effect、access、working-set、discovery 和 representation 规则；
+8. 从 Node contract、Task、effect 和 representation 推导 capability requirements；删除或内部化由调用方设置、backend 可忽略的 `request_*` 开关；
+9. DeviceHAL `compile` 只接收已验证计划，完成 Stage 6 并产出 LoweringReport；`submit` 只执行已降低计划和 Stage 7 commit；
+10. 将现有共享 helper 拆成 core 语义规划与 backend physical operation，明确唯一顺序但不跨层持有彼此对象；
+11. 对 Vulkan：广告的能力必须接入同一合同；未实现的能力清零并统一 `Unsupported`。compile-review-only 注释回到 ADR/report，执行文件只保留可执行路径和必要诊断；
+12. 用 schema 生成或验证单一 Task ring 编码；明确 compute-only ring 或带 discriminator 的多域 ring；
+13. Node-aware 路径稳定后，再以独立 ADR 和 conformance 解除 ADR-047/052 的 mixed compute+raster 限制，验证跨 Node effect、失败/poison 合并和 per-Node LoweringReport。
+
+这组不引入顶层主意图 variant，不增加公共 handle/TaskGraph/submit 原语，也不改变既有 struct 布局。NodeRef namespace、builder descriptor 可空/弃用语义和 API 版本属于已存在 ABI 的语义修复，必须通过第 1 项 ADR 与兼容测试完成，不能伪装成纯机械重构。
+
+### 9.3 第三组：按既有边界拆分实现
+
+在 Stage 边界和回归测试稳定后再搬文件：
+
+- Metal/Vulkan 按 backend resource/cache、lowering、commit/encoding、诊断拆翻译单元；
+- `run_*_facet` 垂直切片迁入窄的 adapter test harness，不扩大 `DeviceHal` 公共虚接口；
+- `core.h/.cpp` 按 Arena、Facet/Representation、TaskGraph、Effect/Certificate、Envelope 等既有 bounded context 拆分，保留聚合头兼容旧 include；
+- shader/template/layout 生成物离开 package orchestration 文件；
+- vertical-slice 按 plan-driven submit 与 direct adapter harness 分开；
+- CMake schema/测试登记和 `vg_exp.py` phase runner 改为数据驱动。
+
+拆分验收看依赖方向、职责和测试影响面；行数只作提示。
+
+### 9.4 第四组：再进入 F8/F9/F10
+
+窗口/present 是既有 PlatformHAL/ownership/timeline 合同的新实现，不应成为 `ExecutionPlan` 的又一个无约束 optional。开始 F8 前至少满足第十节 gate；F8 自身仍需 ADR 明确 drawable identity、display ownership、Timeline、fault 和 offscreen conformance 隔离。
+
+---
+
+## 十、验收、治理与最终裁决
+
+### 10.1 不新增原语检查
+
+每个整改提交必须回答：
+
+- 是否只移动/规范化已有 Region、Task、Node、Effect、Envelope、Facet、Epoch、Capability、LoweringReport？
+- 是否新增了公共对象、生命周期、submit 路径或 authority？若是，本报告无权批准，必须上位规范 + ADR；
+- 是否仍让 TaskGraph/Builder 拥有单一 CodeObject，或让 NodeRef 依赖隐含的 per-CodeObject namespace？若是，该提交没有解决第 7.4 节的结构缺陷；
+- 是否把当前阶段拒绝误写成长期结构，例如整个 graph 只能有一个执行域或一种 backend package？
+- 假想加入一个 ray Node 或 neural Node 时，是否只需扩展 contract/schema/capability/backend lowering，而无需增加 `ExecutionPlan.ray_*`、`ExecutionPlan.neural_*` 或平行 TaskGraph？
+
+最后一项是架构演练，不要求实现 ray/neural，但必须在 review 中通过。
+
+### 10.2 F6 差量裁决（修订）
+
+F6 已有的功能证据继续成立：同一密封图、root bytes 更新、颜色与相机行为、Reference/Metal 合同路径都不因本报告而作废。第一至六节发现的是集成质量和长期演进风险，不是证据造假。
+
+因此修订后的裁决是：**F6 语义/功能里程碑保留；F6 集成整改未完成。** 第 9.1 组应在 F8 前完成，因为它涉及 schema 单一真相、分层、热路径分配、测试所有权和文档合同；不再以 thermo-nuclear 外部 rubric 单独宣布 F6 功能“不批准”。
+
+### 10.3 F8 健康基线 gate（修订）
+
+进入 F8 前检查：
+
+- Semantic Runtime 到 DeviceHAL 的边界能说明 Stage 0—5/6—7 各自责任；
+- backend 不再静默忽略计划请求，capability rejection 集中且有测试；
+- NodeRef 已是 Device-scoped capability，TaskGraph 不再绑定单一 CodeObject；至少两个 canonical CodeObject 的同图执行通过 reference/Metal 对应证据；
+- Envelope 保存并验证完整 NodeRef 授权，Node identity 与 Tier2 Node class 不再靠一个被截断的 index 混用；
+- F6 schema/host/device layout 单一来源；
+- 新窗口/ownership 设计无需增加平行资源生命周期或平行 submit；
+- Metal/reference 的现有 raster submit 回归稳定，Vulkan 状态诚实；
+- 所有相关 P0 有 owner/test，P1 有实验或明确 deferred；
+- 文档、ABI 和样例与实现一致；
+- 假想 ray/neural 扩展演练不要求增加顶层 plan 特性字段。
+
+巨型文件、测试 monolith 和 runner 重复仍应整改，但除非它们直接破坏上述合同或让风险无法测试，不单独作为语义否决票。
+
+### 10.4 当前总裁决
+
+保留第一至六节的事实证据；撤销“顶层单主意图 tagged union”作为整改核心；把单 CodeObject TaskGraph 明确定性为必须修复的结构缺陷；整改中心改为 Device-scoped Node capability、按 Node 解析/降低、原始 Stage 0—7、schema 单一真相和 capability-indexed DeviceHAL 合同。
+
+本计划不新增 VG 公共原语，不重写公共 C ABI，不开放本阶段明确推迟的 mixed submission，不实现 ray tracing 或 neural domain。它只保证当前重构不会关闭这些未来方向，并给出一个约束：未来域必须优先作为现有 Region/Layout/Facet、Node/ExecutionContract、Task payload、Effect/Envelope 和 Capability/Lowering 的扩展进入统一 TaskGraph。

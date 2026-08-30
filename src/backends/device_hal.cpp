@@ -10,6 +10,81 @@
 
 namespace vg::hal {
 
+namespace {
+bool preflight_fail(const ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
+                    CompiledPlan* compiled, std::string message, std::string* error) {
+  if (compiled) {
+    // A reused output must never expose packages or effect state produced by
+    // an earlier successful compile after this compile was refused.
+    *compiled = CompiledPlan{};
+    compiled->abi_version = kDeviceHalAbiVersion;
+    compiled->plan = plan;
+    compiled->report = {};
+    compiled->report.backend = capabilities.backend;
+    compiled->report.supported = false;
+    compiled->report.diagnostic = message;
+    compiled->report.add("stage6_preflight", LoweringClass::Unsupported, 1, 0, message);
+  }
+  if (error) *error = std::move(message);
+  return false;
+}
+}  // namespace
+
+bool preflight_stage6(const ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
+                      BackendKind expected_backend, CompiledPlan* compiled, std::string* error) {
+  if (!compiled) {
+    if (error) *error = "compiled plan output is required";
+    return false;
+  }
+  if (capabilities.abi_version != kDeviceHalAbiVersion)
+    return preflight_fail(plan, capabilities, compiled, "HAL capability snapshot ABI version is unsupported", error);
+  if (capabilities.backend != expected_backend)
+    return preflight_fail(plan, capabilities, compiled, "HAL capability snapshot backend does not match adapter", error);
+  if (!plan.assembled || !plan.capability_requirements_derived)
+    return preflight_fail(plan, capabilities, compiled,
+                          "Stage6 requires sealed capability requirements from the core assembler", error);
+  if (plan.requested_certificate_mode.has_value() &&
+      (!plan.access_plan_derived || !plan.access_certificate.has_value()))
+    return preflight_fail(plan, capabilities, compiled,
+                          "Stage6 requires sealed access-planning facts from the core assembler", error);
+  if ((plan.working_set_budget.has_value() || plan.working_set_lease.has_value()) &&
+      (!plan.access_plan_derived || (plan.working_set_budget.has_value() && !plan.working_set_budget_checked)))
+    return preflight_fail(plan, capabilities, compiled,
+                          "Stage6 requires sealed working-set facts from the core assembler", error);
+  for (const auto requirement : plan.required_capabilities) {
+    Capability capability{};
+    switch (requirement) {
+      case core::CapabilityRequirement::LinearAddress: capability = Capability::LinearAddress; break;
+      case core::CapabilityRequirement::TaskPublication: capability = Capability::TaskPublication; break;
+      case core::CapabilityRequirement::Timeline: capability = Capability::Timeline; break;
+      case core::CapabilityRequirement::EffectDag: capability = Capability::EffectDag; break;
+      case core::CapabilityRequirement::CaptureReplay: capability = Capability::CaptureReplay; break;
+      case core::CapabilityRequirement::IndirectTier1: capability = Capability::IndirectTier1; break;
+      case core::CapabilityRequirement::IndirectTier2Select: capability = Capability::IndirectTier2Select; break;
+      case core::CapabilityRequirement::IndexedBinding: capability = Capability::IndexedBinding; break;
+      case core::CapabilityRequirement::Raster: capability = Capability::Raster; break;
+      case core::CapabilityRequirement::RepresentationTransform: capability = Capability::RepresentationTransform; break;
+      case core::CapabilityRequirement::CheckedFacetGeneration:
+        if (!capabilities.validation_available)
+          return preflight_fail(plan, capabilities, compiled,
+                                "CheckedNative validation profile is unsupported by this adapter", error);
+        capability = Capability::CheckedFacetGeneration;
+        break;
+      case core::CapabilityRequirement::UserShaderImport: capability = Capability::UserShaderImport; break;
+      case core::CapabilityRequirement::ReferenceStrict:
+        if (expected_backend != BackendKind::Reference || !capabilities.validation_available)
+          return preflight_fail(plan, capabilities, compiled,
+                                "ReferenceStrict validation profile is supported only by the validating Reference backend", error);
+        continue;
+    }
+    if (!capabilities.supports(capability))
+      return preflight_fail(plan, capabilities, compiled,
+                            std::string("required HAL capability is unsupported: ") +
+                                core::capability_requirement_name(requirement), error);
+  }
+  return true;
+}
+
 void LoweringReport::add(std::string operation, LoweringClass classification,
                          uint64_t count, uint64_t bytes, std::string reason) {
   events.push_back({std::move(operation), classification, count, bytes, std::move(reason)});
@@ -42,126 +117,19 @@ std::string LoweringReport::canonical_json() const {
       {"events", json::Value(std::move(serialized))},
       {"supported", json::Value(static_cast<int64_t>(supported ? 1 : 0))}}));
 }
-
-namespace {
-bool validate_representation_requests(const std::vector<RepresentationRequest>& requests, std::string* error) {
-  for (size_t index = 0; index < requests.size(); ++index) {
-    const auto& request = requests[index];
-    const std::string label = "representation request " + std::to_string(index);
-    std::string view_error;
-    if (!request.view.valid(&view_error)) {
-      if (error) *error = label + " names a CanonicalView that cannot describe a Region: " + view_error;
-      return false;
-    }
-    if (request.target_kind == core::FacetKind::Address || request.target_kind == core::FacetKind::Transfer) {
-      if (error)
-        *error = label + " targets an AddressFacet or TransferFacet, which name how an existing "
-                         "representation is reached rather than a representation a transform can produce; "
-                         "a Stage 5 target must be a Sample, Storage, or Attachment facet";
-      return false;
-    }
-    if (request.consume_input) {
-      if (const char* unmet = request.consume_proof.first_unmet()) {
-        if (error) *error = label + " asks for ConsumeInput but its proof is incomplete: " + unmet;
-        return false;
-      }
-    }
-    for (size_t earlier = 0; earlier < index; ++earlier) {
-      if (requests[earlier].view.allocation != request.view.allocation) continue;
-      if (error)
-        *error = label + " and representation request " + std::to_string(earlier) +
-                 " both transform the representation of allocation " + std::to_string(request.view.allocation) +
-                 "; one submission must not race two transforms of a single allocation";
-      return false;
-    }
-  }
-  return true;
-}
-
-bool validate_tier2_select(const ExecutionPlan& plan, std::string* error) {
-  if (!plan.request_tier2_select) return true;
-  if (plan.authorized_node_classes.size() < 2) {
-    if (error) *error = "tier2 select requires at least two authorized node classes";
-    return false;
-  }
-  if (plan.task_graph.tasks().empty()) {
-    if (error) *error = "tier2 select requires a published task graph";
-    return false;
-  }
-  for (size_t i = 0; i < plan.authorized_node_classes.size(); ++i) {
-    for (size_t j = i + 1; j < plan.authorized_node_classes.size(); ++j) {
-      if (plan.authorized_node_classes[i] == plan.authorized_node_classes[j]) {
-        if (error) *error = "tier2 authorized node classes must be unique";
-        return false;
-      }
-    }
-  }
-  return true;
-}
-}  // namespace
-
-bool ExecutionPlan::validate(std::string* error) const {
-  if (abi_version != kDeviceHalAbiVersion) { if (error) *error = "execution plan ABI version is unsupported"; return false; }
-  if (capabilities.abi_version != kDeviceHalAbiVersion) { if (error) *error = "capability snapshot ABI version is unsupported"; return false; }
-  if (user_raster_shader.has_value()) {
-    // F3 (ADR-043 Decision #4) v1 scope cut: a restricted-import MSL
-    // submission carries no linear IR to verify (module stays default), and
-    // may only contain raster tasks -- no mixed compute+raster.
-    if (user_raster_shader->vertex_abi != ir::kRasterVertexAbiXyzuvPackedV1) {
-      if (error) *error = "a user_raster_shader submission requires vertex_abi vg.raster.vertex.xyzuv-packed/v1";
-      return false;
-    }
-    for (const auto& task : task_graph.tasks()) {
-      if (task.kind != core::TaskKind::Raster) {
-        if (error) *error = "a user_raster_shader submission may only contain raster tasks";
-        return false;
-      }
-    }
-  } else {
-    const auto verification = ir::verify(module);
-    if (!verification.ok) { if (error) *error = verification.message; return false; }
-  }
-  const std::string& root_schema = user_raster_shader.has_value()
-      ? user_raster_shader->root_schema : module.root_schema;
-  if (core::is_scene_root_raster_schema(root_schema)) {
-    for (const auto& task : task_graph.tasks()) {
-      if (task.kind != core::TaskKind::Raster) {
-        if (error) *error = "a SceneRoot raster submission may only contain raster tasks; compute+raster mixing is deferred";
-        return false;
-      }
-    }
-  }
-  if (!capabilities.supports(Capability::LinearAddress)) { if (error) *error = "linear address capability is unsupported"; return false; }
-  if (timeline_signal != 0 && timeline_signal <= timeline_wait) { if (error) *error = "timeline signal does not advance past wait"; return false; }
-  if (!published && !task_graph.tasks().empty()) { if (error) *error = "execution plan contains unpublished tasks"; return false; }
-  if (published && !task_graph.tasks().empty() && !task_graph.validate_execution(error)) { return false; }
-  if (!validate_representation_requests(representation_requests, error)) return false;
-  if (working_set_budget.has_value() && working_set_lease.has_value() &&
-      working_set_budget->has_limit && working_set_lease->byte_limit > working_set_budget->byte_limit) {
-    if (error) *error = "working-set lease exceeds the plan's working-set budget";
-    return false;
-  }
-  if (pending_overflow.has_value() && !pending_overflow->valid(error)) return false;
-  return validate_tier2_select(*this, error);
-}
-
-bool ExecutionPlan::graph_epoch_matches(const core::Arena& arena, std::string* error) const {
-  if (task_graph.tasks().empty()) { return true; }
-  if (graph_epoch != arena.topology_epoch()) {
-    if (error) *error = "execution plan graph epoch does not match arena topology";
-    return false;
-  }
-  return true;
-}
-
-bool run_representation_stage(const std::vector<RepresentationRequest>& requests,
+bool commit_representation_operations(const core::ExecutionPlan& plan,
+                             const std::vector<CompiledPlan::PhysicalRepresentationOperation>& operations,
                              core::Arena& arena, core::FacetPool& pool,
-                             const std::function<bool(const RepresentationRequest&, core::FacetRef,
+                             const std::function<bool(const core::RepresentationSemanticPlanItem&, const CompiledPlan::PhysicalRepresentationOperation&, core::FacetRef,
                                                       RepresentationTransformCost*,
                                                       std::string*)>& physical,
                              Submission* submission, std::string* error) {
   if (submission == nullptr) { if (error) *error = "submission output is required"; return false; }
-  if (requests.empty()) return true;
+  if (plan.representation_plan.empty()) return true;
+  if (!plan.representation_plan_derived || operations.size() != plan.representation_plan.size()) {
+    if (error) *error = "compiled representation operations do not match the frozen semantic plan";
+    return false;
+  }
 
   submission->representation_epoch = core::RepresentationEpoch{};
   submission->representation_facets.clear();
@@ -200,12 +168,15 @@ bool run_representation_stage(const std::vector<RepresentationRequest>& requests
   uint32_t retired_facets = 0;
   uint32_t consumed_allocations = 0;
 
-  for (size_t index = 0; index < requests.size(); ++index) {
-    const RepresentationRequest& request = requests[index];
+  for (size_t index = 0; index < plan.representation_plan.size(); ++index) {
+    const auto& request = plan.representation_plan[index];
+    const auto& operation = operations[index];
+    if (operation.semantic_order != request.transform_order || operation.operation == CompiledPlan::RepresentationOperation::Unsupported)
+      return fail("compiled representation operation is unsupported or has a mismatched frozen order");
     const std::string label = "representation request " + std::to_string(index);
     const core::Allocation* allocation =
         arena.lookup(core::PointerRef{request.view.allocation, request.view.allocation_generation});
-    if (allocation == nullptr)
+    if (allocation == nullptr || allocation->representation_epoch != request.source_representation_epoch)
       return fail(label + " names allocation " + std::to_string(request.view.allocation) +
                   " at generation " + std::to_string(request.view.allocation_generation) +
                   ", which is not active in this Arena");
@@ -232,14 +203,14 @@ bool run_representation_stage(const std::vector<RepresentationRequest>& requests
     // ref it is about to fill, not one produced afterwards.
     core::FacetRef facet{};
     std::string acquire_error;
-    if (!pool.acquire(arena, request.view, request.target_kind, &facet, &acquire_error))
+    if (new_epoch != request.target_representation_epoch || !pool.acquire(arena, request.view, request.target_kind, &facet, &acquire_error))
       return fail(label + " could not acquire its target facet at RepresentationEpoch " +
                   std::to_string(new_epoch) + ": " + acquire_error);
 
     RepresentationTransformCost cost;
     if (physical) {
       std::string physical_error;
-      if (!physical(request, facet, &cost, &physical_error))
+      if (!physical(request, operation, facet, &cost, &physical_error))
         return fail(label + " could not transform allocation " + std::to_string(request.view.allocation) +
                     " into the requested facet representation: " + physical_error);
     }

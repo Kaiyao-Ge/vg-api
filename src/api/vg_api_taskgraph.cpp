@@ -17,7 +17,7 @@ HandleRegistry<VgTaskGraph_T> g_task_graphs;
 VgResult append_normalized_task(VgTaskGraphBuilder builder, const vg::core::TaskRecord& record,
                                 VgTaskId* out_id) {
   const vg::core::NodeTable::Ref node_ref{record.node_index, record.node_generation};
-  if (builder->code_object->nodes.lookup(node_ref) == nullptr) {
+  if (builder->owner_device == nullptr || !builder->owner_device->nodes.contains(node_ref)) {
     set_diagnostic("task record references an unknown or stale node");
     return VG_ERROR_INVALID_ARGUMENT;
   }
@@ -48,13 +48,19 @@ VgResult VG_CALL create_task_graph_builder(VgDevice device, const VgTaskGraphBui
   const VgResult header_result =
       validate_header(desc->header, VG_STRUCTURE_TASK_GRAPH_BUILDER_DESC, sizeof(VgTaskGraphBuilderDesc));
   if (header_result != VG_SUCCESS) return header_result;
-  if (!is_valid_code_object(desc->code_object)) {
-    set_diagnostic("code object handle is stale or invalid");
-    return VG_ERROR_STALE_HANDLE;
+  if (desc->code_object != nullptr) {
+    if (!is_valid_code_object(desc->code_object)) {
+      set_diagnostic("code object compatibility hint is stale or invalid");
+      return VG_ERROR_STALE_HANDLE;
+    }
+    if (desc->code_object->owner_device != device) {
+      set_diagnostic("code object compatibility hint belongs to a different device");
+      return VG_ERROR_INVALID_ARGUMENT;
+    }
   }
 
   auto wrapper = std::make_unique<VgTaskGraphBuilder_T>();
-  wrapper->code_object = desc->code_object;
+  wrapper->owner_device = device;
   const uint32_t max_tasks = desc->max_tasks != 0 ? desc->max_tasks : UINT32_MAX;
   const uint64_t max_payload_bytes = desc->max_payload_bytes != 0 ? desc->max_payload_bytes : UINT64_MAX;
   std::string error;
@@ -81,14 +87,8 @@ VgResult VG_CALL task_graph_append(VgTaskGraphBuilder builder, const VgTaskRecor
     set_diagnostic("task records are required when task_count is non-zero");
     return VG_ERROR_INVALID_ARGUMENT;
   }
-  // Sequential UAF guard: builder->code_object may have been destroyed any
-  // time after createTaskGraphBuilder() succeeded (destroyCodeObject doesn't
-  // -- and can't -- cascade-invalidate builders holding it). Re-validate
-  // before the first dereference below, mirroring destroy_node()'s
-  // is_valid_code_object() guard (vg_api_code.cpp) and submit()'s equivalent
-  // re-check (vg_api_execution.cpp).
-  if (!is_valid_code_object(builder->code_object)) {
-    set_diagnostic("task graph builder's code object handle is stale or invalid");
+  if (!is_valid_device(builder->owner_device)) {
+    set_diagnostic("task graph builder's owner device is stale or invalid");
     return VG_ERROR_STALE_HANDLE;
   }
   for (uint32_t i = 0; i < task_count; ++i) {
@@ -137,8 +137,8 @@ VgResult VG_CALL task_graph_append_v2(VgTaskGraphBuilder builder, const VgTaskRe
     set_diagnostic("task records are required when task_count is non-zero");
     return VG_ERROR_INVALID_ARGUMENT;
   }
-  if (!is_valid_code_object(builder->code_object)) {
-    set_diagnostic("task graph builder's code object handle is stale or invalid");
+  if (!is_valid_device(builder->owner_device)) {
+    set_diagnostic("task graph builder's owner device is stale or invalid");
     return VG_ERROR_STALE_HANDLE;
   }
 
@@ -201,20 +201,13 @@ VgResult VG_CALL seal_task_graph(VgTaskGraphBuilder builder, const VgSealDesc* d
   }
   const VgResult header_result = validate_header(desc->header, VG_STRUCTURE_SEAL_DESC, sizeof(VgSealDesc));
   if (header_result != VG_SUCCESS) return header_result;
-  // Sequential UAF guard: see the identical is_valid_code_object() check in
-  // task_graph_append() above. Without this, sealing a builder whose code
-  // object was destroyed after createTaskGraphBuilder() would copy a
-  // dangling VgCodeObject_T* into the new VgTaskGraph_T -- submit() already
-  // re-validates that copy before use, but rejecting it here, at the point
-  // the stale pointer would otherwise be captured, is the earlier and
-  // clearer failure point.
-  if (!is_valid_code_object(builder->code_object)) {
-    set_diagnostic("task graph builder's code object handle is stale or invalid");
+  if (!is_valid_device(builder->owner_device)) {
+    set_diagnostic("task graph builder's owner device is stale or invalid");
     return VG_ERROR_STALE_HANDLE;
   }
 
   auto wrapper = std::make_unique<VgTaskGraph_T>();
-  wrapper->code_object = builder->code_object;
+  wrapper->owner_device = builder->owner_device;
   std::string error;
   if (!builder->builder.seal(&wrapper->graph, &error)) {
     set_diagnostic(error.c_str());

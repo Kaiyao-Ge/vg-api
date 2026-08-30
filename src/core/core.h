@@ -7,13 +7,15 @@
 #include <cstdint>
 #include <atomic>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace vg::hal { struct ExecutionPlan; }
-
 namespace vg::core {
+
+class ExecutionPlan;
 
 enum class ObjectState { Active, Retired };
 enum class PoisonState { Valid, PartiallyProduced, Poisoned };
@@ -305,6 +307,11 @@ enum class FacetStatus : uint32_t {
 };
 
 const char* to_string(FacetStatus status);
+
+// Side-effect-free validation shared by Stage-5 planning and FacetPool
+// acquisition. It deliberately does not allocate a slot or alter an epoch.
+bool validate_facet_target(const Arena& arena, const CanonicalView& view, FacetKind kind,
+                           std::string* error = nullptr);
 
 // Independent index+generation pool for facets. Sibling to Arena's
 // allocation table, not a reuse of its id space
@@ -930,6 +937,10 @@ struct AddressDomain {
 struct CodeObject {
   std::vector<uint8_t> bytes;
   std::string format_tag;
+  // Materialized at load time.  submit() only consumes this immutable
+  // package; it never reinterprets application-owned source bytes.
+  std::optional<ir::Module> module;
+  std::optional<ir::UserRasterShaderContract> user_raster_shader;
 };
 
 // A CodeObject has exactly one runnable entry for v1.1, but the
@@ -937,6 +948,9 @@ struct CodeObject {
 // fields carry, mirroring VgFacetRef's staleness-checked-token model rather
 // than a bare caller-picked integer.
 struct NodeEntry {
+  // A live Node retains the immutable package; destroying the public
+  // CodeObject handle must not make existing NodeRefs dangle.
+  std::shared_ptr<const CodeObject> code_object;
   std::string entry_name;
   uint32_t generation{1};
   bool live{true};
@@ -949,13 +963,21 @@ class NodeTable {
     uint32_t generation{};
   };
 
-  Ref create(const std::string& entry_name);
+  NodeTable();
+  Ref create(std::shared_ptr<const CodeObject> code_object, const std::string& entry_name);
   bool destroy(Ref ref);
-  [[nodiscard]] NodeEntry* lookup(Ref ref);
-  [[nodiscard]] const NodeEntry* lookup(Ref ref) const;
+  // Copies an entry while holding the table lock.  Submit uses this instead
+  // of retaining a table-internal pointer across later Node creation.
+  bool snapshot(Ref ref, NodeEntry* out) const;
+  // Capability validation needs no table-internal pointer.  Returning one
+  // after releasing mutex_ would let destroy() or a rehash invalidate it.
+  [[nodiscard]] bool contains(Ref ref) const;
 
  private:
-  std::vector<NodeEntry> entries_;
+  mutable std::mutex mutex_;
+  // Ref bits are allocated from a process-wide monotonic token.  The map is
+  // still Device-owned: it only answers for Nodes created by that Device.
+  std::unordered_map<uint64_t, NodeEntry> entries_;
 };
 
 // Combines what 04-public-c-abi.md Sec.17 calls the envelope's
@@ -970,7 +992,9 @@ class NodeTable {
 // honors.
 class ExecutionEnvelope {
  public:
-  std::vector<uint32_t> allowed_node_classes;
+  // Complete device-scoped identity.  An index alone could authorize a
+  // recycled generation.
+  std::vector<NodeTable::Ref> allowed_nodes;
   std::vector<PointerRef> certificate_touched;
   bool has_certificate_mode{};
   AccessCertificateMode certificate_mode{AccessCertificateMode::CertifiedPinned};
@@ -979,12 +1003,8 @@ class ExecutionEnvelope {
   uint64_t timeline_wait{};
   uint64_t timeline_signal{};
 
-  // Splices this envelope's fields into `plan` ahead of compile()/submit().
-  // Defined in src/api/vg_api_execution.cpp, not core.cpp: that is the one
-  // place core-layer state legitimately reaches into backends::ExecutionPlan,
-  // and keeping the definition there avoids giving vg_core a backends/
-  // header dependency (core.h only forward-declares hal::ExecutionPlan).
-  void apply_to(hal::ExecutionPlan& plan) const;
+  // Splices this envelope's fields into the core-owned plan ahead of Stage 6.
+  void apply_to(ExecutionPlan& plan) const;
 };
 
 }  // namespace vg::core

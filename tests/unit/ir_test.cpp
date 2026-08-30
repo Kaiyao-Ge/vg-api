@@ -45,6 +45,12 @@ int main() {
   invalid_module = parsed;
   invalid_module.declared_effects.clear();
   assert(!vg::ir::verify(invalid_module).ok);
+  // v1 has no unbounded pointer-chase opcode.  A future dynamic operation
+  // must gain an explicit certificate/discovery contract instead of being
+  // accepted as an ADR-028 bounded graph.
+  invalid_module = parsed;
+  invalid_module.instructions[0].op = "load_dynamic_pointer";
+  assert(!vg::ir::verify(invalid_module).ok);
   auto invalid = vg::compiler::compile_c_like("@node @effects for (;;) {}");
   assert(!invalid.ok);
 

@@ -9,6 +9,7 @@ target_sources(vg_backend_reference PRIVATE
 add_executable(vg_envelope_continuation_test
   "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/envelope_continuation_test.cpp")
 target_link_libraries(vg_envelope_continuation_test PRIVATE vg_backend_reference)
+target_include_directories(vg_envelope_continuation_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
 target_compile_features(vg_envelope_continuation_test PRIVATE cxx_std_20)
 add_test(NAME core.envelope-continuation COMMAND vg_envelope_continuation_test)
 

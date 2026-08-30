@@ -1,7 +1,6 @@
 // TASK-D4 (E010): Metal Tier2 heterogeneous-Node select vs the CPU oracle.
 // New executable -- do not add a mode to metal_task_timeline_test.cpp.
 #include "backends/device_hal.h"
-#include "backends/metal/metal_device_hal.h"
 #include "backends/metal/metal_tier2.h"
 #include "backends/reference/tier2_oracle.h"
 #include "ir/ir.h"
@@ -16,24 +15,6 @@ namespace {
 using vg::core::TaskGraph;
 using vg::core::TaskGraphBuilder;
 using vg::core::TaskRecord;
-
-vg::ir::Module make_probe_module(vg::core::Arena& arena) {
-  const auto& allocation = arena.allocate(64);
-  vg::ir::Module module;
-  module.version = 1;
-  module.root_schema = "vg.test/v1";
-  vg::ir::Instruction load;
-  load.op = "load";
-  load.allocation = allocation.id;
-  load.generation = allocation.generation;
-  load.representation_epoch = allocation.representation_epoch;
-  load.offset = 0;
-  load.size = 4;
-  module.instructions.push_back(load);
-  module.declared_effects.push_back(
-      {allocation.id, 0, 64, vg::ir::Access::Read, allocation.representation_epoch});
-  return module;
-}
 
 TaskGraph make_graph(const std::vector<uint32_t>& node_classes) {
   TaskGraphBuilder builder;
@@ -68,8 +49,7 @@ bool report_claims_device_pass_for_tier2(const vg::hal::LoweringReport& report) 
   });
 }
 
-bool run_select_case(vg::metal::DeviceHal& metal, const std::vector<uint32_t>& nodes,
-                     const char* label) {
+bool run_select_case(const std::vector<uint32_t>& nodes, const char* label) {
   const std::vector<uint32_t> authorized{0, 1};
   const auto graph = make_graph(nodes);
   if (graph.tasks().size() != nodes.size()) {
@@ -83,27 +63,13 @@ bool run_select_case(vg::metal::DeviceHal& metal, const std::vector<uint32_t>& n
     return false;
   }
 
-  vg::core::Arena arena;
-  const auto module = make_probe_module(arena);
-
-  vg::hal::ExecutionPlan metal_plan;
-  metal_plan.capabilities = metal.capabilities();
-  metal_plan.module = module;
-  metal_plan.published = true;
-  metal_plan.task_graph = graph;
-  metal_plan.graph_epoch = arena.topology_epoch();
-  metal_plan.request_tier2_select = true;
-  metal_plan.authorized_node_classes = authorized;
-
-  vg::hal::CompiledPlan compiled;
+  // Tier2 has no canonical node-class contract yet, so assembler correctly
+  // rejects it. Exercise the actual physical select adapter through its
+  // narrow test harness instead of constructing a fake sealed plan.
   std::string error;
-  if (!metal.compile(metal_plan, &compiled, &error)) {
-    std::cerr << label << ": Metal compile failed: " << error << "\n";
-    return false;
-  }
   vg::hal::Submission submission;
-  if (!metal.submit(compiled, arena, &submission, &error)) {
-    std::cerr << label << ": Metal submit failed: " << error << "\n";
+  if (!vg::metal::tier2::run_select_test_harness(nodes, authorized, &submission, &error)) {
+    std::cerr << label << ": Tier2 physical harness failed: " << error << "\n";
     return false;
   }
   if (!submission.result.ok) {
@@ -134,36 +100,17 @@ bool run_select_case(vg::metal::DeviceHal& metal, const std::vector<uint32_t>& n
   return true;
 }
 
-bool run_unauthorized(vg::metal::DeviceHal& metal) {
+bool run_unauthorized() {
   const auto graph = make_graph({0, 1, 2, 2, 1, 0, 1, 0});
-  vg::core::Arena arena;
-  const auto module = make_probe_module(arena);
-  vg::hal::ExecutionPlan plan;
-  plan.capabilities = metal.capabilities();
-  plan.module = module;
-  plan.published = true;
-  plan.task_graph = graph;
-  plan.graph_epoch = arena.topology_epoch();
-  plan.request_tier2_select = true;
-  plan.authorized_node_classes = {0, 1};
-
-  vg::hal::CompiledPlan compiled;
   std::string error;
-  if (!metal.compile(plan, &compiled, &error)) {
-    std::cerr << "unauthorized: Metal compile failed: " << error << "\n";
-    return false;
-  }
   vg::hal::Submission submission;
-  if (!metal.submit(compiled, arena, &submission, &error)) {
-    std::cerr << "unauthorized: Metal submit call failed: " << error << "\n";
-    return false;
-  }
-  if (submission.result.ok) {
+  if (vg::metal::tier2::run_select_test_harness({0, 1, 2, 2, 1, 0, 1, 0}, {0, 1},
+                                                &submission, &error)) {
     std::cerr << "unauthorized: Metal accepted an unauthorized node class\n";
     return false;
   }
-  if (submission.result.message.find("unauthorized") == std::string::npos) {
-    std::cerr << "unauthorized: unexpected refuse message: " << submission.result.message << "\n";
+  if (error.find("unauthorized") == std::string::npos) {
+    std::cerr << "unauthorized: unexpected refuse message: " << error << "\n";
     return false;
   }
   std::cout << "unauthorized: ok\n";
@@ -175,14 +122,8 @@ bool run_unauthorized(vg::metal::DeviceHal& metal) {
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
-  auto metal_device = vg::metal::make_device_hal();
-  if (metal_device == nullptr) {
-    std::cerr << "tier2-nodes: no Metal device available on this host\n";
-    return 1;
-  }
-
-  if (!run_select_case(*metal_device, {0, 1, 0, 1, 0, 1, 0, 1}, "uniform-8")) return 1;
-  if (!run_select_case(*metal_device, {0, 0, 0, 0, 0, 0, 0, 1}, "skewed-8")) return 1;
-  if (!run_unauthorized(*metal_device)) return 1;
+  if (!run_select_case({0, 1, 0, 1, 0, 1, 0, 1}, "uniform-8")) return 1;
+  if (!run_select_case({0, 0, 0, 0, 0, 0, 0, 1}, "skewed-8")) return 1;
+  if (!run_unauthorized()) return 1;
   return 0;
 }

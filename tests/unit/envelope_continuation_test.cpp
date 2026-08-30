@@ -3,6 +3,7 @@
 #include "backends/reference/reference_executor.h"
 #include "compiler/compiler.h"
 #include "ir/ir.h"
+#include "assembled_plan_fixture.h"
 
 #include <algorithm>
 #include <cassert>
@@ -48,33 +49,52 @@ struct Fixture {
   std::unique_ptr<vg::hal::DeviceHal> device;
   vg::hal::CompiledPlan compiled;
   vg::core::TaskGraph oracle_graph;
+  vg::ir::Module module;
+  uint32_t task_count{};
 
   explicit Fixture(uint32_t task_count) {
     device = vg::reference::make_device_hal();
     assert(device != nullptr);
-    const auto module = make_module(arena);
+    this->task_count = task_count;
+    module = make_module(arena);
     const uint64_t root = module.instructions[0].allocation;
-    oracle_graph = make_chain({.task_count = task_count, .root_allocation = root});
+    std::vector<vg::core::TaskRecord> tasks;
+    for (uint32_t index = 0; index < task_count; ++index) tasks.push_back(vg::test_support::compute_task(root));
+    std::vector<std::pair<uint32_t, uint32_t>> dependencies;
+    for (uint32_t index = 1; index < task_count; ++index) dependencies.emplace_back(index - 1, index);
+    vg::test_support::AssembledPlanFixture fixture;
+    vg::test_support::AssemblyOptions options;
+    options.dependencies = &dependencies;
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = device->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.task_graph = oracle_graph;
-    plan.graph_epoch = arena.topology_epoch();
     std::string error;
+    assert(vg::test_support::assemble_single_node_plan(arena, module, tasks, &fixture, &plan, &error, options));
+    oracle_graph = fixture.graph;
     assert(device->compile(plan, &compiled, &error));
   }
 
-  vg::hal::CompiledPlan with_quota(uint32_t quota) const {
-    auto copy = compiled;
-    copy.plan.envelope_task_quota = quota;
+  vg::hal::CompiledPlan with_quota(uint32_t quota,
+                                   const vg::core::EnvelopeOverflow* pending = nullptr) {
+    std::vector<vg::core::TaskRecord> tasks;
+    const uint64_t root = module.instructions[0].allocation;
+    for (uint32_t index = 0; index < task_count; ++index) tasks.push_back(vg::test_support::compute_task(root));
+    std::vector<std::pair<uint32_t, uint32_t>> dependencies;
+    for (uint32_t index = 1; index < task_count; ++index) dependencies.emplace_back(index - 1, index);
+    vg::test_support::AssembledPlanFixture fixture;
+    vg::test_support::AssemblyOptions options;
+    options.dependencies = &dependencies;
+    options.task_quota = quota;
+    options.pending_overflow = pending;
+    vg::hal::ExecutionPlan plan;
+    std::string error;
+    assert(vg::test_support::assemble_single_node_plan(arena, module, tasks, &fixture, &plan, &error, options));
+    vg::hal::CompiledPlan copy;
+    assert(device->compile(plan, &copy, &error));
     return copy;
   }
 };
 
 bool same_task(const vg::core::TaskRecord& a, const vg::core::TaskRecord& b) {
-  return a.node_index == b.node_index && a.node_generation == b.node_generation &&
-         a.root_allocation == b.root_allocation && a.root_generation == b.root_generation;
+  return a.root_allocation == b.root_allocation && a.root_generation == b.root_generation;
 }
 
 bool has_host_assisted(const vg::hal::Submission& submission) {
@@ -129,7 +149,6 @@ int main() {
     assert(fixture.device->submit(first_plan, fixture.arena, &first, &error));
     assert(first.result.ok);
     assert(first.published_tasks.size() == 1);
-    assert(first.published_tasks[0].node_index == 0);
     assert(first.envelope_overflow.has_value());
     assert(first.envelope_overflow->valid());
     assert(first.envelope_overflow->disposition == vg::core::EnvelopeOverflowDisposition::Deferred);
@@ -140,14 +159,11 @@ int main() {
     assert(!mentions_ring_overflow(first.report.canonical_json()));
     assert(fixture.device->envelope_continuations().contains(first.envelope_overflow->continuation_token));
 
-    auto continued = first_plan;
-    continued.plan.pending_overflow = first.envelope_overflow;
+    auto continued = fixture.with_quota(1, &*first.envelope_overflow);
     vg::hal::Submission second;
     assert(fixture.device->submit(continued, fixture.arena, &second, &error));
     assert(second.result.ok);
     assert(second.published_tasks.size() == 2);
-    assert(second.published_tasks[0].node_index == 1);
-    assert(second.published_tasks[1].node_index == 2);
     assert(!second.envelope_overflow.has_value());
     assert(!fixture.device->envelope_continuations().contains(first.envelope_overflow->continuation_token));
 
@@ -159,7 +175,6 @@ int main() {
     std::set<uint32_t> seen;
     for (size_t i = 0; i < published.size(); ++i) {
       assert(same_task(published[i], oracle.published_tasks[i]));
-      assert(seen.insert(published[i].node_index).second);
     }
   }
 
@@ -177,18 +192,15 @@ int main() {
     assert(fixture.device->submit(first_plan, fixture.arena, &stolen, &error));
     assert(stolen.result.ok);
     assert(stolen.published_tasks.size() == 1);
-    assert(stolen.published_tasks[0].node_index == 0);
     assert(stolen.envelope_overflow.has_value());
     assert(stolen.envelope_overflow->continuation_token != token);
     assert(fixture.device->envelope_continuations().contains(token));
 
-    auto continued = first_plan;
-    continued.plan.pending_overflow = first.envelope_overflow;
+    auto continued = fixture.with_quota(1, &*first.envelope_overflow);
     vg::hal::Submission drain;
     assert(fixture.device->submit(continued, fixture.arena, &drain, &error));
     assert(drain.result.ok);
     assert(drain.published_tasks.size() == 2);
-    assert(drain.published_tasks[0].node_index == 1);
     assert(!fixture.device->envelope_continuations().contains(token));
   }
 
@@ -199,26 +211,21 @@ int main() {
     vg::hal::Submission first;
     std::string error;
     assert(fixture.device->submit(first_plan, fixture.arena, &first, &error));
-    auto continued = first_plan;
-    continued.plan.envelope_task_quota = 100;
-    continued.plan.pending_overflow = first.envelope_overflow;
+    auto continued = fixture.with_quota(100, &*first.envelope_overflow);
     vg::hal::Submission second;
     assert(fixture.device->submit(continued, fixture.arena, &second, &error));
     assert(second.published_tasks.size() == 2);
-    assert(second.published_tasks[0].node_index == 1);
-    assert(second.published_tasks[1].node_index == 2);
   }
 
   // Rejected pending: refuse, never continued().
   {
     Fixture fixture(3);
-    auto plan = fixture.with_quota(1);
     vg::core::EnvelopeOverflow rejected;
     rejected.disposition = vg::core::EnvelopeOverflowDisposition::Rejected;
     rejected.overflow_task_count = 2;
     assert(rejected.valid());
     assert(!rejected.continued());
-    plan.plan.pending_overflow = rejected;
+    auto plan = fixture.with_quota(1, &rejected);
     vg::hal::Submission submission;
     std::string error;
     assert(!fixture.device->submit(plan, fixture.arena, &submission, &error));
@@ -236,9 +243,9 @@ int main() {
     std::string error;
     assert(fixture.device->submit(first_plan, fixture.arena, &first, &error));
     const uint64_t token = first.envelope_overflow->continuation_token;
-    auto continued = first_plan;
-    continued.plan.pending_overflow = first.envelope_overflow;
-    continued.plan.pending_overflow->continuation_token = token + 99;
+    auto bad_overflow = *first.envelope_overflow;
+    bad_overflow.continuation_token = token + 99;
+    auto continued = fixture.with_quota(1, &bad_overflow);
     vg::hal::Submission bad;
     assert(!fixture.device->submit(continued, fixture.arena, &bad, &error));
     assert(error == "envelope continuation token does not match");

@@ -1,6 +1,6 @@
 #include "core/scene_root.h"
 
-#include "vg_scene_root.h"
+#include "vg_scene_root_layout.h"
 
 #include <cmath>
 #include <cstring>
@@ -33,11 +33,11 @@ bool resolve_scene_root_raster(const Arena& arena, const TaskRecord& task,
   }
   const Allocation* allocation = arena.lookup(PointerRef{task.root_allocation, task.root_generation});
   if (allocation == nullptr) { if (error) *error = "SceneRoot allocation is stale or not owned by the execution arena"; return false; }
-  if (allocation->bytes.size() < sizeof(VgSchema_SceneRootRaster)) {
+  if (allocation->bytes.size() < VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE) {
     if (error) *error = "SceneRoot allocation is smaller than the generated SceneRootRaster schema";
     return false;
   }
-  VgSchema_SceneRootRaster bytes{};
+  VgSchemaLayout_SceneRootRaster bytes{};
   std::memcpy(&bytes, allocation->bytes.data(), sizeof(bytes));
   // F6 deliberately remains the F4 2D/orthographic scope.  A perspective
   // camera would need clipping and homogeneous depth interpolation in the

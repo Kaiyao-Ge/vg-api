@@ -133,14 +133,25 @@ typedef struct VgApi {
 VG_API VgResult VG_CALL vgGetApi(uint32_t requested_version, VgApi* out_api);
 ```
 
-`VG_API_VERSION_1_0` 是本节示例的最小骨架版本。实际实现已按 ADR-044（v1.1：
-`openAdapter`…`getSubmissionLoweringReport` 全链路）、ADR-045（v1.2：
-`getSubmissionExecutionResult`）、ADR-048（v1.3：`acquireFacet`，见 §9.1）
-append-only 增长到 `VG_API_VERSION_1_3`（`include/vg/vg_version.h`）。每一版
-只在 `VgApi` 尾部追加函数指针，`vgGetApi` 按请求版本对应的 `size` 分档
-`memcpy`，旧版本调用方对新 runtime 保持字节兼容——这是本节以下描述的
-loader 契约在多版本增长下的实际延伸，具体每版新增了哪些成员见对应 ADR，
-本节不逐版复述。
+`VG_API_VERSION_1_0` 是本节示例的最小骨架版本。实际 header/API 的版本矩阵
+如下（以 `include/vg/vg_version.h` 为准）：
+
+| 版本 | 记录 | ABI 变化 |
+|---|---|---|
+| v1.0 | ADR-042 前的最小 ABI | 初始 function table |
+| v1.1 | ADR-044 | 完整对象链和 `getSubmissionLoweringReport` |
+| v1.2 | ADR-045 | `getSubmissionExecutionResult` |
+| v1.3 | ADR-048 | `acquireFacet` 与 raster ABI |
+| v1.4 | ADR-049 | `VgTaskRecordV2` / `taskGraphAppendV2` |
+| v1.5 | ADR-050 | index format/header capability；不增长 table |
+| v1.6 | ADR-051 | `writeAllocation` / `readAllocation` |
+| v1.7 | ADR-052 | SceneRoot contract；不增长 table |
+
+每一版的 function table 只在尾部追加函数指针，`vgGetApi` 按请求版本对应的
+`size` 分档 `memcpy`，旧版本调用方对新 runtime 保持字节兼容。ADR-053 的
+device-scoped NodeRef/multi-CodeObject 语义修复复用既有 `VgNodeRef`、builder
+descriptor 和 table，因此不发布 v1.8；它不改变任何 v1.0–v1.7 的 layout 或
+function-table boundary。
 
 导出 `vgGetApi` 是最小 loader ABI。也可为易用性导出同名函数，但规范测试以 function table 为准。Runtime allocator 必须成对使用；callback 不能抛异常跨越 C ABI。
 
@@ -360,6 +371,16 @@ VgResult vgSealTaskGraph(VgTaskGraphBuilder, const VgSealDesc*, VgTaskGraph*);
 
 Builder 不能 submit；sealed graph 不能修改。重复执行通过不同 Envelope/root data，而不是修改已发布 Task。`out_ids`（ADR-044，v1.1）按 append 顺序把每个 task 分配到的 `VgTaskId` 写回调用方数组，供后续 `vgTaskGraphAddDependency` 引用——`VgTaskId` 只在它来源的那一个 `VgTaskGraphBuilder`/`VgTaskGraph` 内有效，不是跨 graph 的 handle。
 
+ADR-053 supersedes ADR-044 的单 `CodeObject` narrowing：builder descriptor
+的 `code_object` 是可为 null 的、同一 Device 兼容性提示，而不是 graph 的
+program owner。每个 Task 的完整 `VgNodeRef {index, generation}` 在 Device 的
+NodeTable 中解析，故一个 graph 可引用同一 Device 上来自多个 CodeObject 的
+Node。该 descriptor 的既有布局和 function-table 协商均未改变；Envelope 若
+提供 Node allow-list，必须以完整 index+generation 授权，不能仅以 index/class
+授权。当前只有 Reference 的 canonical-compute 路径支持此 multi-CodeObject
+组合；Metal/Vulkan 必须返回 `VG_ERROR_UNSUPPORTED`，且 ADR-047/ADR-052 的
+mixed compute+raster 限制仍然适用。
+
 ## 11. ExecutionEnvelope 与提交
 
 ```c
@@ -453,7 +474,11 @@ C++ wrapper 是独立 header-only 或小库：提供 RAII、`span`、typed `Regi
 
 ## 17. 最小应用的完整调用逻辑
 
-以下代码是首版 API 骨架的行为目标，具体 descriptor 字段可随 ADR 调整。它刻意展示对象何时属于控制平面、普通数据何时进入 Arena，以及提交前如何 seal：
+以下代码是首版 API 骨架的**历史性语义伪代码**，用于展示对象何时属于控制平面、普通数据何时进入 Arena，以及提交前如何 seal；它不是可直接编译的当前 header 示例。当前可编译的 F6/v1.7 SceneRoot 公共 C 路径以
+[`tests/api/vg_f6_scene_root.c`](../../tests/api/vg_f6_scene_root.c) 为准：它使用
+`VgSchema_SceneRootRaster`、`VG_SCHEMA_SCENEROOTRASTER_CONTRACT_NAME`、
+`writeAllocation` 和既有 `VgTaskRecordV2.root/root_generation`。这避免把未实现的
+helper 当成 ABI 合同。
 
 ```c
 #include <vg/vg.h>
@@ -504,10 +529,8 @@ int main(void) {
                                _Alignof(SceneRoot), &root_alloc));
     VG_CHECK(api.arenaAllocate(arena, input_bytes, 16, &root_data_alloc));
 
-    /* Generated schema code writes relocations/provenance correctly. */
-    SceneRoot root = vgMakeSceneRoot(root_alloc, root_data_alloc,
-                                     element_count);
-    VG_CHECK(upload_scene_root(api, device, root_alloc, &root));
+    /* Current F6 code writes generated SceneRoot bytes explicitly with
+     * writeAllocation; there is no vgMakeSceneRoot/upload_scene_root ABI. */
 
     VgCodeObject code = NULL;
     VG_CHECK(api.loadCodeObject(device, code_package_bytes,

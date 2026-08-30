@@ -6,6 +6,7 @@
 #include "backends/device_hal.h"
 #include "backends/metal/metal_device_hal.h"
 #include "backends/reference/reference_device_hal.h"
+#include "../support/assembled_plan_fixture.h"
 
 #include <cstring>
 #include <iostream>
@@ -62,6 +63,20 @@ void build_chain(vg::core::Arena& arena, vg::ir::Module* module, vg::core::Point
   module->instructions.push_back(load);
   module->declared_effects.push_back(
       {n0.id, 0, 12, vg::ir::Access::Read, n0.representation_epoch});
+}
+
+bool assemble_discovery_plan(vg::core::Arena& arena, const vg::ir::Module& module,
+                             vg::core::PointerRef seed, vg::test_support::AssembledPlanFixture* fixture,
+                             vg::hal::ExecutionPlan* plan, std::string* error,
+                             const vg::core::WorkingSetLease* lease = nullptr) {
+  const std::vector<vg::core::PointerRef> seeds{seed};
+  vg::test_support::AssemblyOptions options;
+  options.discovery_seeds = &seeds;
+  options.working_set_lease = lease;
+  options.certificate_mode = vg::core::AccessCertificateMode::DiscoverThenLease;
+  return vg::test_support::assemble_single_node_plan(
+      arena, module, {vg::test_support::compute_task(seed.allocation, seed.generation)}, fixture, plan, error,
+      options);
 }
 
 bool require_discovery(const vg::hal::Submission& submission, size_t universe, const char* label) {
@@ -130,14 +145,14 @@ int main() {
     const size_t universe = active_count(arena);
 
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.discovery_seeds = {seed};
-    plan.requested_certificate_mode = vg::core::AccessCertificateMode::DiscoverThenLease;
+    vg::test_support::AssembledPlanFixture fixture;
+    std::string error;
+    if (!assemble_discovery_plan(arena, module, seed, &fixture, &plan, &error)) {
+      std::cerr << "discovery: metal assembly failed: " << error << "\n";
+      return 1;
+    }
 
     vg::hal::CompiledPlan compiled;
-    std::string error;
     if (!metal->compile(plan, &compiled, &error)) {
       std::cerr << "discovery: metal compile failed: " << error << "\n";
       return 1;
@@ -163,14 +178,14 @@ int main() {
     const size_t universe = active_count(arena);
 
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = reference->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.discovery_seeds = {seed};
-    plan.requested_certificate_mode = vg::core::AccessCertificateMode::DiscoverThenLease;
+    vg::test_support::AssembledPlanFixture fixture;
+    std::string error;
+    if (!assemble_discovery_plan(arena, module, seed, &fixture, &plan, &error)) {
+      std::cerr << "discovery: reference assembly failed: " << error << "\n";
+      return 1;
+    }
 
     vg::hal::CompiledPlan compiled;
-    std::string error;
     if (!reference->compile(plan, &compiled, &error)) {
       std::cerr << "discovery: reference compile failed: " << error << "\n";
       return 1;
@@ -222,18 +237,13 @@ int main() {
       }
     }
 
+    vg::core::WorkingSetLease forged;
+    forged.allocations.push_back(extra);
+    forged.complete = true;
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = reference->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.discovery_seeds = {seed};
-    plan.working_set_lease = vg::core::WorkingSetLease{};
-    plan.working_set_lease->allocations.push_back(extra);
-    plan.working_set_lease->complete = true;
-
-    vg::hal::Submission submission;
-    if (vg::hal::run_discovery_stage(plan, arena, &submission, &error)) {
-      std::cerr << "discovery: forged witness lease was accepted\n";
+    vg::test_support::AssembledPlanFixture fixture;
+    if (assemble_discovery_plan(arena, module, seed, &fixture, &plan, &error, &forged)) {
+      std::cerr << "discovery: forged witness lease was accepted by the core assembler\n";
       return 1;
     }
     std::cout << "discovery.forged: refused (" << error << ")\n";

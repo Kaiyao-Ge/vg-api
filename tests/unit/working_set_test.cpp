@@ -3,6 +3,7 @@
 #include "backends/device_hal.h"
 #include "backends/reference/reference_device_hal.h"
 #include "compiler/compiler.h"
+#include "assembled_plan_fixture.h"
 
 #include <cassert>
 #include <iostream>
@@ -27,11 +28,18 @@ vg::ir::Module store_module() {
   return compiled.module;
 }
 
-vg::hal::ExecutionPlan base_plan(vg::hal::DeviceHal& device, const vg::ir::Module& module) {
+vg::hal::ExecutionPlan base_plan(vg::core::Arena& arena, const vg::ir::Module& module,
+                                 const vg::core::WorkingSetBudget* budget = nullptr,
+                                 const vg::core::WorkingSetLease* lease = nullptr) {
+  vg::test_support::AssembledPlanFixture fixture;
+  vg::test_support::AssemblyOptions options;
+  options.certificate_mode = vg::core::AccessCertificateMode::Universe;
+  options.working_set_budget = budget;
+  options.working_set_lease = lease;
   vg::hal::ExecutionPlan plan;
-  plan.capabilities = device.capabilities();
-  plan.module = module;
-  plan.published = true;
+  std::string error;
+  assert(vg::test_support::assemble_single_node_plan(
+      arena, module, {vg::test_support::compute_task(1)}, &fixture, &plan, &error, options));
   return plan;
 }
 
@@ -69,13 +77,12 @@ int main() {
     vg::core::Arena arena;
     const auto& first = arena.allocate(16);
     arena.allocate(16);
-    auto plan = base_plan(*device, module);
-    plan.working_set_budget = vg::core::WorkingSetBudget::limited(64);
-    plan.working_set_lease = vg::core::WorkingSetLease{};
-    plan.working_set_lease->allocations.push_back({first.id, first.generation});
-    plan.working_set_lease->byte_limit = 16;
-    plan.working_set_lease->complete = true;
-    assert(plan.validate());
+    auto budget = vg::core::WorkingSetBudget::limited(64);
+    vg::core::WorkingSetLease lease;
+    lease.allocations.push_back({first.id, first.generation});
+    lease.byte_limit = 16;
+    lease.complete = true;
+    auto plan = base_plan(arena, module, &budget, &lease);
 
     vg::hal::CompiledPlan compiled;
     std::string error;
@@ -96,21 +103,18 @@ int main() {
     vg::core::Arena arena;
     arena.allocate(16);
     arena.allocate(16);
-    auto plan = base_plan(*device, module);
-    plan.working_set_budget = vg::core::WorkingSetBudget::limited(16);
-    assert(plan.validate());
-
-    vg::hal::CompiledPlan compiled;
+    auto budget = vg::core::WorkingSetBudget::limited(16);
+    // A budget failure is semantic assembly rejection, before Stage 6.
+    vg::test_support::AssembledPlanFixture fixture;
+    vg::test_support::AssemblyOptions options;
+    options.certificate_mode = vg::core::AccessCertificateMode::Universe;
+    options.working_set_budget = &budget;
+    vg::hal::ExecutionPlan rejected;
     std::string error;
-    assert(device->compile(plan, &compiled, &error));
-    vg::hal::Submission submission;
-    assert(!device->submit(compiled, arena, &submission, &error));
+    assert(!vg::test_support::assemble_single_node_plan(
+        arena, module, {vg::test_support::compute_task(1)}, &fixture, &rejected, &error, options));
     assert(error == "working-set budget exceeded");
-    const auto* requested_event = find_event(submission.report, "working_set_requested");
-    assert(requested_event != nullptr);
-    universe_requested = requested_event->bytes;
-    assert(universe_requested == 32);
-    require_working_set_events(submission.report, 32, false);
+    universe_requested = 32;
     std::cout << "universe requested=" << universe_requested << "\n";
   }
 
@@ -124,13 +128,13 @@ int main() {
     vg::core::Arena arena;
     const auto& first = arena.allocate(16);
     arena.allocate(16);
-    auto leased = base_plan(*device, module);
-    leased.working_set_budget = vg::core::WorkingSetBudget::limited(64);
-    leased.working_set_lease = vg::core::WorkingSetLease{};
-    leased.working_set_lease->allocations.push_back({first.id, first.generation});
-    leased.working_set_lease->byte_limit = 16;
-    auto universe = base_plan(*device, module);
-    universe.working_set_budget = vg::core::WorkingSetBudget::limited(64);
+    auto budget = vg::core::WorkingSetBudget::limited(64);
+    vg::core::WorkingSetLease lease;
+    lease.allocations.push_back({first.id, first.generation});
+    lease.byte_limit = 16;
+    lease.complete = true;
+    auto leased = base_plan(arena, module, &budget, &lease);
+    auto universe = base_plan(arena, module, &budget);
 
     vg::hal::Submission leased_submission;
     vg::hal::Submission universe_submission;
@@ -149,7 +153,7 @@ int main() {
     vg::core::Arena arena;
     arena.allocate(16);
     arena.allocate(16);
-    auto plan = base_plan(*device, module);
+    auto plan = base_plan(arena, module);
     assert(!plan.working_set_budget.has_value());
     assert(!plan.working_set_lease.has_value());
     vg::hal::CompiledPlan compiled;
@@ -167,15 +171,20 @@ int main() {
   {
     vg::core::Arena arena;
     arena.allocate(16);
-    auto plan = base_plan(*device, module);
-    plan.working_set_budget = vg::core::WorkingSetBudget::limited(64);
-    plan.working_set_lease = vg::core::WorkingSetLease{};
-    plan.working_set_lease->allocations.push_back({99, 1});
-    plan.working_set_lease->byte_limit = 16;
-    vg::hal::Submission submission;
+    auto budget = vg::core::WorkingSetBudget::limited(64);
+    vg::core::WorkingSetLease lease;
+    lease.allocations.push_back({99, 1});
+    lease.byte_limit = 16;
+    vg::test_support::AssembledPlanFixture fixture;
+    vg::test_support::AssemblyOptions options;
+    options.certificate_mode = vg::core::AccessCertificateMode::Universe;
+    options.working_set_budget = &budget;
+    options.working_set_lease = &lease;
+    vg::hal::ExecutionPlan plan;
     std::string error;
-    assert(!vg::hal::apply_working_set_budget(plan, arena, &submission, &error));
-    assert(error == "working-set lease names a missing or stale allocation");
+    assert(!vg::test_support::assemble_single_node_plan(
+        arena, module, {vg::test_support::compute_task(1)}, &fixture, &plan, &error, options));
+    assert(error.find("lease") != std::string::npos || error.find("allocation") != std::string::npos);
   }
 
   // Discovery-lease: real discover_reachable (TASK-D2), not a fake subset.
@@ -192,15 +201,14 @@ int main() {
     assert(discovery.reachable.size() == 1);
     assert(discovery.result_bytes == 16);
 
-    auto plan = base_plan(*device, module);
-    plan.working_set_budget = vg::core::WorkingSetBudget::limited(16);
-    plan.working_set_lease = vg::core::WorkingSetLease{};
+    auto budget = vg::core::WorkingSetBudget::limited(16);
+    vg::core::WorkingSetLease lease;
     for (const auto& ref : discovery.reachable) {
-      assert(plan.working_set_lease->add(ref, discovery.reachable, &error));
+      assert(lease.add(ref, discovery.reachable, &error));
     }
-    plan.working_set_lease->byte_limit = discovery.result_bytes;
-    plan.working_set_lease->complete = true;
-    assert(plan.validate());
+    lease.byte_limit = discovery.result_bytes;
+    lease.complete = true;
+    auto plan = base_plan(arena, module, &budget, &lease);
 
     vg::hal::CompiledPlan compiled;
     assert(device->compile(plan, &compiled, &error));

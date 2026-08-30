@@ -4,6 +4,7 @@
 #include "backends/device_hal.h"
 #include "backends/metal/metal_device_hal.h"
 #include "compiler/compiler.h"
+#include "../support/assembled_plan_fixture.h"
 
 #include <iostream>
 #include <string>
@@ -54,6 +55,23 @@ vg::ir::Module store_module() {
   return compiled.module;
 }
 
+bool assemble_store_plan(vg::core::Arena& arena, const vg::ir::Module& module, vg::core::PointerRef root,
+                         vg::test_support::AssembledPlanFixture* fixture, vg::hal::ExecutionPlan* plan,
+                         std::string* error, const vg::core::WorkingSetBudget* budget = nullptr,
+                         const vg::core::WorkingSetLease* lease = nullptr,
+                         const std::vector<vg::core::PointerRef>* seeds = nullptr,
+                         std::optional<vg::core::AccessCertificateMode> mode = std::nullopt) {
+  vg::test_support::AssemblyOptions options;
+  options.working_set_budget = budget;
+  options.working_set_lease = lease;
+  options.discovery_seeds = seeds;
+  options.certificate_mode = mode;
+  if (mode == vg::core::AccessCertificateMode::CertifiedPinned) options.certificate_touched = {root};
+  return vg::test_support::assemble_single_node_plan(
+      arena, module, {vg::test_support::compute_task(root.allocation, root.generation)}, fixture, plan, error,
+      options);
+}
+
 }  // namespace
 
 int main() {
@@ -74,16 +92,19 @@ int main() {
     vg::core::Arena arena;
     const auto& first = arena.allocate(16);
     arena.allocate(16);
+    vg::core::WorkingSetBudget budget = vg::core::WorkingSetBudget::limited(64);
+    vg::core::WorkingSetLease lease;
+    lease.allocations.push_back({first.id, first.generation});
+    lease.byte_limit = 16;
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.working_set_budget = vg::core::WorkingSetBudget::limited(64);
-    plan.working_set_lease = vg::core::WorkingSetLease{};
-    plan.working_set_lease->allocations.push_back({first.id, first.generation});
-    plan.working_set_lease->byte_limit = 16;
+    vg::test_support::AssembledPlanFixture fixture;
     vg::hal::Submission submission;
     std::string error;
+    if (!assemble_store_plan(arena, module, {first.id, first.generation}, &fixture, &plan, &error, &budget,
+                             &lease, nullptr, vg::core::AccessCertificateMode::CertifiedPinned)) {
+      std::cerr << "working-set: hand-picked assembly failed: " << error << "\n";
+      return 1;
+    }
     if (!vg::hal::apply_working_set_budget(plan, arena, &submission, &error)) {
       std::cerr << "working-set: hand-picked lease should pass: " << error << "\n";
       return 1;
@@ -95,37 +116,37 @@ int main() {
   // Universe (no lease) two 16-byte actives, budget 16: refuse.
   {
     vg::core::Arena arena;
+    const auto& first = arena.allocate(16);
     arena.allocate(16);
-    arena.allocate(16);
+    vg::core::WorkingSetBudget budget = vg::core::WorkingSetBudget::limited(16);
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.working_set_budget = vg::core::WorkingSetBudget::limited(16);
-    vg::hal::Submission submission;
+    vg::test_support::AssembledPlanFixture fixture;
     std::string error;
-    if (vg::hal::apply_working_set_budget(plan, arena, &submission, &error)) {
-      std::cerr << "working-set: universe over budget must refuse\n";
+    if (assemble_store_plan(arena, module, {first.id, first.generation}, &fixture, &plan, &error,
+                            &budget, nullptr, nullptr,
+                            vg::core::AccessCertificateMode::Universe)) {
+      std::cerr << "working-set: universe over budget must be rejected during assembly\n";
       return 1;
     }
     if (error != "working-set budget exceeded") {
       std::cerr << "working-set: expected 'working-set budget exceeded', got '" << error << "'\n";
       return 1;
     }
-    if (!require_working_set_events(submission.report, 32, false, "universe")) return 1;
-    std::cout << "metal universe requested=32 (refused)\n";
+    std::cout << "metal universe requested=32 (rejected during assembly)\n";
   }
 
   // Default plan (no budget): Metal submit unchanged success.
   {
     vg::core::Arena arena;
-    arena.allocate(16);
+    const auto& first = arena.allocate(16);
     vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal->capabilities();
-    plan.module = module;
-    plan.published = true;
+    vg::test_support::AssembledPlanFixture fixture;
     vg::hal::CompiledPlan compiled;
     std::string error;
+    if (!assemble_store_plan(arena, module, {first.id, first.generation}, &fixture, &plan, &error)) {
+      std::cerr << "working-set: default assembly failed: " << error << "\n";
+      return 1;
+    }
     if (!metal->compile(plan, &compiled, &error)) {
       std::cerr << "working-set: default compile failed: " << error << "\n";
       return 1;
@@ -155,20 +176,26 @@ int main() {
       std::cerr << "working-set: discover_reachable failed: " << error << "\n";
       return 1;
     }
-    vg::hal::ExecutionPlan plan;
-    plan.capabilities = metal->capabilities();
-    plan.module = module;
-    plan.published = true;
-    plan.working_set_budget = vg::core::WorkingSetBudget::limited(16);
-    plan.working_set_lease = vg::core::WorkingSetLease{};
+    vg::core::WorkingSetBudget budget = vg::core::WorkingSetBudget::limited(16);
+    vg::core::WorkingSetLease lease;
     for (const auto& ref : discovery.reachable) {
-      if (!plan.working_set_lease->add(ref, discovery.reachable, &error)) {
+      if (!lease.add(ref, discovery.reachable, &error)) {
         std::cerr << "working-set: discovery lease add failed: " << error << "\n";
         return 1;
       }
     }
-    plan.working_set_lease->byte_limit = discovery.result_bytes;
+    lease.byte_limit = discovery.result_bytes;
+    lease.complete = true;
+    const std::vector<vg::core::PointerRef> seeds{{seed_alloc.id, seed_alloc.generation}};
+    vg::hal::ExecutionPlan plan;
+    vg::test_support::AssembledPlanFixture fixture;
     vg::hal::Submission submission;
+    if (!assemble_store_plan(arena, module, {seed_alloc.id, seed_alloc.generation}, &fixture, &plan, &error,
+                             &budget, &lease, &seeds,
+                             vg::core::AccessCertificateMode::DiscoverThenLease)) {
+      std::cerr << "working-set: discovery-lease assembly failed: " << error << "\n";
+      return 1;
+    }
     if (!vg::hal::apply_working_set_budget(plan, arena, &submission, &error)) {
       std::cerr << "working-set: discovery-lease should pass: " << error << "\n";
       return 1;

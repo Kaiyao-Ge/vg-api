@@ -597,4 +597,39 @@ bool apply_select(const MetalSelectContext& metal, uint32_t task_count, const ha
                              counters, icb_error, error);
 }
 
+bool run_select_test_harness(const std::vector<uint32_t>& task_node_classes,
+                             const std::vector<uint32_t>& authorized_node_classes,
+                             hal::Submission* submission, std::string* error) {
+  if (submission == nullptr) {
+    if (error) *error = "Tier2 test harness requires a submission output";
+    return false;
+  }
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  id<MTLCommandQueue> queue = device != nil ? [device newCommandQueue] : nil;
+  if (device == nil || queue == nil) {
+    if (error) *error = "Tier2 test harness requires a Metal device and command queue";
+    return false;
+  }
+  const uint32_t count = static_cast<uint32_t>(task_node_classes.size());
+  id<MTLBuffer> fields = [device newBufferWithLength:std::max<size_t>(
+      static_cast<size_t>(count) * compiler::kTaskRingWordsPerRecord * sizeof(uint32_t), 1)
+                                               options:MTLResourceStorageModeShared];
+  if (fields == nil) {
+    if (error) *error = "Tier2 test harness fields-buffer allocation failed";
+    return false;
+  }
+  auto* words = static_cast<uint32_t*>([fields contents]);
+  std::memset(words, 0, static_cast<size_t>(count) * compiler::kTaskRingWordsPerRecord * sizeof(uint32_t));
+  for (uint32_t i = 0; i < count; ++i)
+    words[static_cast<size_t>(i) * compiler::kTaskRingWordsPerRecord] = task_node_classes[i];
+  hal::ExecutionPlan request;
+  request.request_tier2_select = true;
+  request.authorized_node_classes = authorized_node_classes;
+  const bool selected = apply_select({.device = static_cast<void*>(device), .command_queue = static_cast<void*>(queue),
+                                      .fields_buffer = static_cast<void*>(fields)},
+                                     count, request, submission, {}, error);
+  if (selected) submission->result.ok = true;
+  return selected;
+}
+
 }  // namespace vg::metal::tier2
