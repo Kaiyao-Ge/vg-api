@@ -1,6 +1,6 @@
 #include "backends/metal/metal_tier2.h"
 
-#include "compiler/compiler.h"
+#include "compiler/compute_task_ring.h"
 
 #import <Metal/Metal.h>
 
@@ -27,6 +27,7 @@ struct VgTier2Params {
   uint task_count;
   uint class_count;
   uint words_per_record;
+  uint node_word;
 };
 
 kernel void vg_tier2_bucket(device const uint* fields [[buffer(0)]],
@@ -38,7 +39,7 @@ kernel void vg_tier2_bucket(device const uint* fields [[buffer(0)]],
                             constant VgTier2Params& params [[buffer(6)]],
                             uint gid [[thread_position_in_grid]]) {
   if (gid >= params.task_count) return;
-  uint node = fields[gid * params.words_per_record];
+  uint node = fields[gid * params.words_per_record + params.node_word];
   uint found = 0xffffffffu;
   for (uint c = 0u; c < params.class_count; ++c) {
     if (authorized[c] == node) {
@@ -80,6 +81,7 @@ struct VgTier2Params {
   uint task_count;
   uint class_count;
   uint words_per_record;
+  uint node_word;
 };
 
 struct VgIcbContainer {
@@ -105,7 +107,7 @@ kernel void vg_tier2_icb_encode(device const uint* fields [[buffer(0)]],
   if (gid >= params.task_count) return;
   compute_command cmd(container->icb, gid);
   cmd.reset();
-  uint node = fields[gid * params.words_per_record];
+  uint node = fields[gid * params.words_per_record + params.node_word];
   uint found = 0xffffffffu;
   for (uint c = 0u; c < params.class_count; ++c) {
     if (authorized[c] == node) {
@@ -290,7 +292,8 @@ bool finish_command_buffer(id<MTLCommandBuffer> command_buffer, std::string* err
 
 IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue,
                             id<MTLBuffer> fields_buffer, uint32_t task_count,
-                            const hal::ExecutionPlan& plan, hal::Submission* submission,
+                            const std::vector<uint32_t>& authorized_node_classes,
+                            hal::Submission* submission,
                             DispatchCounters counters, std::string* error) {
   if (task_count == 0 || task_count > kMaxIcbCommands)
     return icb_unavailable(error, "ICB path requires 1..16384 published tasks");
@@ -299,10 +302,10 @@ IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_qu
   if (!ensure_icb_encode_pipeline(device, error))
     return IcbAttempt::Unavailable;
 
-  const auto class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
+  const auto class_count = static_cast<uint32_t>(authorized_node_classes.size());
   std::vector<id<MTLComputePipelineState>> node_pipelines(class_count, nil);
   for (uint32_t i = 0; i < class_count; ++i) {
-    node_pipelines[i] = icb_node_pipeline(device, plan.authorized_node_classes[i], error);
+    node_pipelines[i] = icb_node_pipeline(device, authorized_node_classes[i], error);
     if (node_pipelines[i] == nil) return IcbAttempt::Unavailable;
   }
 
@@ -327,7 +330,7 @@ IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_qu
   const size_t authorized_bytes = class_count * sizeof(uint32_t);
   const size_t selected_bytes = static_cast<size_t>(task_count) * sizeof(uint32_t);
   const size_t flag_bytes = sizeof(uint32_t);
-  const size_t params_bytes = 3 * sizeof(uint32_t);
+  const size_t params_bytes = 4 * sizeof(uint32_t);
   const size_t slot_bytes = static_cast<size_t>(task_count) * sizeof(uint32_t);
   const size_t arg_bytes = [arg_encoder encodedLength];
   const uint64_t temporary_bytes =
@@ -347,13 +350,14 @@ IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_qu
   if ([arg_encoder encodedLength] == 0)
     return icb_unavailable(error, "ICB argument encoder encodedLength is 0");
 
-  std::memcpy([authorized_buffer contents], plan.authorized_node_classes.data(), authorized_bytes);
+  std::memcpy([authorized_buffer contents], authorized_node_classes.data(), authorized_bytes);
   std::memset([selected_buffer contents], 0, selected_bytes);
   std::memset([flag_buffer contents], 0, flag_bytes);
   auto* params = static_cast<uint32_t*>([params_buffer contents]);
   params[0] = task_count;
   params[1] = class_count;
   params[2] = compiler::kTaskRingWordsPerRecord;
+  params[3] = compiler::kTaskRingNodeIndexWord;
   auto* slots = static_cast<uint32_t*>([slot_buffer contents]);
   for (uint32_t i = 0; i < task_count; ++i) slots[i] = i;
 
@@ -439,12 +443,13 @@ IcbAttempt apply_icb_select(id<MTLDevice> device, id<MTLCommandQueue> command_qu
 
 bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue,
                          id<MTLBuffer> fields_buffer, uint32_t task_count,
-                         const hal::ExecutionPlan& plan, hal::Submission* submission,
+                         const std::vector<uint32_t>& authorized_node_classes,
+                         hal::Submission* submission,
                          DispatchCounters counters, const std::string& fallback_reason,
                          std::string* error) {
   if (!ensure_bucket_pipelines(device, error)) return false;
   const Pipelines& pipelines = cached_pipelines();
-  const auto class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
+  const auto class_count = static_cast<uint32_t>(authorized_node_classes.size());
 
   const size_t authorized_bytes = static_cast<size_t>(class_count) * sizeof(uint32_t);
   const size_t counts_bytes = static_cast<size_t>(class_count) * sizeof(uint32_t);
@@ -453,7 +458,7 @@ bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue
   const size_t selected_bytes = static_cast<size_t>(task_count) * sizeof(uint32_t);
   const size_t flag_bytes = sizeof(uint32_t);
   const size_t indirect_bytes = static_cast<size_t>(class_count) * 3 * sizeof(uint32_t);
-  const size_t params_bytes = 3 * sizeof(uint32_t);
+  const size_t params_bytes = 4 * sizeof(uint32_t);
   const uint64_t temporary_bytes = authorized_bytes + counts_bytes + indices_bytes + selected_bytes +
                                    flag_bytes + indirect_bytes + params_bytes;
 
@@ -470,7 +475,7 @@ bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue
     return false;
   }
 
-  std::memcpy([authorized_buffer contents], plan.authorized_node_classes.data(), authorized_bytes);
+  std::memcpy([authorized_buffer contents], authorized_node_classes.data(), authorized_bytes);
   std::memset([counts_buffer contents], 0, counts_bytes);
   std::memset([indices_buffer contents], 0, indices_bytes);
   std::memset([selected_buffer contents], 0, selected_bytes);
@@ -479,6 +484,7 @@ bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue
   params[0] = task_count;
   params[1] = class_count;
   params[2] = compiler::kTaskRingWordsPerRecord;
+  params[3] = compiler::kTaskRingNodeIndexWord;
 
   id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
   if (command_buffer == nil) {
@@ -565,7 +571,8 @@ bool apply_bucket_select(id<MTLDevice> device, id<MTLCommandQueue> command_queue
 
 const std::vector<uint32_t>& last_selected_node_classes() { return g_last_selected_classes; }
 
-bool apply_select(const MetalSelectContext& metal, uint32_t task_count, const hal::ExecutionPlan& plan,
+bool apply_select(const MetalSelectContext& metal, uint32_t task_count,
+                  const std::vector<uint32_t>& authorized_node_classes,
                   hal::Submission* submission, DispatchCounters counters, std::string* error) {
   g_last_selected_classes.clear();
   auto device = static_cast<id<MTLDevice>>(metal.device);
@@ -575,25 +582,23 @@ bool apply_select(const MetalSelectContext& metal, uint32_t task_count, const ha
     if (error) *error = "Metal Tier2 select is missing a device, queue, or fields buffer";
     return false;
   }
-  if (!plan.request_tier2_select) {
-    if (error) *error = "Metal Tier2 select invoked without request_tier2_select";
-    return false;
-  }
-  const auto class_count = static_cast<uint32_t>(plan.authorized_node_classes.size());
+  const auto class_count = static_cast<uint32_t>(authorized_node_classes.size());
   if (class_count < 2 || class_count > kMaxAuthorizedClasses || task_count == 0) {
     if (error) *error = "Metal Tier2 select requires 2..16 authorized classes and a non-empty task graph";
     return false;
   }
 
   std::string icb_error;
-  const IcbAttempt icb = apply_icb_select(device, command_queue, fields_buffer, task_count, plan,
+  const IcbAttempt icb = apply_icb_select(device, command_queue, fields_buffer, task_count,
+                                          authorized_node_classes,
                                           submission, counters, &icb_error);
   if (icb == IcbAttempt::Ok) return true;
   if (icb == IcbAttempt::Unauthorized) {
     if (error) *error = icb_error;
     return false;
   }
-  return apply_bucket_select(device, command_queue, fields_buffer, task_count, plan, submission,
+  return apply_bucket_select(device, command_queue, fields_buffer, task_count,
+                             authorized_node_classes, submission,
                              counters, icb_error, error);
 }
 
@@ -621,13 +626,11 @@ bool run_select_test_harness(const std::vector<uint32_t>& task_node_classes,
   auto* words = static_cast<uint32_t*>([fields contents]);
   std::memset(words, 0, static_cast<size_t>(count) * compiler::kTaskRingWordsPerRecord * sizeof(uint32_t));
   for (uint32_t i = 0; i < count; ++i)
-    words[static_cast<size_t>(i) * compiler::kTaskRingWordsPerRecord] = task_node_classes[i];
-  hal::ExecutionPlan request;
-  request.request_tier2_select = true;
-  request.authorized_node_classes = authorized_node_classes;
+    words[static_cast<size_t>(i) * compiler::kTaskRingWordsPerRecord +
+          compiler::kTaskRingNodeIndexWord] = task_node_classes[i];
   const bool selected = apply_select({.device = static_cast<void*>(device), .command_queue = static_cast<void*>(queue),
                                       .fields_buffer = static_cast<void*>(fields)},
-                                     count, request, submission, {}, error);
+                                     count, authorized_node_classes, submission, {}, error);
   if (selected) submission->result.ok = true;
   return selected;
 }

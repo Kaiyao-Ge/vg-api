@@ -21,6 +21,18 @@ struct AssembledPlanFixture {
   core::NodeTable::Ref node;
 };
 
+// Multi-Node counterpart used by plan-driven conformance tests.  Each module
+// owns one immutable CodeObject/Node and each task names the Node at the same
+// position.  This deliberately cannot express an out-of-band list of backend
+// passes: the only ordering input is the real TaskGraph dependency set.
+struct MultiNodePlanFixture {
+  core::NodeTable nodes;
+  core::ExecutionEnvelope envelope;
+  core::TaskGraph graph;
+  std::vector<std::shared_ptr<const core::CodeObject>> code_objects;
+  std::vector<core::NodeTable::Ref> node_refs;
+};
+
 // Keep the test vocabulary intentionally typed.  This is a compact mirror of
 // the existing semantic assembly inputs, rather than an untyped options bag
 // which could accidentally become a second plan-construction API.
@@ -34,10 +46,6 @@ struct AssemblyOptions {
   const core::EnvelopeOverflow* pending_overflow{};
   const std::vector<std::pair<uint32_t, uint32_t>>* dependencies{};
   uint64_t graph_epoch{};
-  bool request_tier1_indirect{};
-  bool request_indexed_binding{};
-  const std::vector<ir::Module>* effect_dag_passes{};
-  const std::vector<std::pair<uint32_t, uint32_t>>* effect_dag_dependencies{};
   const std::vector<core::RepresentationRequest>* representation_requests{};
   const core::FacetPool* facet_pool{};
   std::optional<core::AccessCertificateMode> certificate_mode;
@@ -96,10 +104,6 @@ inline bool assemble_single_node_plan(core::Arena& arena, ir::Module module,
   core::ExecutionPlanAssemblerInputs inputs{&fixture->graph, &fixture->nodes, &fixture->envelope,
                                               &arena, options.certificate, options.access_certificate,
                                               options.discovery_witness, options.graph_epoch};
-  inputs.request_tier1_indirect = options.request_tier1_indirect;
-  inputs.request_indexed_binding = options.request_indexed_binding;
-  inputs.effect_dag_passes = options.effect_dag_passes;
-  inputs.effect_dag_dependencies = options.effect_dag_dependencies;
   inputs.representation_requests = options.representation_requests;
   if (options.representation_requests != nullptr && options.facet_pool == nullptr) {
     if (error) *error = "representation fixture assembly requires the submitting DeviceHAL FacetPool";
@@ -110,6 +114,51 @@ inline bool assemble_single_node_plan(core::Arena& arena, ir::Module module,
   inputs.working_set_budget = options.working_set_budget;
   inputs.working_set_lease = options.working_set_lease;
   inputs.pending_overflow = options.pending_overflow;
+  return core::ExecutionPlanAssembler::assemble(inputs, out, error);
+}
+
+inline bool assemble_multi_node_plan(core::Arena& arena, std::vector<ir::Module> modules,
+                                     std::vector<core::TaskRecord> tasks,
+                                     const std::vector<std::pair<uint32_t, uint32_t>>& dependencies,
+                                     MultiNodePlanFixture* fixture, core::ExecutionPlan* out,
+                                     std::string* error = nullptr) {
+  if (fixture == nullptr || out == nullptr || modules.empty() || modules.size() != tasks.size()) {
+    if (error) *error = "multi-Node fixture requires one module per task, fixture, and output";
+    return false;
+  }
+  fixture->code_objects.clear();
+  fixture->node_refs.clear();
+  fixture->code_objects.reserve(modules.size());
+  fixture->node_refs.reserve(modules.size());
+  core::TaskGraphBuilder builder;
+  for (size_t index = 0; index < modules.size(); ++index) {
+    auto& module = modules[index];
+    const std::string canonical = ir::serialize_module(module);
+    module.canonical_json = canonical;
+    module.hash = ir::sha256_hex(canonical);
+    auto object = std::make_shared<core::CodeObject>();
+    object->module = std::move(module);
+    const auto node = fixture->nodes.create(object, "test-node-" + std::to_string(index));
+    fixture->code_objects.push_back(std::move(object));
+    fixture->node_refs.push_back(node);
+    tasks[index].node_index = node.index;
+    tasks[index].node_generation = node.generation;
+    if (!builder.append(tasks[index])) {
+      if (error) *error = "multi-Node fixture could not append task";
+      return false;
+    }
+  }
+  for (const auto& [before, after] : dependencies) {
+    if (!builder.add_dependency(before, after)) {
+      if (error) *error = "multi-Node fixture could not add explicit task dependency";
+      return false;
+    }
+  }
+  if (!builder.seal(&fixture->graph, error) || !fixture->graph.publish()) return false;
+  fixture->envelope = {};
+  fixture->envelope.allowed_nodes = fixture->node_refs;
+  core::ExecutionPlanAssemblerInputs inputs{&fixture->graph, &fixture->nodes, &fixture->envelope,
+                                             &arena, nullptr, nullptr, nullptr, 0};
   return core::ExecutionPlanAssembler::assemble(inputs, out, error);
 }
 
@@ -137,8 +186,8 @@ inline bool assemble_single_user_raster_plan(
   for (auto task : task_templates) {
     task.node_index = fixture->node.index;
     task.node_generation = fixture->node.generation;
-    if (!builder.append(task)) {
-      if (error) *error = "test fixture could not append raster task";
+    if (!builder.append(task, error)) {
+      if (error && error->empty()) *error = "test fixture could not append raster task";
       return false;
     }
   }
@@ -165,10 +214,6 @@ inline bool assemble_single_user_raster_plan(
   core::ExecutionPlanAssemblerInputs inputs{&fixture->graph, &fixture->nodes, &fixture->envelope,
                                               &arena, options.certificate, options.access_certificate,
                                               options.discovery_witness, options.graph_epoch};
-  inputs.request_tier1_indirect = options.request_tier1_indirect;
-  inputs.request_indexed_binding = options.request_indexed_binding;
-  inputs.effect_dag_passes = options.effect_dag_passes;
-  inputs.effect_dag_dependencies = options.effect_dag_dependencies;
   inputs.representation_requests = options.representation_requests;
   if (options.representation_requests != nullptr && options.facet_pool == nullptr) {
     if (error) *error = "representation fixture assembly requires the submitting DeviceHAL FacetPool";

@@ -15,7 +15,6 @@
 
 namespace vg::core {
 
-class ExecutionPlan;
 
 enum class ObjectState { Active, Retired };
 enum class PoisonState { Valid, PartiallyProduced, Poisoned };
@@ -1002,9 +1001,6 @@ class ExecutionEnvelope {
   uint32_t task_quota{};
   uint64_t timeline_wait{};
   uint64_t timeline_signal{};
-
-  // Splices this envelope's fields into the core-owned plan ahead of Stage 6.
-  void apply_to(ExecutionPlan& plan) const;
 };
 
 }  // namespace vg::core

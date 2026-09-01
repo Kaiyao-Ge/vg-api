@@ -67,7 +67,7 @@ void build_chain(vg::core::Arena& arena, vg::ir::Module* module, vg::core::Point
 
 bool assemble_discovery_plan(vg::core::Arena& arena, const vg::ir::Module& module,
                              vg::core::PointerRef seed, vg::test_support::AssembledPlanFixture* fixture,
-                             vg::hal::ExecutionPlan* plan, std::string* error,
+                             vg::core::ExecutionPlan* plan, std::string* error,
                              const vg::core::WorkingSetLease* lease = nullptr) {
   const std::vector<vg::core::PointerRef> seeds{seed};
   vg::test_support::AssemblyOptions options;
@@ -144,7 +144,7 @@ int main() {
     build_chain(arena, &module, &seed);
     const size_t universe = active_count(arena);
 
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     vg::test_support::AssembledPlanFixture fixture;
     std::string error;
     if (!assemble_discovery_plan(arena, module, seed, &fixture, &plan, &error)) {
@@ -177,7 +177,7 @@ int main() {
     build_chain(arena, &module, &seed);
     const size_t universe = active_count(arena);
 
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     vg::test_support::AssembledPlanFixture fixture;
     std::string error;
     if (!assemble_discovery_plan(arena, module, seed, &fixture, &plan, &error)) {
@@ -240,7 +240,7 @@ int main() {
     vg::core::WorkingSetLease forged;
     forged.allocations.push_back(extra);
     forged.complete = true;
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     vg::test_support::AssembledPlanFixture fixture;
     if (assemble_discovery_plan(arena, module, seed, &fixture, &plan, &error, &forged)) {
       std::cerr << "discovery: forged witness lease was accepted by the core assembler\n";

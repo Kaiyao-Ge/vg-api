@@ -105,10 +105,12 @@ int main() {
   task.depth_compare_op = vg::core::DepthCompareOp::Less;
   task.raster_filter = vg::core::FilterMode::Nearest;
   task.raster_wrap = vg::core::WrapMode::Clamp;
-  vg::hal::ExecutionPlan plan;
+  vg::core::ExecutionPlan plan;
   vg::test_support::AssembledPlanFixture fixture;
+  vg::test_support::AssemblyOptions options;
+  options.facet_pool = &device->facet_pool();
   if (!vg::test_support::assemble_single_node_plan(arena, make_probe_module(arena), {task},
-                                                    &fixture, &plan, &error)) {
+                                                    &fixture, &plan, &error, options)) {
     std::cerr << "identity-scene-root-cache: assembly failed: " << error << "\n";
     return 1;
   }

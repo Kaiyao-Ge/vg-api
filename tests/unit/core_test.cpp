@@ -220,28 +220,25 @@ int main() {
     auto reference_device = vg::reference::make_device_hal();
 
     // ExecutionPlan::validate(): published==true with a sealed-but-unpublished
-    // task_graph must be rejected, not silently accepted.
-    vg::hal::ExecutionPlan bad_plan;
-    bad_plan.module = compiled_module.module;
+    // task_graph cannot bypass the canonical assembler.
+    vg::core::ExecutionPlan bad_plan;
     bad_plan.task_graph = sealed_unpublished;
     bad_plan.published = true;
     std::string plan_error;
     assert(!bad_plan.validate(&plan_error));
-    assert(plan_error == "task graph must be published before execution");
+    assert(plan_error == "execution plan must be produced by the canonical core assembler");
 
     // A genuinely sealed+published task graph passes the same cross-check.
     vg::core::TaskGraph published_graph = sealed_unpublished;
     assert(published_graph.publish());
-    vg::hal::ExecutionPlan good_plan;
-    good_plan.module = compiled_module.module;
+    vg::core::ExecutionPlan good_plan;
     good_plan.task_graph = published_graph;
     good_plan.graph_epoch = task_arena.topology_epoch();
     good_plan.published = true;
-    assert(good_plan.validate(&plan_error));
 
     // graph_epoch_matches(): empty task_graph is exempt regardless of epoch;
     // a non-empty task_graph must match the live arena's topology_epoch.
-    vg::hal::ExecutionPlan empty_task_plan;
+    vg::core::ExecutionPlan empty_task_plan;
     empty_task_plan.graph_epoch = 12345;
     assert(empty_task_plan.graph_epoch_matches(task_arena));
     assert(good_plan.graph_epoch_matches(task_arena));
@@ -267,7 +264,7 @@ int main() {
     module_copy.canonical_json = vg::ir::serialize_module(module_copy);
 
     vg::test_support::AssembledPlanFixture fresh_fixture;
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     std::string submit_error;
     vg::test_support::AssemblyOptions fresh_options;
     fresh_options.timeline_signal = 5;
@@ -291,7 +288,7 @@ int main() {
     // Next submission's wait is satisfied by the prior signal (real device
     // timeline state, not a plan-local passthrough).
     vg::test_support::AssembledPlanFixture waiting_fixture;
-    vg::hal::ExecutionPlan waiting_plan;
+    vg::core::ExecutionPlan waiting_plan;
     vg::test_support::AssemblyOptions waiting_options;
     waiting_options.timeline_wait = 5;
     waiting_options.timeline_signal = 10;
@@ -309,7 +306,7 @@ int main() {
     // matching the Metal/Vulkan convention that submit() reports host-side
     // acceptance, while submission.result.ok reports execution outcome).
     vg::test_support::AssembledPlanFixture stuck_fixture;
-    vg::hal::ExecutionPlan stuck_plan;
+    vg::core::ExecutionPlan stuck_plan;
     vg::test_support::AssemblyOptions stuck_options;
     stuck_options.timeline_wait = 999;
     stuck_options.timeline_signal = 1000;
@@ -386,7 +383,7 @@ int main() {
     cert_module.module.canonical_json = vg::ir::serialize_module(cert_module.module);
 
     vg::test_support::AssembledPlanFixture cert_fixture;
-    vg::hal::ExecutionPlan cert_plan;
+    vg::core::ExecutionPlan cert_plan;
     std::string device_error;
     vg::test_support::AssemblyOptions cert_options;
     cert_options.certificate_mode = vg::core::AccessCertificateMode::CertifiedPinned;
@@ -406,7 +403,7 @@ int main() {
     assert(cert_submission.access_certificate->epoch.references().size() == 1);
 
     vg::test_support::AssembledPlanFixture unsupported_fixture;
-    vg::hal::ExecutionPlan unsupported_plan;
+    vg::core::ExecutionPlan unsupported_plan;
     cert_options.certificate_mode = vg::core::AccessCertificateMode::SoftwarePaged;
     std::string unsupported_error;
     assert(!vg::test_support::assemble_single_node_plan(
@@ -841,7 +838,7 @@ int main() {
     view.allocation_generation = generation;
     view.width = 2;
     view.height = 2;
-    vg::hal::RepresentationRequest request;
+    vg::core::RepresentationRequest request;
     request.view = view;
     request.target_kind = vg::core::FacetKind::Sample;
     request.consume_input = true;
@@ -933,7 +930,7 @@ int main() {
     std::string hold_error;
     assert(pool.acquire(hold_arena, view, vg::core::FacetKind::Sample, &live, &hold_error));
     assert(pool.references(vg::core::RepresentationRef{backing.id, backing.generation, epoch_before}));
-    vg::hal::RepresentationRequest request;
+    vg::core::RepresentationRequest request;
     request.view = view;
     request.target_kind = vg::core::FacetKind::Sample;
     request.consume_input = true;
@@ -1130,7 +1127,7 @@ int main() {
     stage_view.height = 4;
     assert(stage_view.byte_size() == 64);
 
-    vg::hal::RepresentationRequest request;
+    vg::core::RepresentationRequest request;
     request.view = stage_view;
     request.target_kind = vg::core::FacetKind::Sample;
 
@@ -1139,7 +1136,7 @@ int main() {
     vg::test_support::AssemblyOptions stage_options;
     stage_options.representation_requests = &stage_requests;
     stage_options.facet_pool = &stage_device->facet_pool();
-    vg::hal::ExecutionPlan stage_plan;
+    vg::core::ExecutionPlan stage_plan;
     std::string stage_error;
     assert(vg::test_support::assemble_single_node_plan(
         stage_arena, stage_module.module,
@@ -1148,7 +1145,6 @@ int main() {
 
     vg::hal::CompiledPlan stage_compiled;
     assert(stage_device->compile(stage_plan, &stage_compiled, &stage_error));
-    assert(stage_compiled.representation_supported);
     assert(stage_compiled.report.supported);
 
     vg::hal::Submission stage_submission;
@@ -1180,9 +1176,8 @@ int main() {
     // its honest Stage-6 identity/ConsumeInput Unsupported result.
     assert(stage_device->facet_pool().retire(stage_facet, &stage_error));
 
-    // ConsumeInput: rejected at compile(), with representation_supported
-    // false, an Unsupported lowering event and a reason -- never accepted and
-    // quietly not performed.
+    // ConsumeInput: rejected at compile() with an Unsupported lowering event
+    // and a reason -- never accepted and quietly not performed.
     auto consume_request = request;
     consume_request.consume_input = true;
     consume_request.consume_proof = discharged;
@@ -1191,7 +1186,7 @@ int main() {
     vg::test_support::AssemblyOptions consume_options;
     consume_options.representation_requests = &consume_requests;
     consume_options.facet_pool = &stage_device->facet_pool();
-    vg::hal::ExecutionPlan consume_plan;
+    vg::core::ExecutionPlan consume_plan;
     assert(vg::test_support::assemble_single_node_plan(
         stage_arena, stage_module.module,
         {vg::test_support::compute_task(stage_id, stage_generation)},
@@ -1199,7 +1194,6 @@ int main() {
     vg::hal::CompiledPlan consume_compiled;
     std::string consume_error;
     assert(!stage_device->compile(consume_plan, &consume_compiled, &consume_error));
-    assert(!consume_compiled.representation_supported);
     assert(!consume_compiled.report.supported);
     assert(consume_compiled.report.count(vg::hal::LoweringClass::Unsupported) >= 1);
     assert(consume_error.find("ConsumeInput is not available on the reference backend") == 0);
@@ -1218,7 +1212,7 @@ int main() {
     vg::test_support::AssemblyOptions unproven_options;
     unproven_options.representation_requests = &unproven_requests;
     unproven_options.facet_pool = &stage_device->facet_pool();
-    vg::hal::ExecutionPlan unproven_plan;
+    vg::core::ExecutionPlan unproven_plan;
     vg::hal::CompiledPlan unproven_compiled;
     std::string unproven_error;
     assert(!vg::test_support::assemble_single_node_plan(
@@ -1236,7 +1230,7 @@ int main() {
     vg::test_support::AssemblyOptions address_options;
     address_options.representation_requests = &address_requests;
     address_options.facet_pool = &stage_device->facet_pool();
-    vg::hal::ExecutionPlan address_plan;
+    vg::core::ExecutionPlan address_plan;
     vg::hal::CompiledPlan address_compiled;
     std::string address_error;
     assert(!vg::test_support::assemble_single_node_plan(
@@ -1252,7 +1246,7 @@ int main() {
     vg::test_support::AssemblyOptions racing_options;
     racing_options.representation_requests = &racing_requests;
     racing_options.facet_pool = &stage_device->facet_pool();
-    vg::hal::ExecutionPlan racing_plan;
+    vg::core::ExecutionPlan racing_plan;
     vg::hal::CompiledPlan racing_compiled;
     std::string racing_error;
     assert(!vg::test_support::assemble_single_node_plan(
@@ -1264,7 +1258,7 @@ int main() {
     // A plan carrying no request runs no Stage 5 at all, so a caller that
     // never asked cannot be handed a half-filled epoch.
     vg::test_support::AssembledPlanFixture plain_fixture;
-    vg::hal::ExecutionPlan plain_plan;
+    vg::core::ExecutionPlan plain_plan;
     assert(vg::test_support::assemble_single_node_plan(
         stage_arena, stage_module.module,
         {vg::test_support::compute_task(stage_id, stage_generation)},
@@ -1296,7 +1290,7 @@ int main() {
     stale_module.module.declared_effects[0].representation_epoch = 0;
     stale_module.module.canonical_json = vg::ir::serialize_module(stale_module.module);
 
-    vg::hal::RepresentationRequest stale_request;
+    vg::core::RepresentationRequest stale_request;
     stale_request.view = stage_view;
     stale_request.view.allocation = stale_backing.id;
     stale_request.view.allocation_generation = stale_backing.generation;
@@ -1307,7 +1301,7 @@ int main() {
     vg::test_support::AssemblyOptions stale_options;
     stale_options.representation_requests = &stale_requests;
     stale_options.facet_pool = &stage_device->facet_pool();
-    vg::hal::ExecutionPlan stale_plan;
+    vg::core::ExecutionPlan stale_plan;
     assert(vg::test_support::assemble_single_node_plan(
         stale_arena, stale_module.module,
         {vg::test_support::compute_task(stale_backing.id, stale_backing.generation)},
@@ -1392,36 +1386,18 @@ int main() {
     assert(deferred.valid());
     assert(deferred.continued());
 
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     assert(!plan.working_set_budget.has_value());
     assert(!plan.working_set_lease.has_value());
     assert(!plan.pending_overflow.has_value());
     vg::hal::Submission submission;
     assert(!submission.envelope_overflow.has_value());
 
-    auto ref_device = vg::reference::make_device_hal();
-    assert(ref_device != nullptr);
-    auto compiled = vg::compiler::compile_c_like("@node @effects store(1,0,4,7)");
-    assert(compiled.ok);
-    plan.module = compiled.module;
-    plan.published = true;
-    assert(plan.validate());
-
-    plan.working_set_budget = vg::core::WorkingSetBudget::limited(16);
-    plan.working_set_lease = vg::core::WorkingSetLease{};
-    plan.working_set_lease->byte_limit = 32;
+    const auto limited = vg::core::WorkingSetBudget::limited(16);
     std::string plan_error;
-    assert(!plan.validate(&plan_error));
-    assert(plan_error == "working-set lease exceeds the plan's working-set budget");
-    plan.working_set_lease->byte_limit = 16;
-    assert(plan.validate());
-
-    plan.pending_overflow = rejected;
-    assert(!plan.validate(&plan_error));
-    assert(plan_error == "a rejected overflow cannot be marked continued");
-    rejected.continuation_token = 0;
-    plan.pending_overflow = rejected;
-    assert(plan.validate());
+    assert(!limited.allows(32, &plan_error));
+    assert(plan_error == "working-set budget exceeded");
+    assert(limited.allows(16));
   }
 
   {

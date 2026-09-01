@@ -4,6 +4,7 @@
 #include "backends/reference/tier2_oracle.h"
 #include "core/scene_root.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -34,8 +35,8 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         static_cast<uint64_t>(hal::Capability::RepresentationTransform) |
         static_cast<uint64_t>(hal::Capability::CheckedFacetGeneration) |
         // F3 (ADR-043 Decision #4): this backend accepts an
-        // ExecutionPlan::user_raster_shader submission (compile()/submit()
-        // below), but only against its declared effect contract -- it never
+        // per-Node user raster contract (compile()/submit() below), but only
+        // against its declared effect contract -- it never
         // interprets the supplied MSL text, applying its own fixed C++
         // shading instead and disclosing that as HostAssisted.
         static_cast<uint64_t>(hal::Capability::UserShaderImport);
@@ -48,23 +49,16 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
 
   [[nodiscard]] const hal::CapabilitySnapshot& capabilities() const override { return capabilities_; }
 
-  bool compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
+  bool compile(const core::ExecutionPlan& plan, hal::CompiledPlan* compiled,
                std::string* error) override {
     if (compiled == nullptr) { if (error) *error = "compiled plan output is required"; return false; }
+    *compiled = {};
     if (!plan.validate(error)) return false;
     if (!hal::preflight_stage6(plan, capabilities_, hal::BackendKind::Reference, compiled, error)) return false;
-    // Transitional adapter-local bridge for the old single-program paths.
-    // The sealed core plan itself deliberately has no graph-wide module.
-    hal::ExecutionPlan adapter_plan = plan;
-    if (plan.assembled && plan.resolved_nodes.size() == 1) {
-      const auto& node = plan.resolved_nodes.front();
-      if (node.module) adapter_plan.module = *node.module;
-      else adapter_plan.user_raster_shader = node.user_raster_shader;
-    }
     if (plan.requested_certificate_mode == core::AccessCertificateMode::SoftwarePaged ||
         plan.requested_certificate_mode == core::AccessCertificateMode::FaultManaged) {
       compiled->abi_version = hal::kDeviceHalAbiVersion;
-      compiled->plan = adapter_plan;
+      compiled->plan = plan;
       compiled->report = {};
       compiled->report.backend = hal::BackendKind::Reference;
       compiled->report.supported = false;
@@ -73,59 +67,60 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       if (error) *error = compiled->report.diagnostic;
       return false;
     }
-    const bool node_aware_compute = !plan.resolved_nodes.empty() && !plan.task_graph.tasks().empty() &&
-                                    std::ranges::all_of(plan.task_graph.tasks(), [](const auto& task) {
-                                      return task.kind == core::TaskKind::Compute;
-                                    });
-    if (node_aware_compute && std::ranges::any_of(plan.resolved_nodes, [](const auto& node) {
-          return !node.module.has_value();
-        })) {
-      if (error) *error = "reference per-Node lowering currently supports canonical compute nodes only";
-      return false;
-    }
-    if (adapter_plan.user_raster_shader.has_value()) {
-      // F3 (ADR-043 Decision #4): plan.module is default/empty in this mode
-      // (vg_api_execution.cpp's submit() leaves it unset when the code
-      // object is vg.msl.raster/v1), so building a compute package from it
-      // would be meaningless -- skip straight to the disclosure event below.
-      // HostAssisted, not Direct: this backend accepts the caller's declared
-      // root_schema/entry points but never interprets the supplied MSL text;
-      // submit() below still runs its own fixed C++ shading regardless of
-      // what that MSL says (unlike Metal, which really compiles and runs it).
-      compiled->abi_version = hal::kDeviceHalAbiVersion;
-      compiled->plan = adapter_plan;
-      compiled->report = {};
-      compiled->report.backend = hal::BackendKind::Reference;
-      compiled->report.supported = true;
-      compiled->report.add("raster_user_shader", hal::LoweringClass::HostAssisted, 1,
-                           adapter_plan.user_raster_shader->source.size(),
-                           "caller-declared effect contract accepted; shader logic not independently verified; "
-                           "reference backend applies fixed C++ shading regardless of supplied MSL text");
-    } else if (node_aware_compute) {
-      compiled->abi_version = hal::kDeviceHalAbiVersion;
-      compiled->plan = adapter_plan;
-      compiled->report = {};
-      compiled->report.backend = hal::BackendKind::Reference;
-      compiled->report.supported = true;
-      for (const auto& node : plan.resolved_nodes) {
-        const auto package = compiler::build_linear_compute_package(*node.module);
-        if (!package.ok) { if (error) *error = package.message; return false; }
-        compiled->node_compute_packages.emplace_back(node.ref, package.package);
+    compiled->abi_version = hal::kDeviceHalAbiVersion;
+    compiled->plan = plan;
+    compiled->report = {};
+    compiled->report.backend = hal::BackendKind::Reference;
+    compiled->report.supported = true;
+    for (const auto& node : plan.resolved_nodes) {
+      hal::CompiledPlan::PerNodePackage per_node;
+      per_node.ref = node.ref;
+      const auto task = std::ranges::find_if(plan.task_graph.tasks(), [&](const auto& candidate) {
+        return candidate.node_index == node.ref.index &&
+               candidate.node_generation == node.ref.generation;
+      });
+      if (task == plan.task_graph.tasks().end()) {
+        if (error) *error = "reference lowering found a resolved Node with no Task";
+        return false;
+      }
+      if (task->kind == core::TaskKind::Raster) {
+        per_node.kind = hal::CompiledPlan::NodePackageKind::Raster;
+        if (node.user_raster_shader.has_value()) {
+          per_node.host_assisted = true;
+          compiled->report.add("raster_user_shader", hal::LoweringClass::HostAssisted, 1,
+                               node.user_raster_shader->source.size(),
+                               "caller-declared effect contract accepted; shader logic not independently verified; "
+                               "reference backend applies fixed C++ shading regardless of supplied MSL text");
+        } else {
+          compiled->report.add("node_raster_package", hal::LoweringClass::Direct, 1, 0,
+                               "canonical NodeRef materialized as the built-in reference raster contract");
+        }
+      } else if (node.module.has_value()) {
+        const bool pointer_graph = std::ranges::any_of(node.module->instructions,
+            [](const ir::Instruction& instruction) {
+              return instruction.op == "load_ref" || instruction.op == "load_via" ||
+                     instruction.op == "store_via";
+            });
+        const auto package = pointer_graph
+            ? compiler::build_pointer_graph_compute_package(*node.module)
+            : compiler::build_linear_compute_package(*node.module);
+        if (!package.ok) {
+          compiled->report.supported = false;
+          compiled->report.diagnostic = "reference per-Node package compilation failed: " + package.message;
+          compiled->report.add("node_compute_package", hal::LoweringClass::Unsupported,
+                               1, 0, compiled->report.diagnostic);
+          if (error) *error = compiled->report.diagnostic;
+          return false;
+        }
+        per_node.kind = hal::CompiledPlan::NodePackageKind::CanonicalCompute;
+        per_node.package = package.package;
         compiled->report.add("node_compute_package", hal::LoweringClass::Direct, 1,
                              package.package.bindings.size(), "reference per-Node compute package");
+      } else {
+        if (error) *error = "reference lowering found a resolved Node without a program";
+        return false;
       }
-    } else {
-      const auto package = compiler::build_linear_compute_package(adapter_plan.module);
-      if (!package.ok) { if (error) *error = package.message; return false; }
-      compiled->abi_version = hal::kDeviceHalAbiVersion;
-      compiled->plan = adapter_plan;
-      compiled->compute_package = package.package;
-      compiled->report = {};
-      compiled->report.backend = hal::BackendKind::Reference;
-      compiled->report.supported = true;
-      compiled->report.add("canonical_ir", hal::LoweringClass::Direct, 1, adapter_plan.module.instructions.size(), "reference interpreter");
-      compiled->report.add("compute_package", hal::LoweringClass::Direct, 1, package.package.bindings.size(), "shared B4 linear package");
-      compiled->report.add("linear_access", hal::LoweringClass::Direct, adapter_plan.module.instructions.size(), 0, "checked arena access");
+      compiled->per_node_packages.push_back(std::move(per_node));
     }
     if (!plan.task_graph.tasks().empty()) compiled->report.add("task_publication", hal::LoweringClass::Direct, plan.task_graph.tasks().size(), 0, "immutable task graph");
     if (plan.timeline_signal != 0) compiled->report.add("timeline", hal::LoweringClass::Direct, 1, 0, "reference monotonic timeline");
@@ -152,7 +147,6 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       // than accepted and quietly not performed (START.md §4, invariant 10);
       // E005's watermark comparison is a Metal measurement for the same reason.
       if (request.consume_input) {
-        compiled->representation_supported = false;
         compiled->report.supported = false;
         compiled->report.diagnostic =
             "ConsumeInput is not available on the reference backend: its representation transform is "
@@ -169,17 +163,62 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
   bool submit(const hal::CompiledPlan& compiled, core::Arena& arena,
               hal::Submission* submission, std::string* error) override {
     if (submission == nullptr) { if (error) *error = "submission output is required"; return false; }
+    // Stage 7 consumes an immutable Stage-6 artifact.  Reject an ABI/backend
+    // mismatch before reading its report, plan, or per-Node packages.
+    if (!hal::validate_stage7_compiled_plan(compiled, hal::BackendKind::Reference, error)) return false;
     if (!compiled.report.supported) { if (error) *error = "compiled plan is unsupported"; return false; }
+    if (!compiled.plan.validate(error)) return false;
+    if (compiled.per_node_packages.size() != compiled.plan.resolved_nodes.size()) {
+      if (error) *error = "compiled plan does not contain exactly one package per resolved NodeRef";
+      return false;
+    }
+    for (const auto& node : compiled.plan.resolved_nodes) {
+      const size_t matches = std::count_if(compiled.per_node_packages.begin(),
+                                           compiled.per_node_packages.end(), [&](const auto& package) {
+        return package.ref.index == node.ref.index && package.ref.generation == node.ref.generation;
+      });
+      if (matches != 1) {
+        if (error) *error = "compiled plan contains a duplicate or missing NodeRef package";
+        return false;
+      }
+      const auto package = std::ranges::find_if(compiled.per_node_packages, [&](const auto& candidate) {
+        return candidate.ref.index == node.ref.index && candidate.ref.generation == node.ref.generation;
+      });
+      const auto task = std::ranges::find_if(compiled.plan.task_graph.tasks(), [&](const auto& candidate) {
+        return candidate.node_index == node.ref.index && candidate.node_generation == node.ref.generation;
+      });
+      const bool raster = task != compiled.plan.task_graph.tasks().end() &&
+                          task->kind == core::TaskKind::Raster;
+      if (package == compiled.per_node_packages.end() ||
+          (raster && (package->kind != hal::CompiledPlan::NodePackageKind::Raster ||
+                      package->package.has_value())) ||
+          (!raster && (package->kind != hal::CompiledPlan::NodePackageKind::CanonicalCompute ||
+                       !package->package.has_value()))) {
+        if (error) *error = "compiled NodeRef package kind disagrees with the sealed Task domain";
+        return false;
+      }
+      // Package identity is a Stage-7 admission condition, not a per-Task
+      // runtime check: a tampered package must not allow an earlier Task to
+      // write output before a later Task discovers it.
+      if (!raster &&
+          (package->package->canonical_ir_hash != node.module->hash ||
+           package->package->root_schema != node.module->root_schema)) {
+        if (error) *error = "compiled per-Node package disagrees with the resolved immutable module";
+        return false;
+      }
+    }
     if (!compiled.plan.graph_epoch_matches(arena, error)) return false;
     submission->abi_version = hal::kDeviceHalAbiVersion;
     submission->report = compiled.report;
-    // TASK-D2 / ADR-036: DiscoverThenLease walk when seeds are set (02 §7.2).
-    // Empty seeds leave the B-era full-arena scan below unchanged.
+    // TASK-D2 / ADR-036: record the core-sealed discovery/access operation;
+    // this backend does not rescan the Arena to derive another touched set.
     if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
     // TASK-D3 / ADR-037: this-submit residency is not the address graph.
     // A set working_set_budget that the requested bytes exceed is a hard
     // refuse -- never a silent clamp, and never "unified memory is infinite".
     if (!hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
+    hal::SubmissionLifetimeHold lifetime_hold;
+    if (!lifetime_hold.prepare(compiled.plan, arena, facet_pool(), error)) return false;
     // Stage 5 precedes Stage 6/7 (03 §7), and runs outside the cpu_submit_ns
     // window below so that counter keeps meaning exactly the interpreter's own
     // wall clock. The physical step reports what this backend can actually
@@ -200,70 +239,116 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       if (error) *error = representation_error;
       return false;
     }
+    if (!lifetime_hold.acquire(submission->representation_facets, error)) return false;
     // TASK-B12: this backend has no encoder/command-buffer/barrier concept
     // (it's a plain CPU interpreter), so those counters honestly stay 0;
     // cpu_submit_ns is the real wall-clock time of the interpreter run(s)
     // below, and cpu_encode_ns stays 0 since there is no separate encode
     // phase to distinguish it from.
     const auto submit_start = std::chrono::steady_clock::now();
-    const bool node_aware_compute = !compiled.plan.resolved_nodes.empty() &&
-                                    !compiled.plan.task_graph.tasks().empty() &&
-                                    std::ranges::all_of(compiled.plan.task_graph.tasks(), [](const auto& task) {
-                                      return task.kind == core::TaskKind::Compute;
-                                    });
-    if (node_aware_compute) {
-      submission->result = core::ExecutionResult{};
-      submission->result.ok = true;
-      const auto& tasks = compiled.plan.task_graph.tasks();
-      std::vector<uint32_t> task_order;
-      std::string order_error;
-      if (!compiled.plan.task_graph.deterministic_order(&task_order, &order_error)) {
+    submission->result = core::ExecutionResult{};
+    submission->result.ok = true;
+    const auto& tasks = compiled.plan.task_graph.tasks();
+    const bool raster_only = std::ranges::all_of(tasks, [](const auto& task) {
+      return task.kind == core::TaskKind::Raster;
+    });
+    if (raster_only && compiled.plan.timeline_wait != 0) {
+      std::string wait_error;
+      if (!timeline_.validate_wait(compiled.plan.timeline_wait, &wait_error)) {
         submission->result.ok = false;
-        submission->result.message = order_error;
-        return true;
+        submission->result.outputs_valid = false;
+        submission->result.poison = core::PoisonState::Poisoned;
+        submission->result.message = wait_error;
+        submission->result.fault.code = "TIMELINE_WAIT_UNSATISFIED";
+        submission->result.fault.message = wait_error;
       }
-      for (size_t order_index = 0; order_index < task_order.size(); ++order_index) {
-        const auto& task = tasks[task_order[order_index]];
+    }
+    const auto record_raster_failure = [&](uint32_t task_index, std::string code,
+                                           std::string message) {
+      auto& result = submission->result;
+      if (code.empty()) code = "RASTER_TASK_FAILED";
+      if (message.empty()) message = "reference raster task failed";
+      result.ok = false;
+      result.outputs_valid = false;
+      result.message = std::move(message);
+      result.fault.task_index = task_index;
+      result.fault.code = std::move(code);
+      result.fault.message = result.message;
+      const bool prior_output = !submission->raster_results.empty() ||
+          std::ranges::any_of(result.trace, [](const ir::Effect& effect) {
+            return effect.access != ir::Access::Read;
+          });
+      result.poison = prior_output ? core::PoisonState::PartiallyProduced
+                                   : core::PoisonState::Poisoned;
+    };
+    for (size_t order_index = 0; order_index < compiled.plan.task_order.size(); ++order_index) {
+        if (!submission->result.ok) break;
+        const auto task_index = compiled.plan.task_order[order_index];
+        const auto& task = tasks[task_index];
         const core::NodeTable::Ref ref{task.node_index, task.node_generation};
         const auto found = std::ranges::find_if(compiled.plan.resolved_nodes, [ref](const auto& node) {
           return node.ref.index == ref.index && node.ref.generation == ref.generation;
         });
-        if (found == compiled.plan.resolved_nodes.end() || !found->module.has_value()) {
+        if (found == compiled.plan.resolved_nodes.end()) {
           submission->result.ok = false;
-          submission->result.message = "reference per-Node execution could not resolve a canonical compute Node";
+          submission->result.message = "reference per-Node execution could not resolve the Task NodeRef";
           break;
         }
-        const auto package = std::ranges::find_if(compiled.node_compute_packages, [ref](const auto& item) {
-          return item.first.index == ref.index && item.first.generation == ref.generation;
+        const auto package = std::ranges::find_if(compiled.per_node_packages, [ref](const auto& item) {
+          return item.ref.index == ref.index && item.ref.generation == ref.generation;
         });
-        if (package == compiled.node_compute_packages.end() ||
-            package->second.canonical_ir_hash != found->module->hash ||
-            package->second.root_schema != found->module->root_schema) {
+        if (package == compiled.per_node_packages.end()) {
           submission->result.ok = false;
-          submission->result.message =
-              "reference per-Node execution package is missing or disagrees with the resolved immutable module";
+          submission->result.message = "reference per-Node execution package is missing";
           break;
         }
-        auto result = execute(*found->module, arena,
-                              compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate,
-                              &timeline_, {.wait = order_index == 0 ? compiled.plan.timeline_wait : 0,
-                                           .signal = order_index + 1 == task_order.size() ? compiled.plan.timeline_signal : 0});
-        if (!result.ok) { submission->result = std::move(result); break; }
-      }
-    } else if (compiled.plan.user_raster_shader.has_value()) {
-      // F3 (ADR-043 Decision #4): compiled.plan.module is default/empty in
-      // this mode, so there is no compute-module work for execute() to run --
-      // calling it would additionally trip its internal ir::verify() rejection
-      // of an empty module. Synthesize the trivial success result the raster
-      // block below expects; the actual raster shading happens there,
-      // unchanged, via raster_triangles().
-      submission->result = core::ExecutionResult{};
-      submission->result.ok = true;
-    } else {
-      submission->result = execute(compiled.plan.module, arena,
-                                   compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate,
-                                   &timeline_, {.wait = compiled.plan.timeline_wait,
-                                                .signal = compiled.plan.timeline_signal});
+        if (task.kind == core::TaskKind::Compute) {
+          if (!found->module.has_value() ||
+              package->kind != hal::CompiledPlan::NodePackageKind::CanonicalCompute) {
+            submission->result.ok = false;
+            submission->result.message = "reference compute Task resolved a non-compute NodeRef package";
+            break;
+          }
+          if (!package->package.has_value() ||
+              package->package->canonical_ir_hash != found->module->hash ||
+              package->package->root_schema != found->module->root_schema) {
+            submission->result.ok = false;
+            submission->result.message =
+                "reference per-Node execution package disagrees with the resolved immutable module";
+            break;
+          }
+          auto result = execute(*found->module, arena,
+                                compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate,
+                                &timeline_, {.wait = order_index == 0 ? compiled.plan.timeline_wait : 0,
+                                             .signal = order_index + 1 == compiled.plan.task_order.size()
+                                                           ? compiled.plan.timeline_signal : 0},
+                                &compiled.plan.task_effects[task_index]);
+          if (!result.ok) {
+            result.fault.task_index = task_index;
+            if (std::ranges::any_of(submission->result.trace, [](const ir::Effect& effect) {
+                  return effect.access != ir::Access::Read;
+                }) && result.poison == core::PoisonState::Poisoned)
+              result.poison = core::PoisonState::PartiallyProduced;
+            result.trace.insert(result.trace.begin(), submission->result.trace.begin(),
+                                submission->result.trace.end());
+            result.missing_effects.insert(result.missing_effects.begin(),
+                                          submission->result.missing_effects.begin(),
+                                          submission->result.missing_effects.end());
+            core::AccessWitness merged;
+            for (const auto& entry : submission->result.witness.entries())
+              merged.record(entry.effect, entry.instruction_index);
+            for (const auto& entry : result.witness.entries())
+              merged.record(entry.effect, entry.instruction_index);
+            result.witness = std::move(merged);
+            submission->result = std::move(result);
+            break;
+          }
+          submission->result.trace.insert(submission->result.trace.end(),
+                                          result.trace.begin(), result.trace.end());
+          for (const auto& entry : result.witness.entries())
+            submission->result.witness.record(entry.effect, entry.instruction_index);
+          submission->result.outputs_valid = submission->result.outputs_valid && result.outputs_valid;
+        }
     }
     submission->timeline_value = timeline_.value();
     if (!submission->result.ok) {
@@ -305,48 +390,54 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
           submission->published_tasks.push_back(tasks[index]);
         }
       }
-      // F2 (ADR-043 Decision #3): a Raster task's vertex bytes are only
-      // guaranteed visible in `arena` once execute() above has returned, so
-      // this walks the sealed task graph now rather than during publish
-      // above. task_index reports position in the task graph itself (not
-      // publish order), matching RasterTaskResult's contract. `tasks` above
-      // is scoped to the publish_order block, so re-fetch here.
+      // Raster tasks execute only through their NodeRef-keyed Raster package,
+      // in the assembler-sealed order. A canonical module carried by a raster
+      // Node describes the raster contract; it is never run once as compute.
       const auto& all_tasks = compiled.plan.task_graph.tasks();
-      const std::string& root_schema = compiled.plan.user_raster_shader.has_value()
-          ? compiled.plan.user_raster_shader->root_schema : compiled.plan.module.root_schema;
-      const bool uses_scene_root = core::is_scene_root_raster_schema(root_schema);
-      for (uint32_t task_index = 0; task_index < all_tasks.size(); ++task_index) {
+      for (uint32_t task_index : compiled.plan.task_order) {
         const core::TaskRecord& task = all_tasks[task_index];
         if (task.kind != core::TaskKind::Raster) continue;
+        const core::NodeTable::Ref task_ref{task.node_index, task.node_generation};
+        const auto resolved = std::ranges::find_if(compiled.plan.resolved_nodes, [task_ref](const auto& node) {
+          return node.ref.index == task_ref.index && node.ref.generation == task_ref.generation;
+        });
+        if (resolved == compiled.plan.resolved_nodes.end()) {
+          record_raster_failure(task_index, "RASTER_NODE_REF_MISSING",
+                                "raster task NodeRef is missing from the immutable plan snapshot");
+          break;
+        }
+        const auto package = std::ranges::find_if(compiled.per_node_packages, [task_ref](const auto& item) {
+          return item.ref.index == task_ref.index && item.ref.generation == task_ref.generation;
+        });
+        if (package == compiled.per_node_packages.end() ||
+            package->kind != hal::CompiledPlan::NodePackageKind::Raster ||
+            package->package.has_value()) {
+          record_raster_failure(task_index, "RASTER_PACKAGE_KIND_MISMATCH",
+                                "reference raster Task resolved a non-raster NodeRef package");
+          break;
+        }
+        const std::string& root_schema = resolved->user_raster_shader.has_value()
+            ? resolved->user_raster_shader->root_schema : resolved->module->root_schema;
+        const bool uses_scene_root = core::is_scene_root_raster_schema(root_schema);
         core::FacetStatus vertex_status = core::FacetStatus::Ok;
         const core::FacetSlot* vertex_slot = facet_pool().lookup(arena, task.vertex_buffer_ref, &vertex_status);
         if (vertex_slot == nullptr || vertex_slot->kind != core::FacetKind::Address) {
-          submission->result.ok = false;
-          submission->result.message = vertex_slot == nullptr
+          record_raster_failure(task_index, "RASTER_VERTEX_FACET_INVALID", vertex_slot == nullptr
               ? std::string("raster task vertex buffer: ") + core::to_string(vertex_status)
-              : std::string("raster task vertex buffer: facet kind mismatch");
-          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - submit_start)
-                                          .count();
-          return true;
+              : std::string("raster task vertex buffer: facet kind mismatch"));
+          break;
         }
         auto* vertex_allocation = arena.lookup(
             core::PointerRef{vertex_slot->view.allocation, vertex_slot->view.allocation_generation});
         if (vertex_allocation == nullptr) {
-          submission->result.ok = false;
-          submission->result.message = "raster task vertex buffer: allocation not found";
-          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - submit_start)
-                                          .count();
-          return true;
+          record_raster_failure(task_index, "RASTER_VERTEX_ALLOCATION_MISSING",
+                                "raster task vertex buffer: allocation not found");
+          break;
         }
         if (vertex_allocation->bytes.size() % sizeof(RasterVertex) != 0) {
-          submission->result.ok = false;
-          submission->result.message = "raster task vertex buffer byte size is not a multiple of sizeof(RasterVertex)";
-          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - submit_start)
-                                          .count();
-          return true;
+          record_raster_failure(task_index, "RASTER_VERTEX_LAYOUT_INVALID",
+                                "raster task vertex buffer byte size is not a multiple of sizeof(RasterVertex)");
+          break;
         }
         const size_t vertex_count = vertex_allocation->bytes.size() / sizeof(RasterVertex);
         std::vector<RasterVertex> vertices(vertex_count);
@@ -357,29 +448,31 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
           core::FacetStatus index_status = core::FacetStatus::Ok;
           const core::FacetSlot* index_slot = facet_pool().lookup(arena, task.index_buffer_ref, &index_status);
           if (index_slot == nullptr || index_slot->kind != core::FacetKind::Address) {
-            submission->result.ok = false;
-            submission->result.message = index_slot == nullptr
+            record_raster_failure(task_index, "RASTER_INDEX_FACET_INVALID", index_slot == nullptr
                 ? std::string("raster task index buffer: ") + core::to_string(index_status)
-                : "raster task index buffer: facet kind mismatch";
-            return true;
+                : "raster task index buffer: facet kind mismatch");
+            break;
           }
+          if (!submission->result.ok) break;
           const core::PixelFormat format = index_slot->view.format;
           const size_t element_size = format == core::PixelFormat::R16Uint ? sizeof(uint16_t) :
                                       format == core::PixelFormat::R32Uint ? sizeof(uint32_t) : 0;
           if (element_size == 0 || task.index_count % 3 != 0 ||
               task.index_count > std::numeric_limits<size_t>::max() / element_size) {
-            submission->result.ok = false;
-            submission->result.message = "raster task index buffer requires R16Uint/R32Uint and a triangle-list count";
-            return true;
+            record_raster_failure(task_index, "RASTER_INDEX_LAYOUT_INVALID",
+                                  "raster task index buffer requires R16Uint/R32Uint and a triangle-list count");
+            break;
           }
+          if (!submission->result.ok) break;
           auto* index_allocation = arena.lookup(
               core::PointerRef{index_slot->view.allocation, index_slot->view.allocation_generation});
           const size_t byte_count = static_cast<size_t>(task.index_count) * element_size;
           if (index_allocation == nullptr || index_allocation->bytes.size() < byte_count) {
-            submission->result.ok = false;
-            submission->result.message = "raster task index buffer is shorter than index_count";
-            return true;
+            record_raster_failure(task_index, "RASTER_INDEX_ALLOCATION_INVALID",
+                                  "raster task index buffer is shorter than index_count");
+            break;
           }
+          if (!submission->result.ok) break;
           std::vector<RasterVertex> indexed;
           indexed.reserve(task.index_count);
           for (uint32_t i = 0; i < task.index_count; ++i) {
@@ -392,12 +485,13 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
               std::memcpy(&index, index_allocation->bytes.data() + i * element_size, sizeof(index));
             }
             if (index >= vertices.size()) {
-              submission->result.ok = false;
-              submission->result.message = "raster task index references a vertex outside the vertex buffer";
-              return true;
+              record_raster_failure(task_index, "RASTER_INDEX_OUT_OF_RANGE",
+                                    "raster task index references a vertex outside the vertex buffer");
+              break;
             }
             indexed.push_back(vertices[index]);
           }
+          if (!submission->result.ok) break;
           vertices = std::move(indexed);
         }
         core::RasterFacetPair facets = task.raster_facets;
@@ -414,9 +508,8 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
           core::ResolvedSceneRootRaster root;
           std::string root_error;
           if (!core::resolve_scene_root_raster(arena, task, &root, &root_error)) {
-            submission->result.ok = false;
-            submission->result.message = root_error;
-            return true;
+            record_raster_failure(task_index, "RASTER_SCENE_ROOT_INVALID", root_error);
+            break;
           }
           facets.source = root.albedo;
           desc.tint = root.base_color;
@@ -426,26 +519,22 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
             // Reference oracle must not accept an out-of-range input merely
             // because an affine matrix happens to scale it back into range.
             if (!std::isfinite(vertex.z) || vertex.z < 0.0f || vertex.z > 1.0f) {
-              submission->result.ok = false;
-              submission->result.message = "raster task vertex z must be finite and normalized to [0,1] (F4 vertex ABI)";
-              return true;
+              record_raster_failure(task_index, "RASTER_VERTEX_DEPTH_INVALID",
+                                    "raster task vertex z must be finite and normalized to [0,1] (F4 vertex ABI)");
+              break;
             }
             if (!core::transform_scene_root_vertex(root, vertex.x, vertex.y, vertex.z,
                                                     &vertex.x, &vertex.y, &vertex.z, &root_error)) {
-              submission->result.ok = false;
-              submission->result.message = root_error;
-              return true;
+              record_raster_failure(task_index, "RASTER_SCENE_ROOT_TRANSFORM_FAILED", root_error);
+              break;
             }
           }
+          if (!submission->result.ok) break;
         }
         const RasterResult raster_result = raster_triangles(arena, facet_pool(), facets, desc, vertices);
         if (!raster_result.ok) {
-          submission->result.ok = false;
-          submission->result.message = raster_result.message;
-          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - submit_start)
-                                          .count();
-          return true;
+          record_raster_failure(task_index, "RASTER_EXECUTION_FAILED", raster_result.message);
+          break;
         }
         // raster_triangles writes canonical bytes directly; publish the same
         // content transition Metal commits after its command buffer completes.
@@ -471,60 +560,27 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         task_result.stored = raster_result.stored;
         task_result.contents_defined = raster_result.contents_defined;
         submission->raster_results.push_back(std::move(task_result));
-      }
-      if (compiled.plan.request_tier2_select) {
-        // Host-walk of the sealed graph: Serialized, never DevicePass.
-        // The Metal path is the emulated device pass; this backend is the
-        // byte-level judge that path must match as a multiset.
-        const auto selected =
-            select_tier2_nodes(compiled.plan.task_graph, compiled.plan.authorized_node_classes);
-        if (!selected.ok) {
-          submission->result.ok = false;
-          submission->result.message = selected.message;
-          submission->report.add("tier2_node_select",
-                                 selected.unauthorized ? hal::LoweringClass::Unsupported
-                                                       : hal::LoweringClass::Serialized,
-                                 1, 0, selected.message);
-          submission->cpu_submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - submit_start)
-                                          .count();
-          return true;
+        for (const auto& effect : compiled.plan.task_effects[task_index]) {
+          submission->result.trace.push_back(effect);
+          submission->result.witness.record(
+              effect, static_cast<uint32_t>(submission->result.witness.entries().size()));
         }
-        submission->report.add("tier2_node_select", hal::LoweringClass::Serialized, selected.command_count,
-                               0, "CPU oracle host-walk of authorized node classes; not a device pass");
-        submission->report.add("tier2_bucket_count", hal::LoweringClass::Serialized, selected.bucket_count, 0,
-                               "one host bucket per authorized node class");
+      }
+      if (submission->result.ok && raster_only && compiled.plan.timeline_signal != 0) {
+        std::string signal_error;
+        if (!timeline_.signal(compiled.plan.timeline_signal, &signal_error)) {
+          submission->result.ok = false;
+          submission->result.outputs_valid = false;
+          submission->result.poison = core::PoisonState::PartiallyProduced;
+          submission->result.message = signal_error;
+          submission->result.fault.code = "TIMELINE_SIGNAL_NOT_MONOTONIC";
+          submission->result.fault.message = signal_error;
+        }
       }
     }
+    submission->timeline_value = timeline_.value();
     submission->cpu_submit_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submit_start).count();
-    // B-era certificate path. A non-empty discovery_seeds list already
-    // attached the discovered (strict subset) certificate above; running
-    // build_access_certificate here would overwrite it with the historical
-    // full-arena DiscoverThenLease scan (ADR-025 / ADR-035).
-    if (compiled.plan.requested_certificate_mode.has_value() && compiled.plan.discovery_seeds.empty()) {
-      std::vector<core::PointerRef> touched;
-      if (!compiled.plan.resolved_nodes.empty() && !compiled.plan.task_graph.tasks().empty()) {
-        for (const auto& node : compiled.plan.resolved_nodes) {
-          if (!node.module.has_value()) continue;
-          for (const auto& instruction : node.module->instructions)
-            touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});
-        }
-      } else {
-        touched.reserve(compiled.plan.module.instructions.size());
-        for (const auto& instruction : compiled.plan.module.instructions)
-          touched.push_back(core::PointerRef{instruction.allocation, instruction.generation});
-      }
-      core::AccessCertificate certificate;
-      std::string cert_error;
-      if (core::build_access_certificate(arena, *compiled.plan.requested_certificate_mode, touched, &certificate, &cert_error)) {
-        submission->access_certificate = certificate;
-        const auto classification = *compiled.plan.requested_certificate_mode == core::AccessCertificateMode::DiscoverThenLease
-            ? hal::LoweringClass::HostAssisted : hal::LoweringClass::Direct;
-        submission->report.add("access_certificate", classification, certificate.epoch.references().size(),
-                               certificate.result_bytes, "reference arena scan");
-      }
-    }
     return true;
   }
 

@@ -25,7 +25,7 @@ void report_working_set(Submission* submission, uint64_t requested, bool committ
 
 }  // namespace
 
-bool apply_working_set_budget(const ExecutionPlan& plan, core::Arena& arena, Submission* submission,
+bool apply_working_set_budget(const core::ExecutionPlan& plan, core::Arena& arena, Submission* submission,
                               std::string* error) {
   if (submission == nullptr) {
     if (error) *error = "submission output is required";

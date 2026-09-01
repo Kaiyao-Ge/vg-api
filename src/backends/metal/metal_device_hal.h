@@ -46,6 +46,28 @@ struct CullCompactResult {
   std::vector<uint32_t> compact_ids;
 };
 
+// Narrow observability for the E007 physical adapter experiment.  It is not
+// an ExecutionPlan option: production plans obtain packages exclusively from
+// resolved Node contracts, while this harness measures one Metal binding
+// mechanism in isolation.
+struct IndexedComputeHarnessResult {
+  uint32_t referenced_allocation_count{};
+  hal::LoweringReport report;
+};
+
+// Test-only observation of the arguments handed to Metal's real compute
+// command encoder by the plan-driven Node-aware path. `pipeline_ordinal` is
+// local to one submission: equal values mean the exact same
+// MTLComputePipelineState was bound, without exposing an Objective-C object
+// through this C++ header.
+struct NodeAwareDispatchObservation {
+  uint32_t task_index{};
+  uint32_t node_index{};
+  uint32_t node_generation{};
+  std::array<uint32_t, 3> threadgroups{};
+  uint32_t pipeline_ordinal{};
+};
+
 // AddressFacet use of a FacetRef (02 §3.3): the linear/BDA view of the same
 // CanonicalView, resolved to the allocation's device buffer. No texture object
 // is involved, and none is exposed -- the caller gets an address and a length.
@@ -278,7 +300,7 @@ class DeviceHal final : public hal::DeviceHal {
   DeviceHal& operator=(DeviceHal&&) = delete;
   ~DeviceHal() override;
   [[nodiscard]] const hal::CapabilitySnapshot& capabilities() const override;
-  bool compile(const hal::ExecutionPlan& plan, hal::CompiledPlan* compiled,
+  bool compile(const core::ExecutionPlan& plan, hal::CompiledPlan* compiled,
                std::string* error = nullptr) override;
   bool submit(const hal::CompiledPlan& compiled, core::Arena& arena,
               hal::Submission* submission, std::string* error = nullptr) override;
@@ -290,6 +312,18 @@ class DeviceHal final : public hal::DeviceHal {
   bool run_cull_compact(const std::vector<uint32_t>& instance_visible,
                        const std::vector<uint32_t>& instance_ids,
                        CullCompactResult* result, std::string* error = nullptr) const;
+
+  // Explicitly narrow physical-mechanism harnesses.  Neither method accepts
+  // or mutates ExecutionPlan, so experimental Tier1/indexed lowering cannot
+  // become a second source of production execution semantics.
+  bool run_task_tier1_indirect_test_harness(const ir::Module& module, core::Arena& arena,
+                                            const std::vector<core::TaskRecord>& tasks,
+                                            hal::Submission* submission,
+                                            std::string* error = nullptr) const;
+  bool run_indexed_compute_test_harness(const ir::Module& module, core::Arena& arena,
+                                        IndexedComputeHarnessResult* result,
+                                        hal::Submission* submission,
+                                        std::string* error = nullptr) const;
 
   // Every run_*_facet resolves `ref` through FacetPool::lookup before touching
   // a Metal object, and brackets the command buffer in
@@ -383,6 +417,8 @@ class DeviceHal final : public hal::DeviceHal {
                                   std::string* error = nullptr) const;
 
   [[nodiscard]] const std::vector<std::array<uint32_t, 3>>& last_tier1_indirect_dims() const;
+  [[nodiscard]] const std::vector<NodeAwareDispatchObservation>&
+  last_node_aware_dispatches() const;
 
  private:
   struct Impl;

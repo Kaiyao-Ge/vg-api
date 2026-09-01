@@ -145,7 +145,7 @@ class DeviceHal final : public vg::hal::DeviceHal {
   DeviceHal& operator=(DeviceHal&&) = delete;
 
   const vg::hal::CapabilitySnapshot& capabilities() const override;
-  bool compile(const vg::hal::ExecutionPlan& plan,
+  bool compile(const vg::core::ExecutionPlan& plan,
                vg::hal::CompiledPlan* compiled,
                std::string* error = nullptr) override;
   bool submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& arena,
@@ -288,11 +288,19 @@ class DeviceHal final : public vg::hal::DeviceHal {
     size_t byte_size{};
   };
 
-  VkShaderModule shader_module_{VK_NULL_HANDLE};
-  VkPipelineLayout pipeline_layout_{VK_NULL_HANDLE};
-  VkPipeline compute_pipeline_{VK_NULL_HANDLE};
+  // Backend-owned Stage-6 objects. The key is derived from the immutable
+  // package contents plus the Node entry name; no raw Vulkan handle escapes
+  // through hal::CompiledPlan. Entries live until DeviceHal destruction so a
+  // later Node compile cannot invalidate a pipeline retained by an earlier
+  // CompiledPlan.
+  struct ComputePipelineRecord {
+    VkShaderModule shader_module{VK_NULL_HANDLE};
+    VkPipelineLayout pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline pipeline{VK_NULL_HANDLE};
+    uint32_t binding_count{};
+  };
+  std::map<std::string, ComputePipelineRecord> compute_pipeline_cache_;
   VkCommandPool command_pool_{VK_NULL_HANDLE};
-  std::string cached_ir_hash_;
   std::unordered_map<uint64_t, AllocationRecord> allocation_map_;
 
   // VK_SEMAPHORE_TYPE_TIMELINE, initialValue=0; created lazily on first
@@ -305,8 +313,8 @@ class DeviceHal final : public vg::hal::DeviceHal {
 
   // Task ring publication kernel (Tier0), compiled from
   // compiler::task_ring_vulkan_source() into its own shader module/layout/
-  // pipeline, kept separate from shader_module_/pipeline_layout_/
-  // compute_pipeline_ above: the publication protocol is backend-private
+  // pipeline, kept separate from compute_pipeline_cache_ above: the
+  // publication protocol is backend-private
   // infrastructure, not part of the target-neutral ComputePackage contract
   // (mirrors Metal's task_ring_library/task_ring_pipeline separation).
   VkShaderModule task_ring_shader_module_{VK_NULL_HANDLE};
@@ -330,12 +338,6 @@ class DeviceHal final : public vg::hal::DeviceHal {
     VkDeviceMemory inputs_memory{VK_NULL_HANDLE};
     VkDeviceAddress inputs_address{};
     void* inputs_mapped{nullptr};
-    // Tier1 conformance floor: one VkDispatchIndirectCommand-sized (12-byte,
-    // 4-byte-aligned) slot per task, populated from fields_buffer's x/y/z
-    // words via vkCmdCopyBuffer -- see dispatch_task_ring_and_tier1's doc
-    // comment for why no host-side repacking is needed.
-    VkBuffer indirect_buffer{VK_NULL_HANDLE};
-    VkDeviceMemory indirect_memory{VK_NULL_HANDLE};
     uint32_t task_count{};
   };
 
@@ -465,15 +467,16 @@ class DeviceHal final : public vg::hal::DeviceHal {
   vg::compiler::PipelineClassificationCache pipeline_cache_;
   vg::compiler::PipelineClassificationCache naive_pipeline_cache_;
 
-  // (Re)compiles `glsl_source` (GLSL -> SPIR-V via a glslc subprocess -> a
-  // VkPipeline bound only by a push-constant BDA-address array, no
-  // descriptor sets), caching by IR hash. Failure here is the sole source of
-  // truth for whether this device/driver can run the module -- unlike
+  // Compiles `glsl_source` (GLSL -> SPIR-V via a glslc subprocess -> a
+  // VkPipeline bound only by a push-constant BDA-address array, no descriptor
+  // sets), caching by the complete immutable package/entry key. Failure here
+  // is the sole source of truth for whether this device/driver can run the module -- unlike
   // Metal, no HostAssisted fallback is attempted: the target NVIDIA/Linux
   // hardware is expected to support this natively, so failure is reported
   // as Unsupported rather than silently degraded.
-  bool ensure_pipeline(const std::string& ir_hash, const std::string& glsl_source, uint32_t binding_count,
-                       std::string* error);
+  bool ensure_pipeline(const std::string& cache_key, const std::string& glsl_source,
+                       uint32_t binding_count, const ComputePipelineRecord** out,
+                       bool* cache_hit, std::string* error);
   // Creates or reuses a host-visible-coherent VkBuffer for `allocation`,
   // uploading its current bytes. Invalidated (recreated) on generation or
   // required-size mismatch, mirroring Metal's allocation_map policy.
@@ -482,32 +485,32 @@ class DeviceHal final : public vg::hal::DeviceHal {
   bool ensure_task_ring_pipeline(std::string* error);
   bool create_task_ring_buffers(uint32_t task_count, TaskRingBuffers* out, std::string* error);
   void destroy_task_ring_buffers(TaskRingBuffers* buffers);
-  // Single command buffer covering both B8 tiers: dispatches the Tier0
-  // publish kernel (compiler::task_ring_vulkan_source()) over `order.size()`
-  // tasks, inserts a vkCmdPipelineBarrier2 making the ring's write visible
-  // to a transfer read, copies each published task's x/y/z window directly
-  // into that task's indirect slot, inserts a second barrier2 making that
-  // transfer write visible to indirect-command reads, then issues one
-  // vkCmdDispatchIndirect per task against `compute_pipeline_` (bound with
-  // `addresses` as its push-constant BDA array). This is the Tier1
-  // conformance floor: dispatch sizing is read back from the GPU-published
-  // Task ring, never from host-side TaskRecord.x/y/z (contrast Metal, where
-  // Tier1/ICB remains a target rather than a requirement -- see ADR-021 vs
-  // ADR-022).
-  //
-  // TASK-D4 (E010) compile-review-only: Vulkan has no Tier2 execution here
-  // (no reachable hardware, ADR-024). The analogue of Metal's default
-  // bucket compute + per-Node indirect is a GPU histogram / prefix-sum
-  // over authorized node classes followed by one vkCmdDispatchIndirect
-  // per class. Metal now prefers a GPU-encoded ICB for the same select.
-  // VK_EXT_device_generated_commands (DGC) is the optional
-  // capability upgrade matching Metal ICB -- not required, and never the
-  // floor. Host-read-counts-then-vkCmdDispatch is Serialized/HostAssisted,
-  // never DevicePass. Tier3 (GPU invents a Node / grows the envelope)
-  // remains Unsupported.
-  bool dispatch_task_ring_and_tier1(const TaskRingBuffers& buffers, const std::vector<uint32_t>& order,
-                                    const std::vector<VkDeviceAddress>& addresses, std::string* error);
-  // Records and submits a single dispatch on a transient command buffer.
+  // Publication-only pass. Canonical program execution is performed by
+  // dispatch_task_graph below; the Task ring cannot select a Node pipeline or
+  // become a second execution authority.
+  bool dispatch_task_ring_publication(const TaskRingBuffers& buffers, std::string* error);
+
+  struct CanonicalTaskDispatch {
+    uint32_t task_index{};
+    uint32_t x{1};
+    uint32_t y{1};
+    uint32_t z{1};
+    const ComputePipelineRecord* pipeline{};
+    std::vector<VkDeviceAddress> addresses;
+    bool barrier_after{};
+  };
+  struct TaskDispatchCounts {
+    uint64_t dispatch_count{};
+    uint64_t barrier_count{};
+  };
+  // Records the assembler-sealed task order in one command buffer. Each Task
+  // binds its own NodeRef-keyed Stage-6 pipeline and package bindings. A
+  // sync2 compute memory barrier is emitted exactly at sealed effect-conflict
+  // boundaries selected before this call.
+  bool dispatch_task_graph(const std::vector<CanonicalTaskDispatch>& dispatches,
+                           uint64_t wait_value, uint64_t signal_value,
+                           TaskDispatchCounts* counts, std::string* error);
+
   // wait_value/signal_value of 0 mean "no timeline involvement for this
   // side" -- their fields are omitted from VkTimelineSemaphoreSubmitInfo
   // entirely rather than submitted as a literal 0, matching core's guarantee
@@ -515,9 +518,6 @@ class DeviceHal final : public vg::hal::DeviceHal {
   // VkFence + vkWaitForFences remains the host-side completion mechanism;
   // the timeline semaphore is a GPU-ordering primitive layered on top of it,
   // not a replacement for it in this v1 backend.
-  bool dispatch_and_wait(const std::vector<VkDeviceAddress>& addresses, uint64_t wait_value, uint64_t signal_value,
-                        std::string* error);
-
   // --- Phase C facet/raster/Stage-5 infrastructure -------------------------
   // 07 §6's step 1 ("Core 固定 CanonicalView + RepresentationEpoch") is core's;
   // everything below is steps 2-6, and each helper stays private because none
@@ -615,7 +615,7 @@ class DeviceHal final : public vg::hal::DeviceHal {
   // compile() turns into an Unsupported LoweringEvent -- START.md §4 invariant
   // 10: a semantic this hardware cannot express is rejected, never silently
   // dropped while the rest of the plan compiles as if nothing had been asked.
-  bool can_lower_representation_requests(const vg::hal::ExecutionPlan& plan, std::string* reason) const;
+  bool can_lower_representation_requests(const vg::core::ExecutionPlan& plan, std::string* reason) const;
 
   friend std::unique_ptr<DeviceHal> make_device_hal(std::string* error);
   friend std::unique_ptr<DeviceHal> make_device_hal(const uint8_t uuid[16], std::string* error);

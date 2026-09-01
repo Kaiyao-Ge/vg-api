@@ -14,7 +14,6 @@ int main(int argc, char** argv) {
     return 1;
   }
   vg::conformance::ConformanceExpectation expectation;
-  expectation.expect_linear_subset_only = true;
   expectation.expect_task_publication = true;
   expectation.expect_timeline = true;
   return vg::conformance::run(*device, "metal", expectation, argv[1]) ? 0 : 1;

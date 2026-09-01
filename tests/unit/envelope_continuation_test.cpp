@@ -65,7 +65,7 @@ struct Fixture {
     vg::test_support::AssembledPlanFixture fixture;
     vg::test_support::AssemblyOptions options;
     options.dependencies = &dependencies;
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     std::string error;
     assert(vg::test_support::assemble_single_node_plan(arena, module, tasks, &fixture, &plan, &error, options));
     oracle_graph = fixture.graph;
@@ -84,7 +84,7 @@ struct Fixture {
     options.dependencies = &dependencies;
     options.task_quota = quota;
     options.pending_overflow = pending;
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     std::string error;
     assert(vg::test_support::assemble_single_node_plan(arena, module, tasks, &fixture, &plan, &error, options));
     vg::hal::CompiledPlan copy;

@@ -8,7 +8,7 @@ namespace vg::hal {
 // assembler before lowering. This Stage 7 hook only consumes and reports the
 // frozen witness/certificate; it never reads Arena bytes to walk a graph.
 
-bool run_discovery_stage(const ExecutionPlan& plan, core::Arena& arena, Submission* submission,
+bool run_discovery_stage(const core::ExecutionPlan& plan, core::Arena& arena, Submission* submission,
                          std::string* error) {
   if (submission == nullptr) {
     if (error) *error = "submission output is required";

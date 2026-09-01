@@ -838,18 +838,22 @@ bool EffectGraph::validate_happens_before(const std::vector<std::vector<ir::Effe
     }
     adjacency[edge.before].push_back(edge.after);
   }
+  const auto reaches = [&](uint32_t source, uint32_t destination) {
+    std::vector<uint8_t> seen(count);
+    std::vector<uint32_t> work{source};
+    seen[source] = 1;
+    for (size_t i = 0; i < work.size(); ++i)
+      for (uint32_t next : adjacency[work[i]])
+        if (!seen[next]) { seen[next] = 1; work.push_back(next); }
+    return seen[destination] != 0;
+  };
   for (uint32_t before = 0; before < count; ++before) {
     for (uint32_t after = before + 1; after < count; ++after) {
       bool conflict = false;
       for (const auto& lhs : effects[before]) for (const auto& rhs : effects[after])
         conflict = conflict || conflicts(lhs, rhs);
       if (!conflict) continue;
-      std::vector<uint8_t> seen(count);
-      std::vector<uint32_t> work{before};
-      seen[before] = 1;
-      for (size_t i = 0; i < work.size(); ++i) for (uint32_t next : adjacency[work[i]])
-        if (!seen[next]) { seen[next] = 1; work.push_back(next); }
-      if (!seen[after]) {
+      if (!reaches(before, after) && !reaches(after, before)) {
         if (error) *error = "conflicting task effects have no happens-before edge";
         return false;
       }

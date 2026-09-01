@@ -18,6 +18,18 @@ int main() {
   assert(unsupported.ok);
   assert(!vg::compiler::build_linear_compute_package(unsupported.module).ok);
 
+  // Task publication is compute-only and both shader dialects consume the
+  // same generated word-layout fragment rather than embedding a second
+  // record size or dispatch-window offset.
+  const std::string task_ring_metal = vg::compiler::task_ring_metal_source();
+  const std::string task_ring_vulkan = vg::compiler::task_ring_vulkan_source();
+  assert(task_ring_metal.find("#define VG_TASK_RING_WORD_COUNT 14u") != std::string::npos);
+  assert(task_ring_vulkan.find("#define VG_TASK_RING_WORD_COUNT 14u") != std::string::npos);
+  assert(task_ring_metal.find("word < VG_TASK_RING_WORD_COUNT") != std::string::npos);
+  assert(task_ring_vulkan.find("word < VG_TASK_RING_WORD_COUNT") != std::string::npos);
+  assert(task_ring_metal.find("gid * 14u") == std::string::npos);
+  assert(task_ring_vulkan.find("gid * 14u") == std::string::npos);
+
   // Phase C facet kernels. These are emitted as text and bound by index, so
   // the binding ABI declared in compiler.h and the entry-point names the host
   // looks up are pinned here rather than re-derived from the emitted source by

@@ -342,6 +342,77 @@ SR-4 收尾核验（2026-08-29）：Stage 5 与 `FacetPool::acquire` 共用同�
 `representation_plan_derived`/`representation_plan` 均为零命中；Reference 33/33、真实 Metal
 Device 65/65 回归通过。
 
+SR-5 收尾核验（2026-08-29）：Core assembler 现在把 representation view allocation 纳入
+finite `touched_allocations`，并从 sealed TaskGraph 机械冻结显式 raster source/target、vertex、
+conditional index、optional depth 以及 SceneRoot `material.albedo` 的去重 facet lifetime facts。
+统一的 plan-local、可移动 RAII owner 在 representation physical transition 产出 target facets 后，
+合并所有 facet backing allocation，按确定顺序事务式取得 allocation/facet holds；部分失败逆序回滚，
+同步 Reference、Metal、Vulkan 路径在真实 completion 后析构释放。same-submit transform 若会使
+sealed Task `FacetRef` 在执行前失效，会在 epoch 变化前拒绝；hold 不写回 sealed graph，repeat submit
+各自独立。未改变公共 C ABI / `VgTaskRecordV2`，也未删除 legacy request 字段或推进 per-Node lowering。
+
+核验结果：ASan+UBSan 的 dev-reference 33/33，全量通过且 `core.execution-plan` 额外连续通过
+100 次；真实 macOS Metal Device 65/65 通过，其中 plan-driven raster success/failure/repeat、index、
+depth 的 submit 后 allocation/facet 计数归零有显式断言。Vulkan 的 capability/Unsupported contract
+在两套配置中通过，但本机没有 Linux/Vulkan executable 环境，因此不声称该平台已完成真机验证。
+独立只读审查未发现生产语义 blocker 或范围扩张；其指出的 SceneRoot/index/depth inventory 与
+move/exactly-once 验收缺口已补测。
+
+SR-6 收尾核验（2026-08-30）：`ExecutionPlan` 与 assembler inputs 已删除旧的 tier1/tier2/indexed
+请求袋、effect-pass/dependency 袋和整图 `module`/`user_raster_shader` 投影。assembler 现在按
+Task 的完整 NodeRef 与不可变 CodeObject snapshot 实例化 per-Task effects，把 TaskGraph 显式依赖
+与实际访问冲突合并为唯一 validated EffectGraph，并封存确定的 `task_order`。raster source/target/
+vertex、conditional index、optional depth 和 SceneRoot root/albedo 的 backing access 在 HAL 前解析；
+必需 facet 缺失、无 submitting FacetPool、depth state 无 attachment、非法 index count 均在 Stage 5
+拒绝，depth test 的 Read 与 attachment clear/store 的 Write 分别进入 certificate/effect truth。
+
+`CompiledPlan` 收敛为 immutable core plan、按完整 NodeRef 键控并带 domain kind 的 per-Node package、
+physical representation operations、LoweringReport 与 ABI bookkeeping。Reference 与 Metal 按 sealed
+task order 逐 Task 选择 package；canonical raster Node 不再先作为 compute module 执行。Metal 不能
+组合的 native/host-assisted per-Node compute lowering 会显式返回 Unsupported，Vulkan 对 multi-Node、
+pointer graph、raster 等未实现合同同样给出与执行一致的 Unsupported report。三个 backend 的 Stage 7
+入口重新验证 semantic seal 与 package kind；envelope/publication 消费 `plan.task_order`，不再从 raw
+TaskGraph 重建第二套顺序。旧 effect-DAG 测试已改为真实多 CodeObject/Node/TaskGraph，tier1/indexed/
+tier2 只保留显式窄 physical harness。mixed-domain、Task ring、公共 C ABI / `VgTaskRecordV2` 和 §9.3
+文件治理均未在本包改变。
+
+最终静态门禁在生产与活动测试中对五个旧字段名、整图 program 投影、`resolved_nodes.front()`、旧
+CompiledPlan 字段及 backend-local certificate/touched/effect 推导均为零命中；compile 后篡改
+task order、sealed effects 或 package kind 的 conformance 负例会在 Stage 7 前拒绝。ASan+UBSan 的
+dev-reference 33/33 与 `core.execution-plan` 连续 100 次通过；真实 macOS Metal Device 65/65 通过；
+`docs.check` 与 `git diff --check` 通过。Darwin 主机不提供 `dev-vulkan` preset，因此 Vulkan 只有本机
+source capability/Unsupported contract 证据，Linux 编译/真机 gate 仍是明确的外部平台验证缺口。
+Metal per-Task dispatch shape 的完整 Node-aware lowering 仍属于后续 backend Node-aware 工作包，不在
+本次旧请求袋/双重执行事实清理中借机扩张。
+
+Task ring 单一编码收尾核验（2026-08-30）：新增独立内部 schema
+`schemas/ir/compute-task-ring.vg.json`，把 GPU publication ring 冻结为 compute-only 的
+14×`uint32_t` little-endian wire record。schema generator 以 task-ring-specific 分支机械生成 host
+layout、word count、每个字段的 word offset/name/reserved metadata，以及 MSL/GLSL 共用的布局片段；
+它没有复用语义层 48-byte `task-root.vg.json`，也没有重写其它 schema 的生成路径。现有 wire 顺序、
+64-bit lo/hi 拆装、reserved-zero、Empty→Writing→Published 状态机，以及 Vulkan x/y/z 与
+`VkDispatchIndirectCommand` 连续三字的 byte-identical 契约均保持不变。
+
+`src/compiler/compute_task_ring.{h,cpp}` 是唯一 host codec：完整 `TaskRecord` 必须先经 checked
+conversion 变成不含 raster 字段的 `ComputeTaskRingRecord`；Raster 与未知 kind 稳定拒绝，decode
+显式恢复 `TaskKind::Compute`。pack、unpack 和 diagnostic dump 均使用生成的 named offsets/metadata。
+Metal/Vulkan 删除 backend-local pack/unpack；Tier1 dispatch window 与 Metal Tier2 narrow physical
+harness 的 stride/node offset 也改用 schema 派生事实。Metal raster-only submit 保持独立 render
+package/pass，并有回归断言证明不会进入 compute ring；Vulkan 仍在 Stage 6 保留原有 Raster
+`Unsupported` capability diagnostic，而不是依赖 codec 兜底。
+
+验证结果：ASan+UBSan `dev-reference` **34/34** 全量通过，`compiler.compute-task-ring` 额外连续
+**100/100** 次通过；schema deterministic/host/MSL/GLSL parity、exact 14-word golden、64-bit split、
+reserved-zero、round-trip、dump order 与 Raster/unknown negative 均有自动测试。真实 macOS
+MTLDevice 的 `dev-metal` **66/66** 全量通过，覆盖 Tier0 publication、Tier1 indirect、Tier2 node
+selection 与 raster/depth/user-shader 分流；`docs.check`、`git diff --check` 和静态搜索门禁通过。
+Darwin 上仅完成 Vulkan no-SDK translation-unit syntax check 与 capability/Unsupported source contract；
+缺少 Linux/Vulkan SDK/driver 环境，因此不声称 Linux 编译或真机通过。
+
+本工作包没有修改公共 `include/vg/*`、`VgTaskRecord`/`VgTaskRecordV2`、API 版本/stride、资源生命周期
+或 submit 原语；没有加入 Raster ring discriminator、开放 mixed-domain、改变 Task Tier capability、
+推进 backend Node-aware lowering，或进行 §9.3 文件/runner 治理。
+
 ---
 
 ## 二、看法
@@ -1248,3 +1319,12 @@ F6 已有的功能证据继续成立：同一密封图、root bytes 更新、颜
 保留第一至六节的事实证据；撤销“顶层单主意图 tagged union”作为整改核心；把单 CodeObject TaskGraph 明确定性为必须修复的结构缺陷；整改中心改为 Device-scoped Node capability、按 Node 解析/降低、原始 Stage 0—7、schema 单一真相和 capability-indexed DeviceHAL 合同。
 
 本计划不新增 VG 公共原语，不重写公共 C ABI，不开放本阶段明确推迟的 mixed submission，不实现 ray tracing 或 neural domain。它只保证当前重构不会关闭这些未来方向，并给出一个约束：未来域必须优先作为现有 Region/Layout/Facet、Node/ExecutionContract、Task payload、Effect/Envelope 和 Capability/Lowering 的扩展进入统一 TaskGraph。
+
+**公共 Stage 6/7 identity hardening 记录（2026-08-30）。** Stage 6 继续以完整
+`NodeRef` 为键产出 package；共享 conformance 现验证每个成功 lowering 都有完整、唯一的
+`NodeRef -> package` 映射，并以 `node_compute_package` 事件计数交叉核对。Stage 7 在
+adapter 消费 report、plan 或 package 前统一拒绝错误 `CompiledPlan` ABI 版本和错误的
+`LoweringReport.backend`，且 Reference/Metal/Vulkan 的 device-hal conformance 覆盖这两条
+稳定拒绝边界。此记录只关闭公共身份合同：Metal/Vulkan 的完整 Node-aware lowering 尚未完成，
+Vulkan Linux 真机执行证据仍未完成；它们必须继续以 capability/Unsupported 和平台证据如实
+报告，不能据此宣布整个 Node-aware 工作完成。

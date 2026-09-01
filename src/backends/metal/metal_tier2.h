@@ -33,7 +33,8 @@ struct MetalSelectContext {
   void* fields_buffer{};
 };
 
-bool apply_select(const MetalSelectContext& metal, uint32_t task_count, const hal::ExecutionPlan& plan,
+bool apply_select(const MetalSelectContext& metal, uint32_t task_count,
+                  const std::vector<uint32_t>& authorized_node_classes,
                   hal::Submission* submission, DispatchCounters counters, std::string* error);
 
 // Narrow test-only physical-adapter harness.  It owns only the Metal device,
