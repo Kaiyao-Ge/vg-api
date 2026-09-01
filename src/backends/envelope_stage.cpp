@@ -6,12 +6,12 @@
 namespace vg::hal {
 namespace {
 
-bool pending_is_deferred(const ExecutionPlan& plan) {
+bool pending_is_deferred(const core::ExecutionPlan& plan) {
   return plan.pending_overflow.has_value() &&
          plan.pending_overflow->disposition == core::EnvelopeOverflowDisposition::Deferred;
 }
 
-bool pending_is_rejected(const ExecutionPlan& plan) {
+bool pending_is_rejected(const core::ExecutionPlan& plan) {
   return plan.pending_overflow.has_value() &&
          plan.pending_overflow->disposition == core::EnvelopeOverflowDisposition::Rejected;
 }
@@ -20,7 +20,7 @@ void report_host_split(Submission* submission, uint64_t count, const char* reaso
   submission->report.add("envelope_continuation", LoweringClass::HostAssisted, count, 0, reason);
 }
 
-bool leftover_matches_graph(const ExecutionPlan& plan, const std::vector<uint32_t>& leftover,
+bool leftover_matches_graph(const core::ExecutionPlan& plan, const std::vector<uint32_t>& leftover,
                             std::string* error) {
   const auto task_count = static_cast<uint32_t>(plan.task_graph.tasks().size());
   if (!std::ranges::all_of(leftover, [task_count](uint32_t index) { return index < task_count; })) {
@@ -32,7 +32,7 @@ bool leftover_matches_graph(const ExecutionPlan& plan, const std::vector<uint32_
 
 }  // namespace
 
-bool apply_envelope_continuation(const ExecutionPlan& plan, core::EnvelopeContinuationTable* table,
+bool apply_envelope_continuation(const core::ExecutionPlan& plan, core::EnvelopeContinuationTable* table,
                                  Submission* submission, std::vector<uint32_t>* publish_order,
                                  std::string* error) {
   if (submission == nullptr) {
@@ -72,10 +72,10 @@ bool apply_envelope_continuation(const ExecutionPlan& plan, core::EnvelopeContin
     return true;
   }
 
-  std::vector<uint32_t> order;
-  if (!plan.task_graph.tasks().empty()) {
-    if (!plan.task_graph.deterministic_order(&order, error)) return false;
-  }
+  // Stage 3 already reconciled TaskGraph dependencies with actual per-Task
+  // effects. Publication must consume that sealed order rather than derive a
+  // second ordering fact from the raw graph.
+  std::vector<uint32_t> order = plan.task_order;
 
   if (!plan.envelope_task_quota.has_value()) {
     *publish_order = std::move(order);

@@ -15,12 +15,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   vg::conformance::ConformanceExpectation expectation;
-  expectation.expect_linear_subset_only = true;
-  // Logically correct but not hardware-verified: this backend only ever
-  // compiles on Linux (VG_ENABLE_VULKAN), so these two bits -- and the Task
-  // ring Tier0/Tier1 + timeline semaphore code paths they assert -- have
-  // been confirmed correct by full-file code review only, never run against
-  // real Vulkan/NVIDIA hardware. See TASK-B7/TASK-B8 Known limits.
+  // These checks execute only in the Linux VG_ENABLE_VULKAN lane. Task
+  // publication is a dedicated ring pass; canonical compute execution is the
+  // separate NodeRef-keyed per-Task path exercised by the Vulkan vertical
+  // slice. Do not infer IndirectTier1 support from this expectation.
   expectation.expect_task_publication = true;
   expectation.expect_timeline = true;
   return vg::conformance::run(*device, "vulkan", expectation, argv[1]) ? 0 : 1;

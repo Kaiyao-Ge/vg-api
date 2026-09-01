@@ -18,8 +18,10 @@ Phase E 的自动入口。Phase E（Research Alpha）按 ADR-042 记录为
 
 Phase F 的 TaskGraph 已由 ADR-053 重新收紧为 device-scoped、generation-checked
 `NodeRef` authority：ADR-044 的单 `CodeObject` builder narrowing 不再是合同。
-当前 multi-CodeObject lowering 只由 Reference canonical-compute 路径支持；Metal/
-Vulkan 必须明确拒绝，且 ADR-047/ADR-052 的 compute+raster scope cut 不变。
+Reference 与 Metal 已有 per-Node lowering；Vulkan 的 per-Node Compute 实现仍需完成
+Linux SDK/真机验证。ADR-054 已冻结 mixed-domain 的 component/wave schedule、failure、
+publication 和 backend lowering 边界，但实现与 conformance 尚未完成；当前 runtime
+仍必须明确拒绝 compute+raster mixed submission，不得把已接受设计写成已交付能力。
 
 上一版「尚未建立 CMake / runtime / 测试」的句子描述的是文档初稿时的仓库，
 不再是当前 checkout 的事实。规范冲突优先级不变。
@@ -132,4 +134,5 @@ Agent 不得把 `NativeAdapter` 的成功写成“VG 已经是比 Vulkan/Metal �
 | [11-agent-workflow.md](vg-project/11-agent-workflow.md) | Agent 如何接单、修改、测试、交接 |
 | [12-roadmap-and-risks.md](vg-project/12-roadmap-and-risks.md) | 里程碑、决策记录、风险和停止条件 |
 | [13-repository-layout.md](vg-project/13-repository-layout.md) | 建议代码仓库和产物布局 |
-| [decisions/](decisions/) | 决策记录（当前最高：ADR-053；ADR-053 supersedes ADR-044 的单 CodeObject narrowing） |
+| [decisions/](decisions/) | 决策记录（当前最高：ADR-054；mixed-domain schedule 已冻结，实施待完成） |
+| [issue/gpu-generated-cross-domain-tasks.md](issue/gpu-generated-cross-domain-tasks.md) | 未来 Tier 3：统一、带 domain discriminator 的 GPU 跨域 Task publication 研究项 |

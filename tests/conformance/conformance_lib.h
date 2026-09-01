@@ -11,12 +11,6 @@
 namespace vg::conformance {
 
 struct ConformanceExpectation {
-  // This backend only implements the B4 linear compute-package subset
-  // (load/store/atomic_add), not full task-graph publication lowering.
-  // Gates whether the suite requires backend-specific extra instrumentation
-  // events (e.g. reference's "task_publication"/"canonical_ir" events)
-  // beyond the universal "compute_package" event every backend emits.
-  bool expect_linear_subset_only = true;
   // Capability-gated, not a hard true/false assertion: true asserts the
   // backend declares Capability::TaskPublication; false means "don't assert
   // either way" -- a backend that honestly hasn't implemented a capability
@@ -27,7 +21,7 @@ struct ConformanceExpectation {
 };
 
 // Runs the full suite against `device`: ABI/timeline validation contract
-// checks (backed by the shared, backend-agnostic hal::ExecutionPlan::validate
+// checks (backed by the shared, backend-agnostic core::ExecutionPlan::validate
 // logic), capability-gated snapshot assertions per `expectation`, and the one
 // invariant that holds across all three backends -- for every M1 golden IR
 // fixture, if this backend's LoweringReport claims success, its output bytes

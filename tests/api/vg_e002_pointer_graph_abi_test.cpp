@@ -2,11 +2,11 @@
 // ABI alone (<vg/vg.h>, linking only vg_api) and checks the result against
 // what tests/vertical_slice/metal_task_timeline_test.cpp's run_pointer_graph
 // already verified on real Metal hardware:
-//   1. compile() classifies the "compute_package" lowering event CachedObject
+//   1. compile() classifies the NodeRef-keyed "node_compute_package" event CachedObject
 //      (not Direct) for a module carrying declared_pointer_edges -- this is
-//      driven purely by ExecutionPlan.module, so it is reachable unchanged
-//      through loadCodeObject's IR-JSON text even though the public ABI has
-//      no notion of PointerEdge as a distinct object.
+//      driven by the Task's resolved immutable Node module, reachable through
+//      loadCodeObject's IR-JSON text even though the public ABI has no notion
+//      of PointerEdge as a distinct object.
 //   2. The full golden path (openAdapter..submit) completes with VG_SUCCESS
 //      through a real, uuid-selected Metal device.
 //
@@ -59,11 +59,9 @@ int main() {
   uint32_t written = adapter_count;
   check(api.enumerateAdapters(runtime, &written, adapters.data()) == VG_SUCCESS, "enumerateAdapters fill");
 
-  // E002's CachedObject-vs-Direct branch (build_pointer_graph_compute_package
-  // vs. build_linear_compute_package) is only wired in metal_device_hal.mm;
-  // the reference backend has no pointer_graph branch. So, unlike the
-  // conformance test, this one requires a real Metal adapter -- that is the
-  // actual hardware the internal experiment was verified against.
+  // This case specifically measures Metal's native CachedObject-vs-Direct
+  // package classification. Reference executes the same bounded pointer
+  // graph semantically, while Vulkan returns an explicit Unsupported report.
   const VgAdapterInfo* chosen = nullptr;
   for (const auto& info : adapters) {
     if (info.backend_kind == VG_BACKEND_METAL) {
@@ -153,12 +151,9 @@ int main() {
   VgNodeRef node_ref{};
   check(api.getNodeRef(node, &node_ref) == VG_SUCCESS, "getNodeRef");
 
-  // The public ABI's submit() requires a sealed, non-empty VgTaskGraph even
-  // though the pointer-graph classification and store_via execution are
-  // driven entirely by ExecutionPlan.module (see build_pointer_graph_compute_
-  // package/is_pointer_graph_module, both module-only). One placeholder task
-  // is scaffolding to satisfy that ABI requirement, not part of what E002
-  // measures.
+  // The Task's full NodeRef is the sole route from the sealed TaskGraph to the
+  // pointer-graph package and store_via execution; it is an executable
+  // TaskGraph fact, not publication-only scaffolding.
   VgTaskGraphBuilderDesc builder_desc{};
   builder_desc.header.type = VG_STRUCTURE_TASK_GRAPH_BUILDER_DESC;
   builder_desc.header.size = sizeof(builder_desc);
@@ -201,12 +196,12 @@ int main() {
     const std::string report(report_json);
     // canonical_json() serializes event object keys alphabetically (bytes,
     // classification, count, operation, reason), so this substring is
-    // exactly the fragment metal_device_hal.mm's report.add("compute_package",
+    // exactly the fragment Metal's per-Node package report produces,
     // LoweringClass::CachedObject, 1, ...) produces -- the same fact
     // run_pointer_graph() checks via compiled.report.events directly.
     const bool cached_object =
-        report.find("\"classification\":1,\"count\":1,\"operation\":\"compute_package\"") != std::string::npos;
-    check(cached_object, "compute_package lowering event classified CachedObject, matching run_pointer_graph()");
+        report.find("\"classification\":1,\"count\":1,\"operation\":\"node_compute_package\"") != std::string::npos;
+    check(cached_object, "per-Node package lowering classified CachedObject, matching run_pointer_graph()");
     std::fprintf(stderr, "e002-pointer-graph-via-abi: report json: %s\n", report.c_str());
   }
 
@@ -238,7 +233,7 @@ int main() {
   if (g_ok) {
     std::fprintf(stderr,
                  "e002-pointer-graph-via-abi: E002 matches run_pointer_graph() (golden path VG_SUCCESS, "
-                 "compute_package CachedObject, execution result.ok). target-byte read-back is still not "
+                 "node_compute_package CachedObject, execution result.ok). target-byte read-back is still not "
                  "reachable through vg.h and was not checked.\n");
   }
   return g_ok ? 0 : 1;

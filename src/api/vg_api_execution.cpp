@@ -199,7 +199,7 @@ VgResult VG_CALL submit(VgDevice device, const VgSubmitDesc* submit_desc, VgSubm
   // Stage 0--5 have one construction path.  The C ABI decodes handles and
   // publishes the graph above; core owns Node snapshots, envelope authority,
   // effect/certificate facts, and the immutable plan handed to DeviceHAL.
-  vg::hal::ExecutionPlan plan;
+  vg::core::ExecutionPlan plan;
   std::string error;
   vg::core::ExecutionPlanAssemblerInputs assembler_inputs{
       &graph_wrapper->graph, &device->nodes, &envelope_wrapper->envelope,

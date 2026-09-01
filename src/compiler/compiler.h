@@ -33,18 +33,16 @@ struct ComputePackageResult { bool ok{}; std::string message; ComputePackage pac
 CompileResult compile_c_like(const std::string& source);
 ComputePackageResult build_linear_compute_package(const ir::Module& module);
 
-// Task Tier0 publication-protocol kernel source, shared across backends so
-// their GPU-side Empty->Writing->Published state machines stay identical.
-// Each task record is packed as 14 little-endian uint32 words (matches
-// core::TaskRecord field order; 64-bit fields split into lo/hi words) --
-// see backends/metal/metal_device_hal.mm's pack_task_record/unpack_task_record
-// for the authoritative layout. `task_state[i]` is 0=Empty,1=Writing,
+// Compute Task Tier0 publication-protocol kernel source, shared across
+// backends so their GPU-side Empty->Writing->Published state machines stay
+// identical. The schema-generated layout and the checked host codec live in
+// compute_task_ring.h; this shader merely copies that fixed wire record.
+// `task_state[i]` is 0=Empty,1=Writing,
 // 2=Published,3=Consumed; only Empty->Writing->Published are ever written by
 // this kernel (Consumed is host-side bookkeeping after read-back).
-constexpr uint32_t kTaskRingWordsPerRecord = 14;
 std::string task_ring_metal_source();
 // GLSL analogue of task_ring_metal_source(): identical Empty->Writing->
-// Published state machine and 14-word record layout, addressed via
+// Published state machine and schema-generated compute record layout, addressed via
 // buffer_reference (BDA) through push constants rather than buffer(N)
 // slots, matching this compiler's existing GLSL codegen convention.
 std::string task_ring_vulkan_source();

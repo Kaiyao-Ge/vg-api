@@ -11,7 +11,7 @@
 namespace vg::hal {
 
 namespace {
-bool preflight_fail(const ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
+bool preflight_fail(const core::ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
                     CompiledPlan* compiled, std::string message, std::string* error) {
   if (compiled) {
     // A reused output must never expose packages or effect state produced by
@@ -28,9 +28,50 @@ bool preflight_fail(const ExecutionPlan& plan, const CapabilitySnapshot& capabil
   if (error) *error = std::move(message);
   return false;
 }
+
+bool pointer_ref_less(core::PointerRef left, core::PointerRef right) {
+  return left.allocation != right.allocation ? left.allocation < right.allocation
+                                             : left.generation < right.generation;
+}
+
+bool same_pointer_ref(core::PointerRef left, core::PointerRef right) {
+  return left.allocation == right.allocation && left.generation == right.generation;
+}
+
+bool facet_use_less(const core::FacetLifetimeUse& left, const core::FacetLifetimeUse& right) {
+  if (left.ref.index != right.ref.index) return left.ref.index < right.ref.index;
+  if (left.ref.generation != right.ref.generation)
+    return left.ref.generation < right.ref.generation;
+  return static_cast<uint32_t>(left.kind) < static_cast<uint32_t>(right.kind);
+}
+
+bool same_facet_ref(core::FacetRef left, core::FacetRef right) {
+  return left.index == right.index && left.generation == right.generation;
+}
+
+void sort_unique_allocations(std::vector<core::PointerRef>* refs) {
+  std::sort(refs->begin(), refs->end(), pointer_ref_less);
+  refs->erase(std::unique(refs->begin(), refs->end(), same_pointer_ref), refs->end());
+}
+
+bool sort_unique_facets(std::vector<core::FacetLifetimeUse>* uses, std::string* error) {
+  std::sort(uses->begin(), uses->end(), facet_use_less);
+  for (size_t index = 1; index < uses->size(); ++index) {
+    if (!same_facet_ref((*uses)[index - 1].ref, (*uses)[index].ref)) continue;
+    if ((*uses)[index - 1].kind != (*uses)[index].kind) {
+      if (error) *error = "one sealed FacetRef has incompatible lifetime-use kinds";
+      return false;
+    }
+  }
+  uses->erase(std::unique(uses->begin(), uses->end(), [](const auto& left, const auto& right) {
+                return same_facet_ref(left.ref, right.ref);
+              }),
+              uses->end());
+  return true;
+}
 }  // namespace
 
-bool preflight_stage6(const ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
+bool preflight_stage6(const core::ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
                       BackendKind expected_backend, CompiledPlan* compiled, std::string* error) {
   if (!compiled) {
     if (error) *error = "compiled plan output is required";
@@ -81,6 +122,20 @@ bool preflight_stage6(const ExecutionPlan& plan, const CapabilitySnapshot& capab
       return preflight_fail(plan, capabilities, compiled,
                             std::string("required HAL capability is unsupported: ") +
                                 core::capability_requirement_name(requirement), error);
+  }
+  return true;
+}
+
+bool validate_stage7_compiled_plan(const CompiledPlan& compiled,
+                                   BackendKind expected_backend,
+                                   std::string* error) {
+  if (compiled.abi_version != kDeviceHalAbiVersion) {
+    if (error) *error = "compiled plan ABI version is unsupported";
+    return false;
+  }
+  if (compiled.report.backend != expected_backend) {
+    if (error) *error = "compiled plan backend does not match adapter";
+    return false;
   }
   return true;
 }
@@ -277,6 +332,183 @@ bool commit_representation_operations(const core::ExecutionPlan& plan,
   submission->report.heap_fragmentation_bytes += heap_fragmentation_bytes;
   for (auto& event : events) submission->report.events.push_back(std::move(event));
   return true;
+}
+
+SubmissionLifetimeHold::SubmissionLifetimeHold(SubmissionLifetimeHold&& other) noexcept {
+  *this = std::move(other);
+}
+
+SubmissionLifetimeHold& SubmissionLifetimeHold::operator=(SubmissionLifetimeHold&& other) noexcept {
+  if (this == &other) return *this;
+  release();
+  arena_ = std::exchange(other.arena_, nullptr);
+  pool_ = std::exchange(other.pool_, nullptr);
+  allocation_inventory_ = std::move(other.allocation_inventory_);
+  facet_inventory_ = std::move(other.facet_inventory_);
+  representation_kinds_ = std::move(other.representation_kinds_);
+  acquired_allocations_ = std::move(other.acquired_allocations_);
+  acquired_facets_ = std::move(other.acquired_facets_);
+  held_ = std::exchange(other.held_, false);
+  return *this;
+}
+
+SubmissionLifetimeHold::~SubmissionLifetimeHold() { release(); }
+
+bool SubmissionLifetimeHold::prepare(const core::ExecutionPlan& plan, core::Arena& arena,
+                                     core::FacetPool& pool, std::string* error) {
+  if (prepared() || held_) {
+    if (error) *error = "submission lifetime hold is already prepared";
+    return false;
+  }
+  if (!plan.assembled || !plan.lifetime_plan_derived) {
+    if (error) *error = "submission lifetime hold requires sealed core lifetime facts";
+    return false;
+  }
+
+  std::vector<core::PointerRef> allocations = plan.touched_allocations;
+  std::vector<core::FacetLifetimeUse> facets = plan.lifetime_facets;
+  std::vector<core::FacetKind> representation_kinds;
+  representation_kinds.reserve(plan.representation_plan.size());
+  for (const auto& item : plan.representation_plan) {
+    allocations.push_back({item.view.allocation, item.view.allocation_generation});
+    representation_kinds.push_back(item.target_kind);
+  }
+  if (!sort_unique_facets(&facets, error)) return false;
+
+  for (const auto& use : facets) {
+    core::FacetStatus status = core::FacetStatus::Ok;
+    const core::FacetSlot* slot = pool.lookup(arena, use.ref, &status);
+    if (slot == nullptr) {
+      if (error) {
+        *error = "sealed lifetime facet " + std::to_string(use.ref.index) + ":" +
+                 std::to_string(use.ref.generation) + " is unavailable: " + core::to_string(status);
+      }
+      return false;
+    }
+    if (slot->kind != use.kind) {
+      if (error) {
+        *error = "sealed lifetime facet " + std::to_string(use.ref.index) + ":" +
+                 std::to_string(use.ref.generation) + " has the wrong facet kind";
+      }
+      return false;
+    }
+    const core::PointerRef backing{slot->view.allocation, slot->view.allocation_generation};
+    for (const auto& item : plan.representation_plan) {
+      if (backing.allocation == item.view.allocation &&
+          backing.generation == item.view.allocation_generation) {
+        if (error) {
+          *error = "a same-submit representation transform would invalidate a sealed Task FacetRef before Stage 7";
+        }
+        return false;
+      }
+    }
+    allocations.push_back(backing);
+  }
+
+  sort_unique_allocations(&allocations);
+  for (const auto ref : allocations) {
+    if (arena.lookup(ref) == nullptr) {
+      if (error) {
+        *error = "sealed allocation lifetime fact is stale or retired: allocation " +
+                 std::to_string(ref.allocation) + " generation " + std::to_string(ref.generation);
+      }
+      return false;
+    }
+  }
+
+  arena_ = &arena;
+  pool_ = &pool;
+  allocation_inventory_ = std::move(allocations);
+  facet_inventory_ = std::move(facets);
+  representation_kinds_ = std::move(representation_kinds);
+  return true;
+}
+
+bool SubmissionLifetimeHold::acquire(
+    const std::vector<core::FacetRef>& representation_facets, std::string* error) {
+  if (!prepared()) {
+    if (error) *error = "submission lifetime hold must be prepared before acquisition";
+    return false;
+  }
+  if (held_) {
+    if (error) *error = "submission lifetime hold is already acquired";
+    return false;
+  }
+  if (representation_facets.size() != representation_kinds_.size()) {
+    if (error) *error = "physical representation outputs do not match the sealed lifetime plan";
+    return false;
+  }
+
+  std::vector<core::FacetLifetimeUse> facets = facet_inventory_;
+  for (size_t index = 0; index < representation_facets.size(); ++index)
+    facets.push_back({representation_facets[index], representation_kinds_[index]});
+  if (!sort_unique_facets(&facets, error)) return false;
+
+  std::vector<core::PointerRef> allocations = allocation_inventory_;
+  for (const auto& use : facets) {
+    core::FacetStatus status = core::FacetStatus::Ok;
+    const core::FacetSlot* slot = pool_->lookup(*arena_, use.ref, &status);
+    if (slot == nullptr) {
+      if (error) {
+        *error = "final lifetime facet " + std::to_string(use.ref.index) + ":" +
+                 std::to_string(use.ref.generation) + " is unavailable: " + core::to_string(status);
+      }
+      return false;
+    }
+    if (slot->kind != use.kind) {
+      if (error) {
+        *error = "final lifetime facet " + std::to_string(use.ref.index) + ":" +
+                 std::to_string(use.ref.generation) + " has the wrong facet kind";
+      }
+      return false;
+    }
+    allocations.push_back({slot->view.allocation, slot->view.allocation_generation});
+  }
+  sort_unique_allocations(&allocations);
+
+  acquired_allocations_.clear();
+  acquired_facets_.clear();
+  for (const auto ref : allocations) {
+    if (!arena_->acquire(ref.allocation, ref.generation)) {
+      if (error) {
+        *error = "could not acquire allocation lifetime hold for allocation " +
+                 std::to_string(ref.allocation) + " generation " + std::to_string(ref.generation) +
+                 ": stale or retired";
+      }
+      release();
+      return false;
+    }
+    acquired_allocations_.push_back(ref);
+  }
+  for (const auto& use : facets) {
+    std::string facet_error;
+    if (!pool_->begin_gpu_use(*arena_, use.ref, &facet_error)) {
+      if (error) {
+        *error = "could not acquire facet lifetime hold for facet " +
+                 std::to_string(use.ref.index) + ":" + std::to_string(use.ref.generation) +
+                 ": " + facet_error;
+      }
+      release();
+      return false;
+    }
+    acquired_facets_.push_back(use.ref);
+  }
+  held_ = true;
+  return true;
+}
+
+void SubmissionLifetimeHold::release() noexcept {
+  if (pool_ != nullptr) {
+    for (auto it = acquired_facets_.rbegin(); it != acquired_facets_.rend(); ++it)
+      (void)pool_->end_gpu_use(*it);
+  }
+  if (arena_ != nullptr) {
+    for (auto it = acquired_allocations_.rbegin(); it != acquired_allocations_.rend(); ++it)
+      (void)arena_->release(it->allocation, it->generation);
+  }
+  acquired_facets_.clear();
+  acquired_allocations_.clear();
+  held_ = false;
 }
 
 }  // namespace vg::hal

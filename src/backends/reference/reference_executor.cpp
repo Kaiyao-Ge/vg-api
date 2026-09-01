@@ -50,10 +50,14 @@ bool interpret_instruction(const ir::Instruction& instruction, size_t index, cor
 }  // namespace
 
 core::ExecutionResult execute(const ir::Module& module, core::Arena& arena, const core::Certificate* certificate,
-                              core::Timeline* timeline, core::TimelineGate gate) {
+                              core::Timeline* timeline, core::TimelineGate gate,
+                              const std::vector<ir::Effect>* sealed_effects) {
   core::ExecutionResult result;
   result.ok = true;
   result.poison = core::PoisonState::Valid;
+  // Verification here protects the direct interpreter from malformed
+  // instructions. ExecutionPlan callers pass `sealed_effects` below, so its
+  // inferred list is never a second certificate/effect authority.
   const auto verification = ir::verify(module);
   if (!verification.ok) { result.ok = false; result.poison = core::PoisonState::Poisoned; result.message = verification.message; result.fault.code = "IR_INVALID"; result.fault.message = verification.message; return result; }
   if (timeline != nullptr && gate.wait != 0) {
@@ -65,13 +69,17 @@ core::ExecutionResult execute(const ir::Module& module, core::Arena& arena, cons
     }
   }
   if (certificate != nullptr) {
-    for (const auto& effect : verification.inferred_effects)
+    const auto& certificate_effects =
+        sealed_effects != nullptr ? *sealed_effects : verification.inferred_effects;
+    for (const auto& effect : certificate_effects)
       if (!certificate->covers(effect)) result.missing_effects.push_back(effect);
     if (!result.missing_effects.empty()) {
       result.ok = false;
       result.outputs_valid = false;
       result.poison = core::PoisonState::Poisoned;
-      result.message = "certificate does not cover inferred effect";
+      result.message = sealed_effects != nullptr
+          ? "certificate does not cover sealed per-Task effect"
+          : "certificate does not cover inferred effect";
       result.fault = {0, result.missing_effects.front(), "CERTIFICATE_MISS", result.message, 0};
       return result;
     }

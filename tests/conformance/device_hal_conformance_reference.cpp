@@ -10,7 +10,6 @@ int main(int argc, char** argv) {
   }
   auto device = vg::reference::make_device_hal();
   vg::conformance::ConformanceExpectation expectation;
-  expectation.expect_linear_subset_only = false;
   expectation.expect_task_publication = true;
   expectation.expect_timeline = true;
   return vg::conformance::run(*device, "reference", expectation, argv[1]) ? 0 : 1;

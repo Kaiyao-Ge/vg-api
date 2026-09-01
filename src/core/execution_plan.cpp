@@ -2,10 +2,41 @@
 
 #include "core/scene_root.h"
 #include "ir/sha256.h"
+#include "vg_scene_root_layout.h"
 
 #include <algorithm>
 
 namespace vg::core {
+
+struct ExecutionPlan::SemanticSeal {
+  explicit SemanticSeal(const ExecutionPlan& plan)
+      : tasks(plan.task_graph.tasks()),
+        dependencies(plan.task_graph.dependencies()),
+        task_effects(plan.task_effects),
+        instantiated_effects(plan.instantiated_effects),
+        effect_edges(plan.validated_effect_graph.edges()),
+        task_order(plan.task_order),
+        required_capabilities(plan.required_capabilities),
+        certificate_ranges(plan.certificate.ranges),
+        touched_allocations(plan.touched_allocations),
+        lifetime_facets(plan.lifetime_facets) {
+    resolved_node_refs.reserve(plan.resolved_nodes.size());
+    for (const auto& node : plan.resolved_nodes) resolved_node_refs.push_back(node.ref);
+  }
+
+  std::vector<TaskRecord> tasks;
+  std::vector<std::pair<uint32_t, uint32_t>> dependencies;
+  std::vector<std::vector<ir::Effect>> task_effects;
+  std::vector<ir::Effect> instantiated_effects;
+  std::vector<EffectEdge> effect_edges;
+  std::vector<uint32_t> task_order;
+  std::vector<CapabilityRequirement> required_capabilities;
+  std::vector<ir::Effect> certificate_ranges;
+  std::vector<PointerRef> touched_allocations;
+  std::vector<FacetLifetimeUse> lifetime_facets;
+  std::vector<NodeTable::Ref> resolved_node_refs;
+};
+
 namespace {
 bool validate_representation_requests(const std::vector<RepresentationRequest>& requests, std::string* error) {
   for (size_t index = 0; index < requests.size(); ++index) {
@@ -96,31 +127,85 @@ bool representation_plan_matches(const ExecutionPlan& plan, std::string* error) 
   return true;
 }
 
-bool validate_tier2_select(const ExecutionPlan& plan, std::string* error) {
-  if (!plan.request_tier2_select) return true;
-  if (plan.authorized_node_classes.size() < 2) {
-    if (error) *error = "tier2 select requires at least two authorized node classes";
-    return false;
-  }
-  if (plan.task_graph.tasks().empty()) {
-    if (error) *error = "tier2 select requires a published task graph";
-    return false;
-  }
-  for (size_t i = 0; i < plan.authorized_node_classes.size(); ++i)
-    for (size_t j = i + 1; j < plan.authorized_node_classes.size(); ++j)
-      if (plan.authorized_node_classes[i] == plan.authorized_node_classes[j]) {
-        if (error) *error = "tier2 authorized node classes must be unique";
-        return false;
-      }
-  return true;
-}
-
 bool same_ref(PointerRef left, PointerRef right) {
   return left.allocation == right.allocation && left.generation == right.generation;
 }
 
 bool same_node_ref(NodeTable::Ref left, NodeTable::Ref right) {
   return left.index == right.index && left.generation == right.generation;
+}
+
+bool same_facet_ref(FacetRef left, FacetRef right) {
+  return left.index == right.index && left.generation == right.generation;
+}
+
+bool same_effect(const ir::Effect& left, const ir::Effect& right) {
+  return left.allocation == right.allocation && left.offset == right.offset &&
+         left.size == right.size && left.access == right.access &&
+         left.representation_epoch == right.representation_epoch;
+}
+
+bool same_effects(const std::vector<ir::Effect>& left,
+                  const std::vector<ir::Effect>& right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(), same_effect);
+}
+
+bool same_task_effects(const std::vector<std::vector<ir::Effect>>& left,
+                       const std::vector<std::vector<ir::Effect>>& right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(), same_effects);
+}
+
+bool same_effect_edge(const EffectEdge& left, const EffectEdge& right) {
+  return left.before == right.before && left.after == right.after &&
+         left.kind == right.kind && left.timeline_value == right.timeline_value;
+}
+
+bool same_effect_edges(const std::vector<EffectEdge>& left,
+                       const std::vector<EffectEdge>& right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(), same_effect_edge);
+}
+
+bool absent(FacetRef ref) {
+  return ref.index == 0 && ref.generation == 0;
+}
+
+bool same_task_record(const TaskRecord& left, const TaskRecord& right) {
+  return left.node_index == right.node_index &&
+         left.node_generation == right.node_generation &&
+         left.root_allocation == right.root_allocation &&
+         left.root_generation == right.root_generation && left.x == right.x &&
+         left.y == right.y && left.z == right.z && left.flags == right.flags &&
+         left.contract_index == right.contract_index &&
+         left.payload_size == right.payload_size &&
+         left.payload_or_offset == right.payload_or_offset &&
+         left.kind == right.kind && left.topology == right.topology &&
+         same_facet_ref(left.raster_facets.source, right.raster_facets.source) &&
+         same_facet_ref(left.raster_facets.target, right.raster_facets.target) &&
+         same_facet_ref(left.depth_attachment_ref, right.depth_attachment_ref) &&
+         left.depth_test_enable == right.depth_test_enable &&
+         left.depth_write_enable == right.depth_write_enable &&
+         left.depth_compare_op == right.depth_compare_op &&
+         same_facet_ref(left.vertex_buffer_ref, right.vertex_buffer_ref) &&
+         same_facet_ref(left.index_buffer_ref, right.index_buffer_ref) &&
+         left.index_count == right.index_count &&
+         left.raster_filter == right.raster_filter &&
+         left.raster_wrap == right.raster_wrap &&
+         left.raster_tint == right.raster_tint;
+}
+
+bool same_task_records(const std::vector<TaskRecord>& left,
+                       const std::vector<TaskRecord>& right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(), same_task_record);
+}
+
+bool same_node_refs(const std::vector<NodeTable::Ref>& left,
+                    const std::vector<NodeTable::Ref>& right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(), same_node_ref);
 }
 
 template <typename T, typename U, typename Equal>
@@ -135,6 +220,49 @@ bool append_touched(PointerRef ref, const Arena& arena, std::vector<PointerRef>*
   }
   if (!contains(*out, ref, same_ref)) out->push_back(ref);
   return true;
+}
+
+bool append_lifetime_facet(FacetRef ref, FacetKind kind,
+                           std::vector<FacetLifetimeUse>* out, std::string* error) {
+  // The all-zero value is the Task ABI's absent optional token. Required
+  // raster operands are diagnosed by the backend's semantic operation; there
+  // is no capability to retain until then. A partially-zero token is retained
+  // here so the unified lifetime owner can reject it as stale before Stage 7.
+  if (ref.index == 0 && ref.generation == 0) return true;
+  const auto found = std::ranges::find_if(*out, [&](const FacetLifetimeUse& use) {
+    return same_facet_ref(use.ref, ref);
+  });
+  if (found != out->end()) {
+    if (found->kind != kind) {
+      if (error) *error = "one raster FacetRef is used with incompatible facet kinds";
+      return false;
+    }
+    return true;
+  }
+  out->push_back({ref, kind});
+  return true;
+}
+
+bool facet_lifetime_less(const FacetLifetimeUse& left, const FacetLifetimeUse& right) {
+  if (left.ref.index != right.ref.index) return left.ref.index < right.ref.index;
+  if (left.ref.generation != right.ref.generation)
+    return left.ref.generation < right.ref.generation;
+  return static_cast<uint32_t>(left.kind) < static_cast<uint32_t>(right.kind);
+}
+
+bool same_pointer_ref_list(const std::vector<PointerRef>& left,
+                           const std::vector<PointerRef>& right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(), same_ref);
+}
+
+bool same_lifetime_uses(const std::vector<FacetLifetimeUse>& left,
+                        const std::vector<FacetLifetimeUse>& right) {
+  return left.size() == right.size() &&
+         std::equal(left.begin(), left.end(), right.begin(),
+                    [](const FacetLifetimeUse& lhs, const FacetLifetimeUse& rhs) {
+    return same_facet_ref(lhs.ref, rhs.ref) && lhs.kind == rhs.kind;
+  });
 }
 
 bool same_ref_sets(const std::vector<PointerRef>& left, const std::vector<PointerRef>& right) {
@@ -192,6 +320,167 @@ bool append_bounded_pointer_targets(const ir::Module& module, const Arena& arena
   return true;
 }
 
+// ir::verify deliberately keeps bounded pointer-edge authorization separate
+// from declared_effects, but Stage 3 still needs the concrete dereference as
+// an executable access fact.  The target is finite and immutable here: every
+// via instruction already passed PointerEdge verification and names its full
+// allocation/range/representation epoch.
+std::vector<ir::Effect> instantiate_node_effects(const ir::Module& module) {
+  std::vector<ir::Effect> effects = ir::verify(module).inferred_effects;
+  for (const auto& instruction : module.instructions) {
+    if (instruction.op != "load_via" && instruction.op != "store_via") continue;
+    effects.push_back({instruction.allocation, instruction.offset, instruction.size,
+                       instruction.op == "load_via" ? ir::Access::Read : ir::Access::Write,
+                       instruction.representation_epoch});
+  }
+  return effects;
+}
+
+enum class RasterEffectRange { View, FullBacking, IndexElements };
+
+bool append_raster_facet_effect(const Arena& arena, const FacetPool* pool,
+                                FacetRef ref, FacetKind expected_kind,
+                                ir::Access access, RasterEffectRange range,
+                                uint32_t element_count, const char* label,
+                                std::vector<ir::Effect>* effects,
+                                std::vector<PointerRef>* touched,
+                                std::vector<FacetLifetimeUse>* lifetime,
+                                std::string* error) {
+  if (absent(ref)) return true;
+  if (pool == nullptr) {
+    if (error) *error = std::string("raster semantic assembly requires the submitting FacetPool to resolve ") + label;
+    return false;
+  }
+  FacetStatus status = FacetStatus::Ok;
+  const FacetSlot* slot = pool->lookup(arena, ref, &status);
+  if (slot == nullptr) {
+    if (error) *error = std::string(label) + ": " + to_string(status);
+    return false;
+  }
+  if (slot->kind != expected_kind) {
+    if (error) *error = std::string(label) + ": facet kind mismatch";
+    return false;
+  }
+  if (!append_touched({slot->view.allocation, slot->view.allocation_generation},
+                      arena, touched, error) ||
+      !append_lifetime_facet(ref, expected_kind, lifetime, error))
+    return false;
+  const Allocation* allocation =
+      arena.lookup(PointerRef{slot->view.allocation,
+                              slot->view.allocation_generation});
+  if (allocation == nullptr) {
+    if (error) *error = std::string(label) + ": backing allocation is inactive";
+    return false;
+  }
+  uint64_t size = slot->view.byte_size();
+  if (range == RasterEffectRange::FullBacking) {
+    size = allocation->bytes.size();
+  } else if (range == RasterEffectRange::IndexElements) {
+    const uint64_t stride = slot->view.format == PixelFormat::R16Uint ? 2u :
+                            slot->view.format == PixelFormat::R32Uint ? 4u : 0u;
+    if (stride == 0 || element_count % 3 != 0 ||
+        element_count > UINT64_MAX / stride) {
+      if (error) *error = "raster index facet requires R16Uint/R32Uint and a triangle-list count";
+      return false;
+    }
+    size = static_cast<uint64_t>(element_count) * stride;
+  }
+  if (size == 0) {
+    if (error) *error = std::string(label) + ": facet view has an empty effect range";
+    return false;
+  }
+  if (size > allocation->bytes.size()) {
+    if (error) *error = std::string(label) + ": effect range exceeds backing allocation";
+    return false;
+  }
+  effects->push_back({slot->view.allocation, 0, size, access,
+                      slot->representation_epoch});
+  return true;
+}
+
+bool instantiate_raster_task_effects(const TaskRecord& task,
+                                     std::string_view root_schema,
+                                     const Arena& arena, const FacetPool* pool,
+                                     std::vector<ir::Effect>* effects,
+                                     std::vector<PointerRef>* touched,
+                                     std::vector<FacetLifetimeUse>* lifetime,
+                                     std::string* error) {
+  effects->clear();
+  FacetRef source = task.raster_facets.source;
+  if (is_scene_root_raster_schema(root_schema)) {
+    ResolvedSceneRootRaster root;
+    if (!resolve_scene_root_raster(arena, task, &root, error)) return false;
+    source = root.albedo;
+    effects->push_back({task.root_allocation, 0,
+                        VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE,
+                        ir::Access::Read, root.allocation->representation_epoch});
+  }
+  if (absent(source)) {
+    if (error) *error = "raster source facet is required";
+    return false;
+  }
+  if (absent(task.raster_facets.target)) {
+    if (error) *error = "raster target facet is required";
+    return false;
+  }
+  if (absent(task.vertex_buffer_ref)) {
+    if (error) *error = "raster vertex facet is required";
+    return false;
+  }
+  if (task.index_count != 0 && absent(task.index_buffer_ref)) {
+    if (error) *error = "raster index facet is required when index_count is non-zero";
+    return false;
+  }
+  if (absent(task.depth_attachment_ref) &&
+      (task.depth_test_enable || task.depth_write_enable)) {
+    if (error) *error = "raster depth state requires a depth attachment facet";
+    return false;
+  }
+  if (!append_raster_facet_effect(arena, pool, source, FacetKind::Sample,
+                                  ir::Access::Read, RasterEffectRange::View, 0,
+                                  "raster source facet",
+                                  effects, touched, lifetime, error) ||
+      !append_raster_facet_effect(arena, pool, task.raster_facets.target,
+                                  FacetKind::Attachment, ir::Access::Write,
+                                  RasterEffectRange::View, 0,
+                                  "raster target facet", effects, touched,
+                                  lifetime, error) ||
+      !append_raster_facet_effect(arena, pool, task.vertex_buffer_ref,
+                                  FacetKind::Address, ir::Access::Read,
+                                  RasterEffectRange::FullBacking, 0,
+                                  "raster vertex facet", effects, touched,
+                                  lifetime, error))
+    return false;
+  if (task.index_count != 0 &&
+      !append_raster_facet_effect(arena, pool, task.index_buffer_ref,
+                                  FacetKind::Address, ir::Access::Read,
+                                  RasterEffectRange::IndexElements,
+                                  task.index_count,
+                                  "raster index facet", effects, touched,
+                                  lifetime, error))
+    return false;
+  if (!absent(task.depth_attachment_ref)) {
+    if (task.depth_test_enable &&
+        !append_raster_facet_effect(arena, pool, task.depth_attachment_ref,
+                                    FacetKind::Attachment, ir::Access::Read,
+                                    RasterEffectRange::View, 0,
+                                    "raster depth facet", effects, touched,
+                                    lifetime, error))
+      return false;
+    // A present depth attachment is cleared/stored by the fixed raster
+    // attachment contract even when depth testing and depth writes are off.
+    // Keep that physical write in the sealed certificate; depth testing adds
+    // the independent read above.
+    if (!append_raster_facet_effect(arena, pool, task.depth_attachment_ref,
+                                    FacetKind::Attachment, ir::Access::Write,
+                                    RasterEffectRange::View, 0,
+                                    "raster depth facet", effects, touched,
+                                    lifetime, error))
+      return false;
+  }
+  return true;
+}
+
 bool envelope_authorizes(const ExecutionEnvelope& envelope, NodeTable::Ref ref) {
   return envelope.allowed_nodes.empty() ||
          contains(envelope.allowed_nodes, ref, same_node_ref);
@@ -220,26 +509,32 @@ bool derive_capability_requirements(ExecutionPlan* plan, std::string* error) {
   if (!plan->task_graph.tasks().empty()) add_requirement(&requirements, CapabilityRequirement::TaskPublication);
   if (plan->timeline_wait != 0 || plan->timeline_signal != 0)
     add_requirement(&requirements, CapabilityRequirement::Timeline);
-  // Ordinary load/store effects are semantic access facts, not a request for
-  // a backend-owned EffectDag lowering.  The latter is only required for the
-  // legacy explicit multi-pass form, whose scheduling contract an adapter
-  // must actually implement.
-  if (!plan->effect_dag_passes.empty())
+  // A multi-Task graph requires the adapter to preserve the assembler-sealed
+  // effect ordering; there is no parallel list of executable passes.
+  if (plan->task_graph.tasks().size() > 1)
     add_requirement(&requirements, CapabilityRequirement::EffectDag);
   if (!plan->representation_requests.empty())
     add_requirement(&requirements, CapabilityRequirement::RepresentationTransform);
 
+  bool has_compute = false;
+  bool has_raster = false;
   for (const auto& task : plan->task_graph.tasks()) {
     switch (task.kind) {
       case TaskKind::Compute:
+        has_compute = true;
         break;
       case TaskKind::Raster:
+        has_raster = true;
         add_requirement(&requirements, CapabilityRequirement::Raster);
         break;
       default:
         if (error) *error = "task execution domain is Unsupported by the canonical core assembler";
         return false;
     }
+  }
+  if (has_compute && has_raster) {
+    if (error) *error = "compute+raster mixed-domain TaskGraphs remain Unsupported";
+    return false;
   }
   for (const auto& node : plan->resolved_nodes) {
     if (node.user_raster_shader.has_value()) add_requirement(&requirements, CapabilityRequirement::UserShaderImport);
@@ -266,16 +561,6 @@ bool derive_capability_requirements(ExecutionPlan* plan, std::string* error) {
       return false;
   }
 
-  // Transitional request_* fields are assembler inputs only.  They never
-  // cross the Stage 5/6 boundary as requirements in their own right.
-  if (plan->request_tier1_indirect) add_requirement(&requirements, CapabilityRequirement::IndirectTier1);
-  // NodeRef identity is deliberately not a node class.  Until a real class
-  // source exists in the node contract, Tier2 cannot be authorized safely.
-  if (plan->request_tier2_select) {
-    if (error) *error = "Tier2 selection is Unsupported: no canonical node-class contract is available";
-    return false;
-  }
-  if (plan->request_indexed_binding) add_requirement(&requirements, CapabilityRequirement::IndexedBinding);
   std::sort(requirements.begin(), requirements.end(), [](auto left, auto right) {
     return static_cast<uint32_t>(left) < static_cast<uint32_t>(right);
   });
@@ -284,35 +569,48 @@ bool derive_capability_requirements(ExecutionPlan* plan, std::string* error) {
   return true;
 }
 
-bool validate_instantiated_happens_before(const TaskGraph& graph,
-                                          const std::vector<std::vector<ir::Effect>>& effects,
-                                          std::string* error) {
+bool build_validated_effect_graph(const TaskGraph& graph,
+                                  const std::vector<std::vector<ir::Effect>>& effects,
+                                  EffectGraph* out, std::string* error) {
+  if (out == nullptr) {
+    if (error) *error = "validated EffectGraph output is required";
+    return false;
+  }
   const uint32_t count = static_cast<uint32_t>(effects.size());
+  EffectGraph sealed;
   std::vector<std::vector<uint32_t>> adjacency(count);
   for (const auto& [before, after] : graph.dependencies()) {
-    if (before >= count || after >= count) {
-      if (error) *error = "effect edge references an unknown task";
+    if (before >= count || after >= count ||
+        !sealed.add_edge(before, after, EffectEdgeKind::Explicit, 0, error))
       return false;
-    }
     adjacency[before].push_back(after);
   }
   const auto reaches = [&](uint32_t source, uint32_t destination) {
     std::vector<uint8_t> seen(count);
     std::vector<uint32_t> work{source};
     seen[source] = 1;
-    for (size_t i = 0; i < work.size(); ++i) for (const auto next : adjacency[work[i]])
-      if (!seen[next]) { seen[next] = 1; work.push_back(next); }
+    for (size_t index = 0; index < work.size(); ++index) {
+      for (uint32_t next : adjacency[work[index]]) {
+        if (!seen[next]) { seen[next] = 1; work.push_back(next); }
+      }
+    }
     return seen[destination] != 0;
   };
-  for (uint32_t left = 0; left < count; ++left) for (uint32_t right = left + 1; right < count; ++right) {
-    bool conflict = false;
-    for (const auto& lhs : effects[left]) for (const auto& rhs : effects[right])
-      conflict = conflict || EffectGraph::conflicts(lhs, rhs);
-    if (conflict && !reaches(left, right) && !reaches(right, left)) {
-      if (error) *error = "conflicting task effects have no happens-before edge";
-      return false;
+  for (uint32_t left = 0; left < count; ++left) {
+    for (uint32_t right = left + 1; right < count; ++right) {
+      bool conflict = false;
+      for (const auto& lhs : effects[left]) for (const auto& rhs : effects[right])
+        conflict = conflict || EffectGraph::conflicts(lhs, rhs);
+      if (!conflict || reaches(left, right) || reaches(right, left)) continue;
+      if (!sealed.add_edge(left, right, EffectEdgeKind::InferredConflict, 0, error)) return false;
+      adjacency[left].push_back(right);
     }
   }
+  if (!sealed.valid() || !sealed.validate_happens_before(effects, error)) {
+    if (error && error->empty()) *error = "assembler could not seal the validated EffectGraph";
+    return false;
+  }
+  *out = std::move(sealed);
   return true;
 }
 }  // namespace
@@ -339,6 +637,18 @@ const char* capability_requirement_name(CapabilityRequirement requirement) {
 bool ExecutionPlan::validate(std::string* error) const {
   if (assembled) {
     if (!representation_plan_matches(*this, error)) return false;
+    if (!lifetime_plan_derived) {
+      if (error) *error = "assembled execution plan is missing sealed lifetime facts";
+      return false;
+    }
+    if (!std::is_sorted(lifetime_facets.begin(), lifetime_facets.end(), facet_lifetime_less) ||
+        std::adjacent_find(lifetime_facets.begin(), lifetime_facets.end(),
+                           [](const FacetLifetimeUse& left, const FacetLifetimeUse& right) {
+                             return same_facet_ref(left.ref, right.ref);
+                           }) != lifetime_facets.end()) {
+      if (error) *error = "assembled execution plan facet lifetime facts are not deterministic";
+      return false;
+    }
     if (!capability_requirements_derived) {
       if (error) *error = "assembled execution plan is missing sealed capability requirements";
       return false;
@@ -349,8 +659,38 @@ bool ExecutionPlan::validate(std::string* error) const {
       if (error) *error = "assembled execution plan capability requirements are not deterministic";
       return false;
     }
-    if (task_order.size() != task_graph.tasks().size()) {
+    ExecutionPlan derived_requirements = *this;
+    derived_requirements.required_capabilities.clear();
+    derived_requirements.capability_requirements_derived = false;
+    std::string requirement_error;
+    if (!derive_capability_requirements(&derived_requirements, &requirement_error) ||
+        derived_requirements.required_capabilities != required_capabilities) {
+      if (error) *error = requirement_error.empty()
+          ? "sealed capability requirements disagree with the execution semantics"
+          : requirement_error;
+      return false;
+    }
+    if (task_order.size() != task_graph.tasks().size() ||
+        task_effects.size() != task_graph.tasks().size()) {
       if (error) *error = "assembled execution plan is missing its deterministic task order";
+      return false;
+    }
+    std::vector<uint8_t> seen_task(task_effects.size());
+    for (uint32_t task_index : task_order) {
+      if (task_index >= task_effects.size() || seen_task[task_index] != 0) {
+        if (error) *error = "assembled execution plan task order is out of range or contains a duplicate";
+        return false;
+      }
+      seen_task[task_index] = 1;
+    }
+    if (!validated_effect_graph.valid() ||
+        !validated_effect_graph.validate_happens_before(task_effects, error)) {
+      if (error && error->empty()) *error = "assembled execution plan is missing its validated EffectGraph";
+      return false;
+    }
+    if (validated_effect_graph_shape != classify_effect_graph_shape(
+            validated_effect_graph, static_cast<uint32_t>(task_effects.size()))) {
+      if (error) *error = "validated EffectGraph shape was tampered after semantic assembly";
       return false;
     }
     for (const auto& task : task_graph.tasks()) {
@@ -361,6 +701,116 @@ bool ExecutionPlan::validate(std::string* error) const {
         if (error) *error = "assembled execution plan has a duplicate or missing resolved task node";
         return false;
       }
+    }
+    std::vector<NodeTable::Ref> unique_task_refs;
+    for (const auto& task : task_graph.tasks()) {
+      const NodeTable::Ref ref{task.node_index, task.node_generation};
+      if (!contains(unique_task_refs, ref, same_node_ref))
+        unique_task_refs.push_back(ref);
+    }
+    if (resolved_nodes.size() != unique_task_refs.size()) {
+      if (error) *error = "assembled execution plan contains a resolved Node with no Task";
+      return false;
+    }
+    for (const auto& node : resolved_nodes) {
+      if (!node.code_object ||
+          node.module.has_value() != node.code_object->module.has_value() ||
+          node.user_raster_shader.has_value() != node.code_object->user_raster_shader.has_value()) {
+        if (error) *error = "resolved Node program disagrees with its immutable CodeObject snapshot";
+        return false;
+      }
+      if (node.module.has_value()) {
+        const std::string resolved_canonical = ir::serialize_module(*node.module);
+        const std::string object_canonical = ir::serialize_module(*node.code_object->module);
+        if (resolved_canonical != object_canonical ||
+            node.module->canonical_json != node.code_object->module->canonical_json ||
+            node.module->hash != node.code_object->module->hash) {
+          if (error) *error = "resolved Node module drifted from its immutable CodeObject snapshot";
+          return false;
+        }
+      }
+      if (node.user_raster_shader.has_value()) {
+        const auto& resolved = *node.user_raster_shader;
+        const auto& object = *node.code_object->user_raster_shader;
+        if (resolved.root_schema != object.root_schema ||
+            resolved.vertex_entry != object.vertex_entry ||
+            resolved.fragment_entry != object.fragment_entry ||
+            resolved.vertex_abi != object.vertex_abi ||
+            resolved.source != object.source) {
+          if (error) *error = "resolved raster contract drifted from its immutable CodeObject snapshot";
+          return false;
+        }
+      }
+    }
+    for (size_t task_index = 0; task_index < task_graph.tasks().size(); ++task_index) {
+      const auto& task = task_graph.tasks()[task_index];
+      const NodeTable::Ref ref{task.node_index, task.node_generation};
+      const auto resolved = std::ranges::find_if(resolved_nodes, [&](const ResolvedNode& node) {
+        return same_node_ref(node.ref, ref);
+      });
+      if (resolved == resolved_nodes.end()) {
+        if (error) *error = "assembled execution plan is missing its immutable per-Task Node snapshot";
+        return false;
+      }
+      if (task.kind == TaskKind::Compute) {
+        const auto expected = resolved->module.has_value()
+            ? instantiate_node_effects(*resolved->module) : std::vector<ir::Effect>{};
+        if (expected.size() != task_effects[task_index].size() ||
+            !std::equal(expected.begin(), expected.end(),
+                        task_effects[task_index].begin(), same_effect)) {
+          if (error) *error = "sealed per-Task effects disagree with the immutable Node program";
+          return false;
+        }
+      }
+    }
+    EffectGraph expected_effect_graph;
+    std::string graph_error;
+    if (!build_validated_effect_graph(task_graph, task_effects,
+                                      &expected_effect_graph, &graph_error) ||
+        expected_effect_graph.edges().size() != validated_effect_graph.edges().size() ||
+        !std::equal(expected_effect_graph.edges().begin(),
+                    expected_effect_graph.edges().end(),
+                    validated_effect_graph.edges().begin(), same_effect_edge)) {
+      if (error) *error = graph_error.empty()
+          ? "validated EffectGraph disagrees with canonical TaskGraph/effect derivation"
+          : graph_error;
+      return false;
+    }
+    std::vector<ir::Effect> actual_flattened;
+    for (uint32_t task_index : task_order)
+      actual_flattened.insert(actual_flattened.end(), task_effects[task_index].begin(),
+                              task_effects[task_index].end());
+    if (actual_flattened.size() != instantiated_effects.size() ||
+        !std::equal(actual_flattened.begin(), actual_flattened.end(),
+                    instantiated_effects.begin(), same_effect)) {
+      if (error) *error = "flattened effect certificate facts disagree with the per-Task facts";
+      return false;
+    }
+    std::vector<NodeTable::Ref> resolved_node_refs;
+    resolved_node_refs.reserve(resolved_nodes.size());
+    for (const auto& node : resolved_nodes) resolved_node_refs.push_back(node.ref);
+    if (!semantic_seal ||
+        !same_task_records(task_graph.tasks(), semantic_seal->tasks) ||
+        task_graph.dependencies() != semantic_seal->dependencies ||
+        !same_node_refs(resolved_node_refs, semantic_seal->resolved_node_refs) ||
+        !same_task_effects(task_effects, semantic_seal->task_effects) ||
+        !same_effects(instantiated_effects, semantic_seal->instantiated_effects) ||
+        !same_effect_edges(validated_effect_graph.edges(), semantic_seal->effect_edges) ||
+        task_order != semantic_seal->task_order ||
+        required_capabilities != semantic_seal->required_capabilities ||
+        !same_effects(certificate.ranges, semantic_seal->certificate_ranges) ||
+        !same_pointer_ref_list(touched_allocations, semantic_seal->touched_allocations) ||
+        !same_lifetime_uses(lifetime_facets, semantic_seal->lifetime_facets)) {
+      if (error) *error = "assembled execution plan semantic facts disagree with the immutable assembler seal";
+      return false;
+    }
+    std::vector<uint32_t> effect_order;
+    if (!effect_graph_deterministic_order(validated_effect_graph,
+                                          static_cast<uint32_t>(task_effects.size()),
+                                          &effect_order, error) || effect_order != task_order) {
+      if (error && error->empty())
+        *error = "validated EffectGraph order disagrees with the sealed TaskGraph order";
+      return false;
     }
     if (requested_certificate_mode.has_value()) {
       if (!access_plan_derived || !access_certificate.has_value()) {
@@ -400,24 +850,10 @@ bool ExecutionPlan::validate(std::string* error) const {
         return false;
       }
     }
-  } else if (user_raster_shader.has_value()) {
-    if (user_raster_shader->vertex_abi != ir::kRasterVertexAbiXyzuvPackedV1) {
-      if (error) *error = "a user_raster_shader submission requires vertex_abi vg.raster.vertex.xyzuv-packed/v1";
-      return false;
-    }
-    if (!require_raster_only(task_graph,
-                             "a user_raster_shader submission may only contain raster tasks", error))
-      return false;
   } else {
-    const auto verification = ir::verify(module);
-    if (!verification.ok) { if (error) *error = verification.message; return false; }
-  }
-  const std::string& root_schema = user_raster_shader ? user_raster_shader->root_schema : module.root_schema;
-  if (!assembled && is_scene_root_raster_schema(root_schema) &&
-      !require_raster_only(task_graph,
-                           "a SceneRoot raster submission may only contain raster tasks; compute+raster mixing is deferred",
-                           error))
+    if (error) *error = "execution plan must be produced by the canonical core assembler";
     return false;
+  }
   if (timeline_signal != 0 && timeline_signal <= timeline_wait) {
     if (error) *error = "timeline signal does not advance past wait";
     return false;
@@ -434,7 +870,7 @@ bool ExecutionPlan::validate(std::string* error) const {
     return false;
   }
   if (pending_overflow && !pending_overflow->valid(error)) return false;
-  return validate_tier2_select(*this, error);
+  return true;
 }
 
 bool ExecutionPlan::graph_epoch_matches(const Arena& arena, std::string* error) const {
@@ -467,18 +903,12 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
   if (!graph.validate_execution(error)) return false;
 
   ExecutionPlan plan;
-  if (!graph.deterministic_order(&plan.task_order, error)) return false;
   plan.task_graph = graph;
   plan.published = true;
   plan.graph_epoch = inputs.graph_epoch == 0 ? arena.topology_epoch() : inputs.graph_epoch;
   plan.authorized_nodes = envelope.allowed_nodes;
   plan.timeline_wait = envelope.timeline_wait;
   plan.timeline_signal = envelope.timeline_signal;
-  plan.request_tier1_indirect = inputs.request_tier1_indirect;
-  plan.request_tier2_select = inputs.request_tier2_select;
-  plan.request_indexed_binding = inputs.request_indexed_binding;
-  if (inputs.effect_dag_passes != nullptr) plan.effect_dag_passes = *inputs.effect_dag_passes;
-  if (inputs.effect_dag_dependencies != nullptr) plan.effect_dag_dependencies = *inputs.effect_dag_dependencies;
   if (inputs.representation_requests != nullptr) plan.representation_requests = *inputs.representation_requests;
   if (!freeze_representation_plan(plan.representation_requests, arena, inputs.facet_pool,
                                   &plan.representation_plan, error)) return false;
@@ -505,8 +935,15 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
   }
 
   std::vector<PointerRef> actual_touched;
-  std::vector<std::vector<ir::Effect>> task_effects(graph.tasks().size());
-  for (const auto task_index : plan.task_order) {
+  for (const auto& item : plan.representation_plan) {
+    if (!append_touched({item.view.allocation, item.view.allocation_generation}, arena,
+                        &actual_touched, error)) {
+      if (error) *error = "representation plan names an inactive allocation generation";
+      return false;
+    }
+  }
+  plan.task_effects.resize(graph.tasks().size());
+  for (uint32_t task_index = 0; task_index < graph.tasks().size(); ++task_index) {
     const TaskRecord& task = graph.tasks()[task_index];
     const NodeTable::Ref ref{task.node_index, task.node_generation};
     NodeEntry snapshot;
@@ -536,7 +973,7 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
         if (error) *error = "node execution domain is Unsupported by the canonical core assembler";
         return false;
       }
-      // Canonical IR remains usable for the legacy raster Task shape; only a
+      // Canonical IR remains usable for the built-in raster Task contract; only a
       // restricted imported raster package is raster-exclusive.
       if (raster_node && task.kind != TaskKind::Raster) {
         if (error) *error = "task kind does not match its resolved node execution domain";
@@ -571,15 +1008,39 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
     const auto resolved = std::find_if(plan.resolved_nodes.begin(), plan.resolved_nodes.end(), [&](const auto& node) {
       return same_node_ref(node.ref, ref);
     });
-    const std::vector<ir::Effect> effects = resolved->module.has_value()
-        ? ir::verify(*resolved->module).inferred_effects : std::vector<ir::Effect>{};
-    task_effects[task_index] = effects;
-    for (const auto& effect : effects) {
-      plan.instantiated_effects.push_back(effect);
-      if (!append_touched({effect.allocation, 1}, arena, &actual_touched, error)) return false;
+    std::vector<ir::Effect> effects;
+    if (task.kind == TaskKind::Compute) {
+      if (!resolved->module.has_value()) {
+        if (error) *error = "compute Task does not resolve to a canonical module";
+        return false;
+      }
+      effects = instantiate_node_effects(*resolved->module);
+    } else {
+      const std::string& root_schema = resolved->user_raster_shader.has_value()
+          ? resolved->user_raster_shader->root_schema : resolved->module->root_schema;
+      if (!instantiate_raster_task_effects(task, root_schema, arena,
+                                           inputs.facet_pool, &effects,
+                                           &actual_touched,
+                                           &plan.lifetime_facets, error))
+        return false;
     }
+    plan.task_effects[task_index] = effects;
+    if (task.kind == TaskKind::Compute)
+      for (const auto& effect : effects)
+        if (!append_touched({effect.allocation, 1}, arena, &actual_touched, error)) return false;
   }
-  if (!validate_instantiated_happens_before(graph, task_effects, error)) return false;
+  if (!build_validated_effect_graph(graph, plan.task_effects,
+                                    &plan.validated_effect_graph, error)) return false;
+  if (!effect_graph_deterministic_order(plan.validated_effect_graph,
+                                        static_cast<uint32_t>(plan.task_effects.size()),
+                                        &plan.task_order, error)) return false;
+  plan.instantiated_effects.clear();
+  for (uint32_t task_index : plan.task_order)
+    plan.instantiated_effects.insert(plan.instantiated_effects.end(),
+                                     plan.task_effects[task_index].begin(),
+                                     plan.task_effects[task_index].end());
+  plan.validated_effect_graph_shape = classify_effect_graph_shape(
+      plan.validated_effect_graph, static_cast<uint32_t>(plan.task_effects.size()));
   // The output list contains exactly one snapshot for each unique task ref.
   for (const auto& task : graph.tasks()) {
     const NodeTable::Ref ref{task.node_index, task.node_generation};
@@ -725,8 +1186,11 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
     return false;
   }
   plan.touched_allocations = std::move(actual_touched);
+  std::sort(plan.lifetime_facets.begin(), plan.lifetime_facets.end(), facet_lifetime_less);
+  plan.lifetime_plan_derived = true;
   if (!derive_capability_requirements(&plan, error)) return false;
   plan.assembled = true;
+  plan.semantic_seal = std::make_shared<const ExecutionPlan::SemanticSeal>(plan);
   if (!plan.validate(error)) return false;
   *out = std::move(plan);
   return true;

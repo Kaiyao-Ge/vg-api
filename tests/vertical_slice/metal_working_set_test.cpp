@@ -56,7 +56,7 @@ vg::ir::Module store_module() {
 }
 
 bool assemble_store_plan(vg::core::Arena& arena, const vg::ir::Module& module, vg::core::PointerRef root,
-                         vg::test_support::AssembledPlanFixture* fixture, vg::hal::ExecutionPlan* plan,
+                         vg::test_support::AssembledPlanFixture* fixture, vg::core::ExecutionPlan* plan,
                          std::string* error, const vg::core::WorkingSetBudget* budget = nullptr,
                          const vg::core::WorkingSetLease* lease = nullptr,
                          const std::vector<vg::core::PointerRef>* seeds = nullptr,
@@ -96,7 +96,7 @@ int main() {
     vg::core::WorkingSetLease lease;
     lease.allocations.push_back({first.id, first.generation});
     lease.byte_limit = 16;
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     vg::test_support::AssembledPlanFixture fixture;
     vg::hal::Submission submission;
     std::string error;
@@ -119,7 +119,7 @@ int main() {
     const auto& first = arena.allocate(16);
     arena.allocate(16);
     vg::core::WorkingSetBudget budget = vg::core::WorkingSetBudget::limited(16);
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     vg::test_support::AssembledPlanFixture fixture;
     std::string error;
     if (assemble_store_plan(arena, module, {first.id, first.generation}, &fixture, &plan, &error,
@@ -139,7 +139,7 @@ int main() {
   {
     vg::core::Arena arena;
     const auto& first = arena.allocate(16);
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     vg::test_support::AssembledPlanFixture fixture;
     vg::hal::CompiledPlan compiled;
     std::string error;
@@ -187,7 +187,7 @@ int main() {
     lease.byte_limit = discovery.result_bytes;
     lease.complete = true;
     const std::vector<vg::core::PointerRef> seeds{{seed_alloc.id, seed_alloc.generation}};
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     vg::test_support::AssembledPlanFixture fixture;
     vg::hal::Submission submission;
     if (!assemble_store_plan(arena, module, {seed_alloc.id, seed_alloc.generation}, &fixture, &plan, &error,

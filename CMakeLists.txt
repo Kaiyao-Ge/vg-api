@@ -20,6 +20,7 @@ find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 set(VG_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(VG_SCHEMA_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/schemas/ir/task-root.vg.json")
 set(VG_SCENE_ROOT_SCHEMA_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/schemas/ir/scene-root-raster.vg.json")
+set(VG_COMPUTE_TASK_RING_SCHEMA_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/schemas/ir/compute-task-ring.vg.json")
 set(VG_SCHEMA_HEADER "${VG_GENERATED_DIR}/vg_task_root.h")
 set(VG_SCHEMA_REFLECTION "${VG_GENERATED_DIR}/vg_task_root.reflection.json")
 set(VG_SCHEMA_GOLDEN "${VG_GENERATED_DIR}/vg_task_root.layout.json")
@@ -28,6 +29,11 @@ set(VG_SCENE_ROOT_LAYOUT_HEADER "${VG_GENERATED_DIR}/vg_scene_root_layout.h")
 set(VG_SCENE_ROOT_MSL_HEADER "${VG_GENERATED_DIR}/vg_scene_root_msl.h")
 set(VG_SCENE_ROOT_REFLECTION "${VG_GENERATED_DIR}/vg_scene_root.reflection.json")
 set(VG_SCENE_ROOT_GOLDEN "${VG_GENERATED_DIR}/vg_scene_root.layout.json")
+set(VG_COMPUTE_TASK_RING_HEADER "${VG_GENERATED_DIR}/vg_compute_task_ring.h")
+set(VG_COMPUTE_TASK_RING_LAYOUT_HEADER "${VG_GENERATED_DIR}/vg_compute_task_ring_layout.h")
+set(VG_COMPUTE_TASK_RING_WORDS_HEADER "${VG_GENERATED_DIR}/vg_compute_task_ring_words.h")
+set(VG_COMPUTE_TASK_RING_REFLECTION "${VG_GENERATED_DIR}/vg_compute_task_ring.reflection.json")
+set(VG_COMPUTE_TASK_RING_GOLDEN "${VG_GENERATED_DIR}/vg_compute_task_ring.layout.json")
 add_custom_command(
   OUTPUT "${VG_SCHEMA_HEADER}" "${VG_SCHEMA_REFLECTION}" "${VG_SCHEMA_GOLDEN}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${VG_GENERATED_DIR}"
@@ -44,8 +50,21 @@ add_custom_command(
   DEPENDS "${VG_SCENE_ROOT_SCHEMA_INPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/vg-schema/vg_schema.py"
   VERBATIM
 )
+add_custom_command(
+  OUTPUT "${VG_COMPUTE_TASK_RING_HEADER}" "${VG_COMPUTE_TASK_RING_LAYOUT_HEADER}"
+         "${VG_COMPUTE_TASK_RING_WORDS_HEADER}" "${VG_COMPUTE_TASK_RING_REFLECTION}"
+         "${VG_COMPUTE_TASK_RING_GOLDEN}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${VG_GENERATED_DIR}"
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/vg-schema/vg_schema.py"
+          "${VG_COMPUTE_TASK_RING_SCHEMA_INPUT}" --out-dir "${VG_GENERATED_DIR}"
+  DEPENDS "${VG_COMPUTE_TASK_RING_SCHEMA_INPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/vg-schema/vg_schema.py"
+  VERBATIM
+)
 add_custom_target(vg_schema_generate DEPENDS "${VG_SCHEMA_HEADER}" "${VG_SCHEMA_REFLECTION}" "${VG_SCHEMA_GOLDEN}"
-                                                "${VG_SCENE_ROOT_HEADER}" "${VG_SCENE_ROOT_LAYOUT_HEADER}" "${VG_SCENE_ROOT_MSL_HEADER}" "${VG_SCENE_ROOT_REFLECTION}" "${VG_SCENE_ROOT_GOLDEN}")
+                                                "${VG_SCENE_ROOT_HEADER}" "${VG_SCENE_ROOT_LAYOUT_HEADER}" "${VG_SCENE_ROOT_MSL_HEADER}" "${VG_SCENE_ROOT_REFLECTION}" "${VG_SCENE_ROOT_GOLDEN}"
+                                                "${VG_COMPUTE_TASK_RING_HEADER}" "${VG_COMPUTE_TASK_RING_LAYOUT_HEADER}"
+                                                "${VG_COMPUTE_TASK_RING_WORDS_HEADER}" "${VG_COMPUTE_TASK_RING_REFLECTION}"
+                                                "${VG_COMPUTE_TASK_RING_GOLDEN}")
 
 add_library(vg_ir STATIC
     src/ir/json.cpp
@@ -70,12 +89,13 @@ target_link_libraries(vg_capture PUBLIC vg_core vg_ir)
 
 add_library(vg_compiler STATIC
     src/compiler/compiler.cpp
+    src/compiler/compute_task_ring.cpp
     src/compiler/compute_package.cpp
     src/compiler/pipeline_classification.cpp
 )
 target_compile_features(vg_compiler PUBLIC cxx_std_20)
 target_include_directories(vg_compiler PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_include_directories(vg_compiler PRIVATE "${VG_GENERATED_DIR}")
+target_include_directories(vg_compiler PUBLIC "${VG_GENERATED_DIR}")
 target_link_libraries(vg_compiler PUBLIC vg_ir)
 add_dependencies(vg_compiler vg_schema_generate)
 
@@ -244,9 +264,10 @@ if(BUILD_TESTING)
   if(VG_ENABLE_METAL)
     # Reruns E002 (ADR-028/TASK-B15 typed pointer graph) through the public
     # C ABI alone, cross-checked against vertical-slice.metal.pointer-graph's
-    # internal-machinery result. Requires real Metal hardware because only
-    # metal_device_hal.mm branches on pointer_graph (CachedObject lowering);
-    # reference/Vulkan always take build_linear_compute_package.
+    # internal-machinery result. Requires real Metal hardware for the native
+    # CachedObject GPU lowering; Reference consumes the same canonical
+    # pointer-graph Node through its interpreter and Vulkan reports the
+    # unsupported profile explicitly.
     add_executable(vg_e002_pointer_graph_abi_test tests/api/vg_e002_pointer_graph_abi_test.cpp)
     target_link_libraries(vg_e002_pointer_graph_abi_test PRIVATE vg_api)
     target_compile_features(vg_e002_pointer_graph_abi_test PRIVATE cxx_std_17)
@@ -287,6 +308,11 @@ if(BUILD_TESTING)
   target_link_libraries(vg_compute_package_test PRIVATE vg_compiler)
   target_compile_features(vg_compute_package_test PRIVATE cxx_std_20)
   add_test(NAME compiler.compute-package COMMAND vg_compute_package_test)
+
+  add_executable(vg_compute_task_ring_test tests/unit/compute_task_ring_test.cpp)
+  target_link_libraries(vg_compute_task_ring_test PRIVATE vg_compiler)
+  target_compile_features(vg_compute_task_ring_test PRIVATE cxx_std_20)
+  add_test(NAME compiler.compute-task-ring COMMAND vg_compute_task_ring_test)
 
   # pipeline_classification lives in vg_compiler, so this needs nothing else.
   add_executable(vg_pipeline_classification_test tests/unit/pipeline_classification_test.cpp)

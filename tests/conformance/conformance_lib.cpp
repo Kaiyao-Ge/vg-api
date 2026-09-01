@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -29,6 +30,24 @@ bool has_event(const vg::hal::LoweringReport& report, const std::string& operati
   return std::ranges::any_of(report.events, [&](const vg::hal::LoweringEvent& event) {
     return event.operation == operation;
   });
+}
+
+uint64_t event_count(const vg::hal::LoweringReport& report, const std::string& operation) {
+  uint64_t total = 0;
+  for (const auto& event : report.events)
+    if (event.operation == operation) total += event.count;
+  return total;
+}
+
+bool has_one_package_per_resolved_node(const vg::hal::CompiledPlan& compiled) {
+  if (compiled.per_node_packages.size() != compiled.plan.resolved_nodes.size()) return false;
+  std::set<std::pair<uint32_t, uint32_t>> package_refs;
+  for (const auto& package : compiled.per_node_packages)
+    package_refs.emplace(package.ref.index, package.ref.generation);
+  if (package_refs.size() != compiled.per_node_packages.size()) return false;
+  for (const auto& node : compiled.plan.resolved_nodes)
+    if (!package_refs.contains({node.ref.index, node.ref.generation})) return false;
+  return true;
 }
 
 // Parses the fixture and rebinds its fixture-local allocation ids onto real
@@ -77,7 +96,7 @@ bool run_contract_checks(vg::hal::DeviceHal& device, const std::string& backend_
   compiled_module.module.canonical_json = vg::ir::serialize_module(compiled_module.module);
 
   std::string error;
-  vg::hal::ExecutionPlan plan;
+  vg::core::ExecutionPlan plan;
   vg::test_support::AssembledPlanFixture plan_fixture;
   const auto root_ref = vg::core::PointerRef{allocation.id, allocation.generation};
   if (!check(vg::test_support::assemble_single_node_plan(
@@ -87,28 +106,116 @@ bool run_contract_checks(vg::hal::DeviceHal& device, const std::string& backend_
     return all_ok;
 
   vg::hal::CompiledPlan compiled;
-  if (check(device.compile(plan, &compiled, &error), backend_name, "compiles a valid linear-subset plan", &all_ok)) {
+  const bool compiled_ok = device.compile(plan, &compiled, &error);
+  if (!caps.supports(vg::hal::Capability::TaskPublication)) {
+    check(!compiled_ok && !compiled.report.supported &&
+              error.find("TaskPublication") != std::string::npos,
+          backend_name, "rejects a TaskPublication plan when that capability is absent", &all_ok);
+  } else if (check(compiled_ok, backend_name, "compiles a valid linear-subset plan", &all_ok)) {
     // Every backend emits this event for a linear-subset compile (the B4
     // shared contract); backends that implement more than the linear subset
     // (currently only reference) additionally instrument the underlying
     // canonical-IR interpretation step. A backend that has NOT implemented
     // more than the linear subset must not claim that extra event.
-    check(has_event(compiled.report, "compute_package") || has_event(compiled.report, "node_compute_package"),
+    check(has_event(compiled.report, "node_compute_package"),
          backend_name, "reports a compute package lowering event",
          &all_ok);
-    if (expectation.expect_linear_subset_only)
-      check(!has_event(compiled.report, "canonical_ir"), backend_name,
-           "linear-subset-only backend does not claim canonical_ir instrumentation", &all_ok);
-    else
-      check(has_event(compiled.report, "canonical_ir") || has_event(compiled.report, "node_compute_package"),
-           backend_name, "full backend reports Node-aware canonical package instrumentation", &all_ok);
+    check(has_one_package_per_resolved_node(compiled), backend_name,
+          "has exactly one package for every resolved NodeRef", &all_ok);
+    check(event_count(compiled.report, "node_compute_package") == compiled.per_node_packages.size(),
+          backend_name, "reports the exact count of compute NodeRef package lowerings", &all_ok);
+
+    auto bad_abi = compiled;
+    ++bad_abi.abi_version;
+    vg::hal::Submission tampered_submission;
+    error.clear();
+    check(!device.submit(bad_abi, arena, &tampered_submission, &error) &&
+              error == "compiled plan ABI version is unsupported",
+          backend_name, "rejects a CompiledPlan with a wrong ABI version before Stage 7", &all_ok);
+
+    auto wrong_backend = compiled;
+    wrong_backend.report.backend = vg::hal::BackendKind::Reference;
+    if (device.capabilities().backend == vg::hal::BackendKind::Reference)
+      wrong_backend.report.backend = vg::hal::BackendKind::Metal;
+    error.clear();
+    check(!device.submit(wrong_backend, arena, &tampered_submission, &error) &&
+              error == "compiled plan backend does not match adapter",
+          backend_name, "rejects a CompiledPlan from another backend before Stage 7", &all_ok);
+
+    auto tampered_order = compiled;
+    tampered_order.plan.task_order[0] =
+        static_cast<uint32_t>(tampered_order.plan.task_graph.tasks().size());
+    error.clear();
+    check(!device.submit(tampered_order, arena, &tampered_submission, &error),
+          backend_name, "rejects a CompiledPlan with a tampered sealed task order", &all_ok);
+
+    auto tampered_effects = compiled;
+    ++tampered_effects.plan.task_effects[0][0].offset;
+    error.clear();
+    check(!device.submit(tampered_effects, arena, &tampered_submission, &error),
+          backend_name, "rejects a CompiledPlan with tampered sealed effects", &all_ok);
+
+    auto tampered_package = compiled;
+    tampered_package.per_node_packages[0].kind =
+        vg::hal::CompiledPlan::NodePackageKind::Raster;
+    error.clear();
+    check(!device.submit(tampered_package, arena, &tampered_submission, &error),
+          backend_name, "rejects a CompiledPlan with a mismatched Node package kind", &all_ok);
+  }
+
+  // The shared fixture exercises the public Stage 0--6 path for two distinct
+  // CodeObjects.  A backend may either prove its Node-aware lowering with
+  // complete package evidence or decline it explicitly; it must never report
+  // a successful compile with a partial Node/package mapping.
+  auto second_module = vg::compiler::compile_c_like("@node @effects store(1,0,4,9)");
+  if (!check(second_module.ok, backend_name, "second compile_c_like fixture parses", &all_ok)) return all_ok;
+  auto& second_allocation = arena.allocate(16);
+  second_module.module.instructions[0].allocation = second_allocation.id;
+  second_module.module.declared_effects[0].allocation = second_allocation.id;
+  second_module.module.canonical_json = vg::ir::serialize_module(second_module.module);
+  vg::core::ExecutionPlan multi_node_plan;
+  vg::test_support::MultiNodePlanFixture multi_node_fixture;
+  error.clear();
+  if (check(vg::test_support::assemble_multi_node_plan(
+                arena, {compiled_module.module, second_module.module},
+                {vg::test_support::compute_task(root_ref.allocation, root_ref.generation),
+                 vg::test_support::compute_task(second_allocation.id, second_allocation.generation)},
+                {{0, 1}}, &multi_node_fixture, &multi_node_plan, &error), backend_name,
+            "assembles a two-CodeObject NodeRef plan", &all_ok)) {
+    vg::hal::CompiledPlan multi_node_compiled;
+    error.clear();
+    const bool multi_node_compiled_ok = device.compile(multi_node_plan, &multi_node_compiled, &error);
+    if (!caps.supports(vg::hal::Capability::EffectDag)) {
+      check(!multi_node_compiled_ok && !multi_node_compiled.report.supported &&
+                error.find("EffectDag") != std::string::npos,
+            backend_name, "rejects an EffectDag plan when that capability is absent", &all_ok);
+    } else if (multi_node_compiled_ok) {
+      check(multi_node_compiled.report.supported, backend_name,
+            "successful multi-Node compile reports supported", &all_ok);
+      check(has_one_package_per_resolved_node(multi_node_compiled), backend_name,
+            "multi-Node compile has complete unique NodeRef packages", &all_ok);
+      check(event_count(multi_node_compiled.report, "node_compute_package") ==
+                multi_node_compiled.per_node_packages.size(),
+            backend_name, "multi-Node compile reports the exact count of compute packages", &all_ok);
+    } else {
+      check(!multi_node_compiled.report.supported &&
+                multi_node_compiled.report.count(vg::hal::LoweringClass::Unsupported) != 0,
+            backend_name, "unsupported multi-Node lowering is explicit", &all_ok);
+    }
   }
 
 
-  auto bad_timeline = plan;
-  bad_timeline.timeline_wait = 4;
-  bad_timeline.timeline_signal = 4;
-  check(!device.compile(bad_timeline, &compiled, &error), backend_name, "rejects non-advancing timeline", &all_ok);
+  vg::core::ExecutionPlan bad_timeline;
+  vg::test_support::AssembledPlanFixture bad_timeline_fixture;
+  vg::test_support::AssemblyOptions bad_timeline_options;
+  bad_timeline_options.timeline_wait = 4;
+  bad_timeline_options.timeline_signal = 4;
+  error.clear();
+  check(!vg::test_support::assemble_single_node_plan(
+            arena, compiled_module.module,
+            {vg::test_support::compute_task(root_ref.allocation, root_ref.generation)},
+            &bad_timeline_fixture, &bad_timeline, &error, bad_timeline_options),
+        backend_name, "rejects non-advancing timeline", &all_ok);
   check(error == "timeline signal does not advance past wait", backend_name, "non-advancing timeline error message",
        &all_ok);
 
@@ -126,8 +233,8 @@ bool run_golden_fixture_invariant(vg::hal::DeviceHal& device, const std::string&
     const auto device_module = load_and_bind(path, device_arena);
     const auto reference_module = load_and_bind(path, reference_arena);
 
-    vg::hal::ExecutionPlan device_plan;
-    vg::hal::ExecutionPlan reference_plan;
+    vg::core::ExecutionPlan device_plan;
+    vg::core::ExecutionPlan reference_plan;
     vg::test_support::AssembledPlanFixture device_fixture;
     vg::test_support::AssembledPlanFixture reference_fixture;
     const auto device_root = vg::core::PointerRef{device_module.instructions.front().allocation,

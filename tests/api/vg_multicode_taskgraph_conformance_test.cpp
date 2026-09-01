@@ -4,7 +4,7 @@
 // an acceptance test for the public semantic path, not a unit test coupled to
 // NodeTable or ExecutionPlan internals.  In particular, the two CodeObjects
 // use distinct effects so an implementation that merely stores two refs but
-// still executes one graph-wide module cannot pass.
+// still executes one shared program outside per-Task dispatch cannot pass.
 #include "vg/vg.h"
 
 #include <cstdint>

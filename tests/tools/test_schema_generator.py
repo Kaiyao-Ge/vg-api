@@ -43,3 +43,48 @@ assert "VG_SCHEMA_SCENEROOTRASTER_MSL_DECLARATIONS" in compiler_source
 scene_reflection = json.loads((out / "vg_scene_root.reflection.json").read_text())
 assert scene_reflection["layouts"]["SceneRootRaster"]["size"] == 64 + scene_reflection["layouts"]["Material"]["size"]
 assert scene_reflection["relocations"] == [{"path": ["SceneRootRaster", "material", "albedo"], "kind": "facet", "offset": 80}]
+
+ring_schema = root / "schemas/ir/compute-task-ring.vg.json"
+subprocess.run([sys.executable, str(root / "tools/vg-schema/vg_schema.py"), str(ring_schema), "--out-dir", str(out)], check=True)
+ring_outputs = {
+    name: (out / name).read_text()
+    for name in ["vg_compute_task_ring.h", "vg_compute_task_ring_layout.h",
+                 "vg_compute_task_ring_words.h", "vg_compute_task_ring.reflection.json",
+                 "vg_compute_task_ring.layout.json"]
+}
+# Re-emitting into the same directory must be byte deterministic.
+subprocess.run([sys.executable, str(root / "tools/vg-schema/vg_schema.py"), str(ring_schema), "--out-dir", str(out)], check=True)
+for name, contents in ring_outputs.items():
+    assert (out / name).read_text() == contents
+
+ring_reflection = json.loads(ring_outputs["vg_compute_task_ring.reflection.json"])
+ring_fields = ring_reflection["layouts"]["ComputeTaskRingRecord"]["fields"]
+assert ring_reflection["layouts"]["ComputeTaskRingRecord"]["size"] == 14 * 4
+assert [field["offset"] for field in ring_fields] == list(range(0, 14 * 4, 4))
+ring_layout = ring_outputs["vg_compute_task_ring_layout.h"]
+assert "VG_SCHEMA_COMPUTETASKRING_COMPUTETASKRINGRECORD_X_OFFSET 20u" in ring_layout
+ring_words = ring_outputs["vg_compute_task_ring_words.h"]
+assert "inline constexpr uint32_t kWordCount = 14u;" in ring_words
+assert 'inline constexpr std::string_view kByteOrder = "little-endian";' in ring_words
+assert "std::endian::native == std::endian::little" in ring_words
+assert "inline constexpr uint32_t kXWord = 5u;" in ring_words
+assert "inline constexpr uint32_t kYWord = 6u;" in ring_words
+assert "inline constexpr uint32_t kZWord = 7u;" in ring_words
+assert "inline constexpr uint32_t kReservedWord = 11u;" in ring_words
+assert '{"reserved", 11u, true}' in ring_words
+assert "#define VG_TASK_RING_WORD_COUNT 14u" in ring_words
+assert "#define VG_TASK_RING_X_WORD 5u" in ring_words
+
+# Both shader dialects splice the same generated fragment, and active backend
+# code owns neither a local codec nor numeric x/node offsets.
+assert compiler_source.count("schema::compute_task_ring::kShaderLayout") == 2
+assert "word < 14u" not in compiler_source
+metal_source = (root / "src/backends/metal/metal_device_hal.mm").read_text()
+vulkan_source = (root / "src/backends/vulkan/vulkan_device_hal.cpp").read_text()
+assert "void pack_task_record" not in metal_source
+assert "unpack_task_record(" not in metal_source
+assert "void pack_task_record" not in vulkan_source
+assert "unpack_task_record(" not in vulkan_source
+assert "kTaskRingDispatchXWord" in metal_source
+assert "kTaskRingDispatchXWord" in vulkan_source
+assert "kTaskRingNodeIndexWord" in (root / "src/backends/metal/metal_tier2.mm").read_text()

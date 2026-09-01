@@ -39,7 +39,7 @@ struct TaskChain {
 };
 
 bool assemble_chain(vg::core::Arena& arena, const vg::ir::Module& module, TaskChain chain,
-                    vg::test_support::AssembledPlanFixture* fixture, vg::hal::ExecutionPlan* plan,
+                    vg::test_support::AssembledPlanFixture* fixture, vg::core::ExecutionPlan* plan,
                     std::string* error, uint32_t quota) {
   std::vector<TaskRecord> tasks;
   std::vector<std::pair<uint32_t, uint32_t>> dependencies;
@@ -69,7 +69,7 @@ bool run_reference_continuation() {
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
   vg::test_support::AssembledPlanFixture fixture;
-  vg::hal::ExecutionPlan plan;
+  vg::core::ExecutionPlan plan;
   std::string error;
   if (!assemble_chain(arena, module, {.task_count = 3, .root_allocation = module.instructions[0].allocation},
                       &fixture, &plan, &error, 1)) {
@@ -145,7 +145,7 @@ bool run_metal_large_quota() {
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
   vg::test_support::AssembledPlanFixture fixture;
-  vg::hal::ExecutionPlan plan;
+  vg::core::ExecutionPlan plan;
   std::string error;
   if (!assemble_chain(arena, module, {.task_count = 3, .root_allocation = module.instructions[0].allocation},
                       &fixture, &plan, &error, 8)) {
@@ -191,7 +191,7 @@ bool run_metal_continuation() {
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
   vg::test_support::AssembledPlanFixture fixture;
-  vg::hal::ExecutionPlan plan;
+  vg::core::ExecutionPlan plan;
   std::string error;
   if (!assemble_chain(arena, module, {.task_count = 3, .root_allocation = module.instructions[0].allocation},
                       &fixture, &plan, &error, 1)) {

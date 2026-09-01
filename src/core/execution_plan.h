@@ -47,10 +47,29 @@ struct RepresentationSemanticPlanItem {
   uint32_t transform_order{};
 };
 
+// One existing FacetRef that Stage 7 will dereference, paired with the kind
+// the sealed Task semantics require.  This is an internal lifetime fact, not
+// a new public binding record: the ref still comes from TaskRecord (or from a
+// SceneRoot resolved during assembly), and the backing allocation remains a
+// property of the device-owned FacetPool slot.
+struct FacetLifetimeUse {
+  FacetRef ref;
+  FacetKind kind{FacetKind::Address};
+};
+
 // The one internal submission-plan representation.  DeviceHAL receives this
 // same type for Stage 6; capability snapshots remain a HAL concern.
 struct ExecutionPlan {
-  ir::Module module;
+ private:
+  // Opaque immutable witness of the facts produced by the assembler.  It is
+  // validation-only: Stage 6/7 still consume the fields below, never a second
+  // executable plan. Keeping the definition out of the header prevents a
+  // caller from rewriting raster effects and their graph in lockstep.
+  struct SemanticSeal;
+  std::shared_ptr<const SemanticSeal> semantic_seal;
+  friend class ExecutionPlanAssembler;
+
+ public:
   Certificate certificate;
   TaskGraph task_graph;
   uint64_t graph_epoch{};
@@ -58,10 +77,6 @@ struct ExecutionPlan {
   uint64_t timeline_signal{};
   bool published{};
   std::optional<AccessCertificateMode> requested_certificate_mode;
-  bool request_tier1_indirect{};
-  std::vector<ir::Module> effect_dag_passes;
-  std::vector<std::pair<uint32_t, uint32_t>> effect_dag_dependencies;
-  bool request_indexed_binding{};
   std::vector<RepresentationRequest> representation_requests;
   std::vector<RepresentationSemanticPlanItem> representation_plan;
   bool representation_plan_derived{};
@@ -71,9 +86,7 @@ struct ExecutionPlan {
   std::optional<EnvelopeOverflow> pending_overflow;
   std::vector<PointerRef> discovery_seeds;
   std::optional<uint32_t> envelope_task_quota;
-  bool request_tier2_select{};
   std::vector<NodeTable::Ref> authorized_nodes;
-  std::vector<uint32_t> authorized_node_classes;
   struct ResolvedNode {
     NodeTable::Ref ref;
     std::shared_ptr<const CodeObject> code_object;
@@ -82,12 +95,25 @@ struct ExecutionPlan {
     std::optional<ir::UserRasterShaderContract> user_raster_shader;
   };
   std::vector<ResolvedNode> resolved_nodes;
-  std::optional<ir::UserRasterShaderContract> user_raster_shader;
   // Stage 0--4 facts produced by the sole core assembler.  They are not a
   // second submission representation: Stage 6 consumes this same plan.
   std::vector<uint32_t> task_order;
   std::vector<PointerRef> touched_allocations;
+  // Sorted, unique set of every pre-existing facet capability the sealed
+  // TaskGraph can dereference. Stage 6 selects a physical representation
+  // operation, but its target FacetRef only exists after that operation is
+  // committed; the submission lifetime owner then joins those target refs to
+  // this set before Task execution continues.
+  std::vector<FacetLifetimeUse> lifetime_facets;
+  bool lifetime_plan_derived{};
+  // Effects are instantiated once per Task from that Task's immutable
+  // resolved Node snapshot.  The flattened form remains the certificate
+  // vocabulary; the per-Task form plus validated_effect_graph is the sole
+  // executable happens-before fact consumed by Stage 6/7.
+  std::vector<std::vector<ir::Effect>> task_effects;
   std::vector<ir::Effect> instantiated_effects;
+  EffectGraph validated_effect_graph;
+  EffectGraphShape validated_effect_graph_shape{EffectGraphShape::Unsupported};
   std::optional<AccessCertificate> access_certificate;
   // Sealed access-planning facts.  These remain fields of the one execution
   // plan (rather than a backend-owned second plan): Stage 6/7 may record or
@@ -98,8 +124,8 @@ struct ExecutionPlan {
   bool working_set_budget_checked{};
   bool access_plan_derived{};
   // Produced exactly once by ExecutionPlanAssembler after Stage 0--5 facts
-  // have been validated.  Stage 6 compares this canonical, sorted, unique
-  // list with its adapter snapshot and must not reinterpret request_* hints.
+  // have been validated. Stage 6 compares this canonical, sorted, unique
+  // list with its adapter snapshot and must not reinterpret caller hints.
   std::vector<CapabilityRequirement> required_capabilities;
   bool capability_requirements_derived{};
   bool assembled{};
@@ -121,16 +147,8 @@ struct ExecutionPlanAssemblerInputs {
   // never a claim inferred from the certificate being checked.
   const std::vector<PointerRef>* discovery_witness{};
   uint64_t graph_epoch{};
-  // Compatibility-only semantic inputs from legacy submission descriptors.
-  // The assembler translates them once into required_capabilities; adapters
-  // never use these booleans to decide what a plan requires.
-  bool request_tier1_indirect{};
-  bool request_tier2_select{};
-  bool request_indexed_binding{};
-  // Semantic multi-pass and representation requests are also assembled here;
-  // adapters receive only the resulting sealed plan.
-  const std::vector<ir::Module>* effect_dag_passes{};
-  const std::vector<std::pair<uint32_t, uint32_t>>* effect_dag_dependencies{};
+  // Representation requests are assembled here; adapters receive only the
+  // resulting sealed semantic plan.
   const std::vector<RepresentationRequest>* representation_requests{};
   // Existing device-owned pool, observed read-only while freezing Stage 5.
   // It is required for representation requests so ConsumeInput can reject

@@ -54,8 +54,8 @@ bool run_fixture(const std::string& name, const std::string& root) {
   }
   auto reference_device = vg::reference::make_device_hal();
 
-  vg::hal::ExecutionPlan metal_plan;
-  vg::hal::ExecutionPlan reference_plan;
+  vg::core::ExecutionPlan metal_plan;
+  vg::core::ExecutionPlan reference_plan;
   vg::test_support::AssembledPlanFixture metal_fixture;
   vg::test_support::AssembledPlanFixture reference_fixture;
 

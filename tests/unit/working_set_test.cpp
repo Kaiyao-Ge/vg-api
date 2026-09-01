@@ -28,7 +28,7 @@ vg::ir::Module store_module() {
   return compiled.module;
 }
 
-vg::hal::ExecutionPlan base_plan(vg::core::Arena& arena, const vg::ir::Module& module,
+vg::core::ExecutionPlan base_plan(vg::core::Arena& arena, const vg::ir::Module& module,
                                  const vg::core::WorkingSetBudget* budget = nullptr,
                                  const vg::core::WorkingSetLease* lease = nullptr) {
   vg::test_support::AssembledPlanFixture fixture;
@@ -36,7 +36,7 @@ vg::hal::ExecutionPlan base_plan(vg::core::Arena& arena, const vg::ir::Module& m
   options.certificate_mode = vg::core::AccessCertificateMode::Universe;
   options.working_set_budget = budget;
   options.working_set_lease = lease;
-  vg::hal::ExecutionPlan plan;
+  vg::core::ExecutionPlan plan;
   std::string error;
   assert(vg::test_support::assemble_single_node_plan(
       arena, module, {vg::test_support::compute_task(1)}, &fixture, &plan, &error, options));
@@ -109,7 +109,7 @@ int main() {
     vg::test_support::AssemblyOptions options;
     options.certificate_mode = vg::core::AccessCertificateMode::Universe;
     options.working_set_budget = &budget;
-    vg::hal::ExecutionPlan rejected;
+    vg::core::ExecutionPlan rejected;
     std::string error;
     assert(!vg::test_support::assemble_single_node_plan(
         arena, module, {vg::test_support::compute_task(1)}, &fixture, &rejected, &error, options));
@@ -180,7 +180,7 @@ int main() {
     options.certificate_mode = vg::core::AccessCertificateMode::Universe;
     options.working_set_budget = &budget;
     options.working_set_lease = &lease;
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     std::string error;
     assert(!vg::test_support::assemble_single_node_plan(
         arena, module, {vg::test_support::compute_task(1)}, &fixture, &plan, &error, options));

@@ -131,10 +131,9 @@ std::vector<vg::reference::RasterVertex> full_target_quad() {
   return {top_left, top_right, bottom_left, top_right, bottom_right, bottom_left};
 }
 
-// A minimal single-load module: compile()'s build_linear_compute_package()
-// requires a valid module regardless of whether the task graph it accompanies
-// is raster-only, so this gives it one without the test caring about what it
-// computes.
+// A minimal canonical module carried by the built-in raster Node. The
+// NodeRef-keyed raster package must not execute these instructions as a
+// graph-wide compute pre-pass.
 vg::ir::Module probe_module(vg::core::Arena& arena) {
   const auto& allocation = arena.allocate(64);
   vg::ir::Module module;
@@ -738,16 +737,27 @@ int main() {
 
     const auto module = probe_module(arena);
     vg::test_support::AssembledPlanFixture fixture;
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
+    vg::test_support::AssemblyOptions raster_options;
+    raster_options.facet_pool = &device->facet_pool();
     assert(vg::test_support::assemble_single_node_plan(arena, module, {raster_task},
-                                                        &fixture, &plan, &error));
+                                                        &fixture, &plan, &error,
+                                                        raster_options));
 
     vg::hal::CompiledPlan compiled;
     assert(device->compile(plan, &compiled, &error));
+    assert(compiled.per_node_packages.size() == 1);
+    assert(compiled.per_node_packages[0].kind ==
+           vg::hal::CompiledPlan::NodePackageKind::Raster);
+    assert(!compiled.per_node_packages[0].package.has_value());
 
     vg::hal::Submission submission;
     assert(device->submit(compiled, arena, &submission, &error));
     assert(submission.result.ok);
+    assert(submission.result.trace.size() == plan.task_effects[0].size());
+    assert(std::ranges::none_of(submission.result.trace, [&](const vg::ir::Effect& effect) {
+      return effect.allocation == module.instructions[0].allocation;
+    }));
     assert(submission.raster_results.size() == 1);
     const auto& task_result = submission.raster_results[0];
     assert(task_result.task_index == 0);
@@ -783,9 +793,10 @@ int main() {
     indexed_task.index_buffer_ref = index_ref;
     indexed_task.index_count = static_cast<uint32_t>(indices.size());
     vg::test_support::AssembledPlanFixture indexed_fixture;
-    vg::hal::ExecutionPlan indexed_plan;
+    vg::core::ExecutionPlan indexed_plan;
     assert(vg::test_support::assemble_single_node_plan(arena, module, {indexed_task},
-                                                        &indexed_fixture, &indexed_plan, &error));
+                                                        &indexed_fixture, &indexed_plan, &error,
+                                                        raster_options));
     vg::hal::CompiledPlan indexed_compiled;
     std::string indexed_error;
     assert(device->compile(indexed_plan, &indexed_compiled, &indexed_error));
@@ -793,6 +804,40 @@ int main() {
     assert(device->submit(indexed_compiled, arena, &indexed_submission, &indexed_error));
     assert(indexed_submission.result.ok);
     assert(indexed_submission.raster_results.size() == 1);
+
+    // A two-Task raster submission preserves Task 0's produced result when
+    // Task 1 discovers an invalid index during actual raster execution.
+    const std::array<uint16_t, 3> bad_indices{99, 99, 99};
+    auto& bad_index_alloc = arena.allocate(sizeof(bad_indices));
+    std::memcpy(bad_index_alloc.bytes.data(), bad_indices.data(), sizeof(bad_indices));
+    auto bad_index_view = plain_view(bad_index_alloc.id,
+                                     {.width = static_cast<uint32_t>(bad_indices.size()), .height = 1});
+    bad_index_view.format = vg::core::PixelFormat::R16Uint;
+    vg::core::FacetRef bad_index_ref;
+    assert(device->facet_pool().acquire(arena, bad_index_view, vg::core::FacetKind::Address,
+                                        &bad_index_ref, &indexed_error));
+    auto failing_raster_task = raster_task;
+    failing_raster_task.index_buffer_ref = bad_index_ref;
+    failing_raster_task.index_count = static_cast<uint32_t>(bad_indices.size());
+    vg::test_support::AssembledPlanFixture partial_fixture;
+    vg::core::ExecutionPlan partial_plan;
+    assert(vg::test_support::assemble_single_node_plan(
+        arena, module, {raster_task, failing_raster_task}, &partial_fixture, &partial_plan,
+        &indexed_error, raster_options));
+    vg::hal::CompiledPlan partial_compiled;
+    assert(device->compile(partial_plan, &partial_compiled, &indexed_error));
+    vg::hal::Submission partial_submission;
+    assert(device->submit(partial_compiled, arena, &partial_submission, &indexed_error));
+    assert(!partial_submission.result.ok);
+    assert(!partial_submission.result.outputs_valid);
+    assert(partial_submission.result.poison == vg::core::PoisonState::PartiallyProduced);
+    assert(partial_submission.result.fault.task_index == 1);
+    assert(!partial_submission.result.fault.code.empty());
+    assert(!partial_submission.result.fault.message.empty());
+    assert(partial_submission.raster_results.size() == 1);
+    assert(partial_submission.raster_results[0].task_index == 0);
+    assert(!partial_submission.result.trace.empty());
+    assert(!partial_submission.result.witness.entries().empty());
 
     // The identical stream encoded as u32 takes the other F5 decode path.
     const std::array<uint32_t, 6> wide_indices{0, 1, 2, 3, 4, 5};
@@ -806,7 +851,8 @@ int main() {
     indexed_task.index_buffer_ref = wide_index_ref;
     vg::test_support::AssembledPlanFixture wide_index_fixture;
     assert(vg::test_support::assemble_single_node_plan(arena, module, {indexed_task},
-                                                        &wide_index_fixture, &indexed_plan, &indexed_error));
+                                                        &wide_index_fixture, &indexed_plan, &indexed_error,
+                                                        raster_options));
     vg::hal::CompiledPlan wide_index_compiled;
     assert(device->compile(indexed_plan, &wide_index_compiled, &indexed_error));
     vg::hal::Submission wide_index_submission;
@@ -817,17 +863,15 @@ int main() {
     // truncated to a partial primitive.
     indexed_task.index_count = 4;
     vg::test_support::AssembledPlanFixture malformed_index_fixture;
-    assert(vg::test_support::assemble_single_node_plan(arena, module, {indexed_task},
-                                                        &malformed_index_fixture, &indexed_plan, &indexed_error));
-    vg::hal::CompiledPlan malformed_index_compiled;
-    assert(device->compile(indexed_plan, &malformed_index_compiled, &indexed_error));
-    vg::hal::Submission malformed_index_submission;
-    assert(device->submit(malformed_index_compiled, arena, &malformed_index_submission, &indexed_error));
-    assert(!malformed_index_submission.result.ok);
+    assert(!vg::test_support::assemble_single_node_plan(arena, module, {indexed_task},
+                                                         &malformed_index_fixture, &indexed_plan, &indexed_error,
+                                                         raster_options));
+    assert(indexed_error ==
+           "raster index facet requires R16Uint/R32Uint and a triangle-list count");
   }
 
   // --- F3 (ADR-043 Decision #4): a restricted-import "vg.msl.raster/v1"
-  // submission -- plan.user_raster_shader set, plan.module left default --
+  // submission -- the resolved Node owns only its user raster contract --
   // must still drive a Raster-kind task exactly like F2's plain path above.
   // This backend never interprets the supplied MSL text (raster_triangles()
   // is completely unchanged), so the pixel output must match F2's fixed
@@ -897,16 +941,20 @@ int main() {
     auto stale_shader = shader;
     stale_shader.vertex_abi = "vg.raster.vertex.xyuv-packed/v1";
     vg::test_support::AssembledPlanFixture stale_fixture;
-    vg::hal::ExecutionPlan stale_plan;
+    vg::core::ExecutionPlan stale_plan;
+    vg::test_support::AssemblyOptions raster_options;
+    raster_options.facet_pool = &device->facet_pool();
     assert(!vg::test_support::assemble_single_user_raster_plan(
-        arena, stale_shader, {raster_task}, &stale_fixture, &stale_plan, &error));
+        arena, stale_shader, {raster_task}, &stale_fixture, &stale_plan, &error,
+        raster_options));
     assert(error.find("vertex_abi") != std::string::npos);
     error.clear();
 
     vg::test_support::AssembledPlanFixture fixture;
-    vg::hal::ExecutionPlan plan;
+    vg::core::ExecutionPlan plan;
     assert(vg::test_support::assemble_single_user_raster_plan(
-        arena, shader, {raster_task}, &fixture, &plan, &error));
+        arena, shader, {raster_task}, &fixture, &plan, &error,
+        raster_options));
 
     vg::hal::CompiledPlan compiled;
     assert(device->compile(plan, &compiled, &error));

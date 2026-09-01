@@ -58,8 +58,8 @@ bool run_fixture(const std::string& name, const std::string& root) {
 
   vg::test_support::AssembledPlanFixture vulkan_fixture;
   vg::test_support::AssembledPlanFixture reference_fixture;
-  vg::hal::ExecutionPlan vulkan_plan;
-  vg::hal::ExecutionPlan reference_plan;
+  vg::core::ExecutionPlan vulkan_plan;
+  vg::core::ExecutionPlan reference_plan;
   std::string assembly_error;
   const auto vulkan_root = vulkan_module.instructions.front();
   const auto reference_root = reference_module.instructions.front();

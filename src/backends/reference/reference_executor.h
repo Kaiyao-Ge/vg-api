@@ -17,7 +17,8 @@ namespace vg::reference {
 core::ExecutionResult execute(const ir::Module& module, core::Arena& arena,
                               const core::Certificate* certificate = nullptr,
                               core::Timeline* timeline = nullptr,
-                              core::TimelineGate gate = {});
+                              core::TimelineGate gate = {},
+                              const std::vector<ir::Effect>* sealed_effects = nullptr);
 
 struct TaskGraphExecutionResult {
   bool ok{};

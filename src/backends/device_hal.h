@@ -33,12 +33,11 @@ enum class Capability : uint32_t {
   // path leaves the bit clear and reports Unsupported.
   Raster = 1u << 6,
   // Advertising this obliges the backend to actually carry out every
-  // ExecutionPlan::representation_requests item -- publish a new
+  // core::ExecutionPlan representation item -- publish a new
   // RepresentationEpoch, retire what it invalidated, acquire the requested
   // facet (02 §8: a transform is not a barrier) -- and to report its real
-  // cost. A backend that cannot leaves the bit clear and answers a request
-  // with CompiledPlan::representation_supported = false plus an Unsupported
-  // LoweringEvent, never with a silently dropped request.
+  // cost. A backend that cannot leaves the bit clear and answers with an
+  // Unsupported LoweringEvent, never with a silently dropped request.
   RepresentationTransform = 1u << 7,
   // Advertising this obliges the backend to genuinely verify a FacetRef's
   // generation under ValidationProfile::CheckedNative -- in the shader on a
@@ -47,8 +46,8 @@ enum class Capability : uint32_t {
   // than letting a caller believe a stale token would be caught.
   CheckedFacetGeneration = 1u << 8,
   // F3 (ADR-043 Decision #4): advertising this obliges the backend to accept
-  // an ExecutionPlan::user_raster_shader submission -- compiling the
-  // caller's hand-written MSL against its declared effect contract only,
+  // a per-Node user raster contract -- compiling the caller's hand-written
+  // MSL against its declared effect contract only,
   // never validating shader logic -- and to classify that trust boundary as
   // HostAssisted, never a silently upgraded fully-verified status. A backend
   // with no restricted-import path leaves the bit clear.
@@ -126,45 +125,22 @@ struct LoweringReport {
   [[nodiscard]] std::string canonical_json() const;
 };
 
-// One Stage 5 (03 §7 "Representation") item: a Region's required facet and
-// representation version, fixed before the adapter is allowed to see the plan
-// (03 §8: "每个 Region 的所需 facet 与 representation version 已固定").
-using RepresentationRequest = core::RepresentationRequest;
-using ExecutionPlan = core::ExecutionPlan;
 struct CompiledPlan {
   uint32_t abi_version{kDeviceHalAbiVersion};
-  ExecutionPlan plan;
-  // B4's target-neutral package.  It is deliberately source/metadata only;
-  // B5/B6 attach private pipeline objects outside this contract.
-  std::optional<compiler::ComputePackage> compute_package;
-  // One package per resolved Node when a graph has multiple compute programs.
-  // Backends without Node-aware lowering must reject that graph explicitly.
-  std::vector<std::pair<core::NodeTable::Ref, compiler::ComputePackage>> node_compute_packages;
-  // TASK-B16 (E007): populated instead of compute_package when the sealed
-  // plan requires indexed binding and plan.module qualified (load/
-  // store only, no pointer-graph opcodes). Exactly one of compute_package /
-  // indexed_compute_package is ever set for a given CompiledPlan -- never
-  // both, never neither, on a successful compile().
-  std::optional<compiler::IndexedComputePackage> indexed_compute_package;
+  core::ExecutionPlan plan;
+  // Stage-6 output is keyed only by the complete immutable NodeRef.  A raster
+  // package intentionally has no compute payload: its materialized raster
+  // contract remains in plan.resolved_nodes and Stage 7 executes it only for
+  // Raster Tasks naming this exact generation.
+  enum class NodePackageKind : uint32_t { CanonicalCompute, Raster };
+  struct PerNodePackage {
+    core::NodeTable::Ref ref;
+    NodePackageKind kind{NodePackageKind::CanonicalCompute};
+    std::optional<compiler::ComputePackage> package;
+    bool host_assisted{};
+  };
+  std::vector<PerNodePackage> per_node_packages;
   LoweringReport report;
-  // TASK-B14 (E012): populated only when plan.effect_dag_passes was
-  // non-empty and compile() accepted its shape. One ComputePackage per
-  // pass, same order as plan.effect_dag_passes. effect_dag_shape is
-  // Unsupported (and effect_dag_packages/effect_dag_graph left empty/
-  // default) when classify_effect_graph_shape() did not recognize the
-  // graph -- compile() reports that honestly via `report` and returns
-  // false rather than guessing a lowering strategy.
-  std::vector<compiler::ComputePackage> effect_dag_packages;
-  core::EffectGraph effect_dag_graph;
-  uint32_t effect_dag_node_count{};
-  core::EffectGraphShape effect_dag_shape{core::EffectGraphShape::Unsupported};
-  // False when compile() could not accept one of
-  // plan.representation_requests because this backend has no lowering for the
-  // requested transform. The rejection always carries an Unsupported
-  // LoweringEvent naming the reason, per START.md §4's tenth invariant: a
-  // backend never drops a request and then reports a successful compile as if
-  // none had been asked for.
-  bool representation_supported{true};
   // Stage-6 result: one descriptor per frozen Stage-5 item.  It contains no
   // authority or epoch derivation; submit only executes this already selected
   // physical form and fails closed on a snapshot mismatch.
@@ -179,9 +155,16 @@ struct CompiledPlan {
 
 // Stage 6 capability gate.  The plan remains core-owned; adapters supply
 // their own immutable snapshot here instead of receiving a caller snapshot.
-bool preflight_stage6(const ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
+bool preflight_stage6(const core::ExecutionPlan& plan, const CapabilitySnapshot& capabilities,
                       BackendKind expected_backend, CompiledPlan* compiled,
                       std::string* error = nullptr);
+
+// Stage 7 identity boundary.  This deliberately validates only the immutable
+// compiled-plan ABI and the adapter identity recorded by Stage 6; package
+// contents and plan semantics remain backend/Stage-7 concerns.
+bool validate_stage7_compiled_plan(const CompiledPlan& compiled,
+                                   BackendKind expected_backend,
+                                   std::string* error = nullptr);
 
 // F2 (ADR-046): the backend-neutral subset of Metal's RasterResult /
 // reference's RasterResult -- both already mirror each other field for
@@ -238,7 +221,7 @@ struct Submission {
   // tasks in the order they were actually published (Empty->Writing->
   // Published->Consumed), for byte-exact cross-backend comparison.
   std::vector<core::TaskRecord> published_tasks;
-  // Populated only when ExecutionPlan::requested_certificate_mode was set
+  // Populated only when core::ExecutionPlan::requested_certificate_mode was set
   // and the mode has a real implementation (CertifiedPinned/Universe/
   // DiscoverThenLease); left unset for SoftwarePaged/FaultManaged, which
   // report Unsupported via `report` instead of fabricating a certificate.
@@ -370,6 +353,46 @@ bool commit_representation_operations(const core::ExecutionPlan& plan,
                                                        std::string*)>& physical,
                               Submission* submission, std::string* error = nullptr);
 
+// Per-submit, completion-owned lifetime retention for the one sealed plan.
+// prepare() is read-only and may run before representation operations so a
+// task facet that would be invalidated by a same-submit transform is rejected
+// before any epoch is changed. acquire() runs after those physical operations
+// have produced their final target FacetRefs and transactionally retains the
+// complete allocation/facet set. Destruction releases exactly once; today's
+// synchronous backends keep the owner on the submit stack through their real
+// completion wait, while the movable owner can later be handed to an async
+// completion object without changing the lifetime contract.
+class SubmissionLifetimeHold {
+ public:
+  SubmissionLifetimeHold() = default;
+  SubmissionLifetimeHold(const SubmissionLifetimeHold&) = delete;
+  SubmissionLifetimeHold& operator=(const SubmissionLifetimeHold&) = delete;
+  SubmissionLifetimeHold(SubmissionLifetimeHold&& other) noexcept;
+  SubmissionLifetimeHold& operator=(SubmissionLifetimeHold&& other) noexcept;
+  ~SubmissionLifetimeHold();
+
+  bool prepare(const core::ExecutionPlan& plan, core::Arena& arena, core::FacetPool& pool,
+               std::string* error = nullptr);
+  bool acquire(const std::vector<core::FacetRef>& representation_facets,
+               std::string* error = nullptr);
+  void release() noexcept;
+
+  [[nodiscard]] bool prepared() const { return arena_ != nullptr && pool_ != nullptr; }
+  [[nodiscard]] bool held() const { return held_; }
+  [[nodiscard]] size_t allocation_count() const { return acquired_allocations_.size(); }
+  [[nodiscard]] size_t facet_count() const { return acquired_facets_.size(); }
+
+ private:
+  core::Arena* arena_{};
+  core::FacetPool* pool_{};
+  std::vector<core::PointerRef> allocation_inventory_;
+  std::vector<core::FacetLifetimeUse> facet_inventory_;
+  std::vector<core::FacetKind> representation_kinds_;
+  std::vector<core::PointerRef> acquired_allocations_;
+  std::vector<core::FacetRef> acquired_facets_;
+  bool held_{};
+};
+
 // Stage 7 physical working-set accounting. Core Stage 0--5 already selects
 // a proven lease (or Universe accounting), freezes its byte count, and
 // applies the hard budget refusal. HAL only records that sealed request; it
@@ -380,22 +403,23 @@ bool commit_representation_operations(const core::ExecutionPlan& plan,
 // this helper has no OS residency counter. Sparse residency is reported
 // as Unsupported (Metal sparse heap/texture is not implemented; Vulkan
 // sparse binding is explicit map/unmap, not automatic page fault).
-bool apply_working_set_budget(const ExecutionPlan& plan, core::Arena& arena,
+bool apply_working_set_budget(const core::ExecutionPlan& plan, core::Arena& arena,
                               Submission* submission, std::string* error = nullptr);
 
 // Stage 7 report/physical-operation hook for core-sealed discovery. The
 // host walk, topology freeze, witness/certificate/lease construction and
 // authority checks are solely ExecutionPlanAssembler work. HAL records the
 // selected operation as HostAssisted and must not derive another set.
-bool run_discovery_stage(const ExecutionPlan& plan, core::Arena& arena,
+bool run_discovery_stage(const core::ExecutionPlan& plan, core::Arena& arena,
                          Submission* submission, std::string* error = nullptr);
 
-// TASK-D5 / ADR-039: portable envelope continuation. Host-splits
-// TaskGraph::deterministic_order (HostAssisted). ADR-010 set_quota stays
-// build-time only; this helper never silently enlarges envelope_task_quota.
+// TASK-D5 / ADR-039: portable envelope continuation. Host-splits the
+// assembler-sealed plan.task_order (HostAssisted). ADR-010 set_quota stays
+// build-time only; this helper never silently enlarges envelope_task_quota or
+// derives a second order from the raw TaskGraph.
 //
 // - quota unset and no valid Deferred pending: no-op, publish_order = full
-//   deterministic_order, envelope_overflow left unset
+//   sealed task_order, envelope_overflow left unset
 // - task count <= quota and no valid Deferred pending: publish all
 // - task count > quota and no valid Deferred pending: publish first N,
 //   mint a token, set submission.envelope_overflow Deferred
@@ -404,7 +428,7 @@ bool run_discovery_stage(const ExecutionPlan& plan, core::Arena& arena,
 //   the prefix.
 // - pending Rejected or a bad token: refuse (distinct from
 //   "publication ring quota overflow")
-bool apply_envelope_continuation(const ExecutionPlan& plan,
+bool apply_envelope_continuation(const core::ExecutionPlan& plan,
                                  core::EnvelopeContinuationTable* table,
                                  Submission* submission,
                                  std::vector<uint32_t>* publish_order,
@@ -419,7 +443,7 @@ class DeviceHal {
   DeviceHal& operator=(DeviceHal&&) = delete;
   virtual ~DeviceHal() = default;
   [[nodiscard]] virtual const CapabilitySnapshot& capabilities() const = 0;
-  virtual bool compile(const ExecutionPlan& plan, CompiledPlan* compiled,
+  virtual bool compile(const core::ExecutionPlan& plan, CompiledPlan* compiled,
                        std::string* error = nullptr) = 0;
   virtual bool submit(const CompiledPlan& compiled, core::Arena& arena,
                       Submission* submission, std::string* error = nullptr) = 0;
