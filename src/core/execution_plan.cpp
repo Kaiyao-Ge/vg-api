@@ -13,28 +13,36 @@ struct ExecutionPlan::SemanticSeal {
       : tasks(plan.task_graph.tasks()),
         dependencies(plan.task_graph.dependencies()),
         task_effects(plan.task_effects),
+        task_facet_uses(plan.task_facet_uses),
         instantiated_effects(plan.instantiated_effects),
         effect_edges(plan.validated_effect_graph.edges()),
         task_order(plan.task_order),
+        execution_schedule(plan.execution_schedule),
         required_capabilities(plan.required_capabilities),
         certificate_ranges(plan.certificate.ranges),
         touched_allocations(plan.touched_allocations),
         lifetime_facets(plan.lifetime_facets) {
     resolved_node_refs.reserve(plan.resolved_nodes.size());
-    for (const auto& node : plan.resolved_nodes) resolved_node_refs.push_back(node.ref);
+    for (const auto& node : plan.resolved_nodes) {
+      resolved_node_refs.push_back(node.ref);
+      resolved_node_domains.push_back(node.execution_domain);
+    }
   }
 
   std::vector<TaskRecord> tasks;
   std::vector<std::pair<uint32_t, uint32_t>> dependencies;
   std::vector<std::vector<ir::Effect>> task_effects;
+  std::vector<std::vector<TaskFacetSemanticUse>> task_facet_uses;
   std::vector<ir::Effect> instantiated_effects;
   std::vector<EffectEdge> effect_edges;
   std::vector<uint32_t> task_order;
+  ExecutionSchedule execution_schedule;
   std::vector<CapabilityRequirement> required_capabilities;
   std::vector<ir::Effect> certificate_ranges;
   std::vector<PointerRef> touched_allocations;
   std::vector<FacetLifetimeUse> lifetime_facets;
   std::vector<NodeTable::Ref> resolved_node_refs;
+  std::vector<TaskKind> resolved_node_domains;
 };
 
 namespace {
@@ -139,6 +147,27 @@ bool same_facet_ref(FacetRef left, FacetRef right) {
   return left.index == right.index && left.generation == right.generation;
 }
 
+bool same_task_facet_use(const TaskFacetSemanticUse& left,
+                         const TaskFacetSemanticUse& right) {
+  return same_facet_ref(left.ref, right.ref) && left.kind == right.kind &&
+         same_view(left.view, right.view) &&
+         left.representation_epoch == right.representation_epoch &&
+         left.access == right.access;
+}
+
+bool same_task_facet_uses(
+    const std::vector<std::vector<TaskFacetSemanticUse>>& left,
+    const std::vector<std::vector<TaskFacetSemanticUse>>& right) {
+  if (left.size() != right.size()) return false;
+  for (size_t task = 0; task < left.size(); ++task) {
+    if (left[task].size() != right[task].size() ||
+        !std::equal(left[task].begin(), left[task].end(), right[task].begin(),
+                    same_task_facet_use))
+      return false;
+  }
+  return true;
+}
+
 bool same_effect(const ir::Effect& left, const ir::Effect& right) {
   return left.allocation == right.allocation && left.offset == right.offset &&
          left.size == right.size && left.access == right.access &&
@@ -166,6 +195,58 @@ bool same_effect_edges(const std::vector<EffectEdge>& left,
                        const std::vector<EffectEdge>& right) {
   return left.size() == right.size() &&
          std::equal(left.begin(), left.end(), right.begin(), same_effect_edge);
+}
+
+bool same_schedule(const ExecutionSchedule& left,
+                   const ExecutionSchedule& right) {
+  if (left.task_order != right.task_order ||
+      left.structural_successors != right.structural_successors ||
+      left.components.size() != right.components.size() ||
+      left.transitions.size() != right.transitions.size())
+    return false;
+  for (size_t component = 0; component < left.components.size(); ++component) {
+    const auto& lhs = left.components[component];
+    const auto& rhs = right.components[component];
+    if (lhs.tasks != rhs.tasks || lhs.waves.size() != rhs.waves.size()) return false;
+    for (size_t wave = 0; wave < lhs.waves.size(); ++wave)
+      if (lhs.waves[wave].tasks != rhs.waves[wave].tasks) return false;
+  }
+  for (size_t index = 0; index < left.transitions.size(); ++index) {
+    const auto& lhs = left.transitions[index];
+    const auto& rhs = right.transitions[index];
+    if (lhs.component != rhs.component || lhs.before_wave != rhs.before_wave ||
+        lhs.after_wave != rhs.after_wave ||
+        lhs.requires_execution_completion != rhs.requires_execution_completion ||
+        lhs.representation_operations != rhs.representation_operations ||
+        lhs.region_visibility.size() != rhs.region_visibility.size() ||
+        lhs.facet_requirements.size() != rhs.facet_requirements.size())
+      return false;
+    for (size_t visibility = 0; visibility < lhs.region_visibility.size(); ++visibility) {
+      const auto& a = lhs.region_visibility[visibility];
+      const auto& b = rhs.region_visibility[visibility];
+      if (a.producer_task != b.producer_task || a.consumer_task != b.consumer_task ||
+          a.allocation != b.allocation || a.offset != b.offset || a.size != b.size ||
+          a.representation_epoch != b.representation_epoch ||
+          a.producer_access != b.producer_access || a.consumer_access != b.consumer_access)
+        return false;
+    }
+    for (size_t facet = 0; facet < lhs.facet_requirements.size(); ++facet) {
+      const auto& a = lhs.facet_requirements[facet];
+      const auto& b = rhs.facet_requirements[facet];
+      if (a.task != b.task || !same_task_facet_use(a.use, b.use)) return false;
+    }
+  }
+  return true;
+}
+
+std::vector<ScheduleRepresentationFact> schedule_representation_facts(
+    const std::vector<RepresentationSemanticPlanItem>& plan) {
+  std::vector<ScheduleRepresentationFact> facts;
+  facts.reserve(plan.size());
+  for (const auto& item : plan)
+    facts.push_back({item.transform_order, item.view, item.target_kind,
+                     item.target_representation_epoch});
+  return facts;
 }
 
 bool absent(FacetRef ref) {
@@ -345,6 +426,7 @@ bool append_raster_facet_effect(const Arena& arena, const FacetPool* pool,
                                 std::vector<ir::Effect>* effects,
                                 std::vector<PointerRef>* touched,
                                 std::vector<FacetLifetimeUse>* lifetime,
+                                std::vector<TaskFacetSemanticUse>* task_facets,
                                 std::string* error) {
   if (absent(ref)) return true;
   if (pool == nullptr) {
@@ -395,6 +477,8 @@ bool append_raster_facet_effect(const Arena& arena, const FacetPool* pool,
   }
   effects->push_back({slot->view.allocation, 0, size, access,
                       slot->representation_epoch});
+  task_facets->push_back({ref, expected_kind, slot->view,
+                          slot->representation_epoch, access});
   return true;
 }
 
@@ -404,8 +488,10 @@ bool instantiate_raster_task_effects(const TaskRecord& task,
                                      std::vector<ir::Effect>* effects,
                                      std::vector<PointerRef>* touched,
                                      std::vector<FacetLifetimeUse>* lifetime,
+                                     std::vector<TaskFacetSemanticUse>* task_facets,
                                      std::string* error) {
   effects->clear();
+  task_facets->clear();
   FacetRef source = task.raster_facets.source;
   if (is_scene_root_raster_schema(root_schema)) {
     ResolvedSceneRootRaster root;
@@ -439,17 +525,17 @@ bool instantiate_raster_task_effects(const TaskRecord& task,
   if (!append_raster_facet_effect(arena, pool, source, FacetKind::Sample,
                                   ir::Access::Read, RasterEffectRange::View, 0,
                                   "raster source facet",
-                                  effects, touched, lifetime, error) ||
+                                  effects, touched, lifetime, task_facets, error) ||
       !append_raster_facet_effect(arena, pool, task.raster_facets.target,
                                   FacetKind::Attachment, ir::Access::Write,
                                   RasterEffectRange::View, 0,
                                   "raster target facet", effects, touched,
-                                  lifetime, error) ||
+                                  lifetime, task_facets, error) ||
       !append_raster_facet_effect(arena, pool, task.vertex_buffer_ref,
                                   FacetKind::Address, ir::Access::Read,
                                   RasterEffectRange::FullBacking, 0,
                                   "raster vertex facet", effects, touched,
-                                  lifetime, error))
+                                  lifetime, task_facets, error))
     return false;
   if (task.index_count != 0 &&
       !append_raster_facet_effect(arena, pool, task.index_buffer_ref,
@@ -457,7 +543,7 @@ bool instantiate_raster_task_effects(const TaskRecord& task,
                                   RasterEffectRange::IndexElements,
                                   task.index_count,
                                   "raster index facet", effects, touched,
-                                  lifetime, error))
+                                  lifetime, task_facets, error))
     return false;
   if (!absent(task.depth_attachment_ref)) {
     if (task.depth_test_enable &&
@@ -465,7 +551,7 @@ bool instantiate_raster_task_effects(const TaskRecord& task,
                                     FacetKind::Attachment, ir::Access::Read,
                                     RasterEffectRange::View, 0,
                                     "raster depth facet", effects, touched,
-                                    lifetime, error))
+                                    lifetime, task_facets, error))
       return false;
     // A present depth attachment is cleared/stored by the fixed raster
     // attachment contract even when depth testing and depth writes are off.
@@ -475,7 +561,7 @@ bool instantiate_raster_task_effects(const TaskRecord& task,
                                     FacetKind::Attachment, ir::Access::Write,
                                     RasterEffectRange::View, 0,
                                     "raster depth facet", effects, touched,
-                                    lifetime, error))
+                                    lifetime, task_facets, error))
       return false;
   }
   return true;
@@ -671,8 +757,13 @@ bool ExecutionPlan::validate(std::string* error) const {
       return false;
     }
     if (task_order.size() != task_graph.tasks().size() ||
-        task_effects.size() != task_graph.tasks().size()) {
+        task_effects.size() != task_graph.tasks().size() ||
+        task_facet_uses.size() != task_graph.tasks().size()) {
       if (error) *error = "assembled execution plan is missing its deterministic task order";
+      return false;
+    }
+    if (!execution_schedule_derived) {
+      if (error) *error = "assembled execution plan is missing its sealed execution schedule";
       return false;
     }
     std::vector<uint8_t> seen_task(task_effects.size());
@@ -741,6 +832,26 @@ bool ExecutionPlan::validate(std::string* error) const {
           return false;
         }
       }
+      bool observed_domain = false;
+      TaskKind expected_domain = TaskKind::Compute;
+      for (const auto& task : task_graph.tasks()) {
+        if (!same_node_ref(node.ref,
+                           NodeTable::Ref{task.node_index, task.node_generation}))
+          continue;
+        if (!observed_domain) {
+          expected_domain = task.kind;
+          observed_domain = true;
+        } else if (expected_domain != task.kind) {
+          if (error) *error = "one resolved NodeRef is used by multiple execution domains";
+          return false;
+        }
+      }
+      if (!observed_domain || node.execution_domain != expected_domain ||
+          (node.user_raster_shader.has_value() &&
+           node.execution_domain != TaskKind::Raster)) {
+        if (error) *error = "resolved Node execution domain disagrees with its Tasks or contract";
+        return false;
+      }
     }
     for (size_t task_index = 0; task_index < task_graph.tasks().size(); ++task_index) {
       const auto& task = task_graph.tasks()[task_index];
@@ -753,6 +864,10 @@ bool ExecutionPlan::validate(std::string* error) const {
         return false;
       }
       if (task.kind == TaskKind::Compute) {
+        if (!task_facet_uses[task_index].empty()) {
+          if (error) *error = "compute Task contains sealed raster facet semantics";
+          return false;
+        }
         const auto expected = resolved->module.has_value()
             ? instantiate_node_effects(*resolved->module) : std::vector<ir::Effect>{};
         if (expected.size() != task_effects[task_index].size() ||
@@ -760,6 +875,23 @@ bool ExecutionPlan::validate(std::string* error) const {
                         task_effects[task_index].begin(), same_effect)) {
           if (error) *error = "sealed per-Task effects disagree with the immutable Node program";
           return false;
+        }
+      } else {
+        if (task_facet_uses[task_index].empty()) {
+          if (error) *error = "raster Task is missing sealed per-Task facet semantics";
+          return false;
+        }
+        for (const auto& use : task_facet_uses[task_index]) {
+          std::string view_error;
+          if (absent(use.ref) || !use.view.valid(&view_error) ||
+              !std::ranges::any_of(task_effects[task_index], [&](const ir::Effect& effect) {
+                return effect.allocation == use.view.allocation &&
+                       effect.representation_epoch == use.representation_epoch &&
+                       effect.access == use.access;
+              })) {
+            if (error) *error = "sealed raster facet semantics disagree with per-Task effects";
+            return false;
+          }
         }
       }
     }
@@ -787,21 +919,42 @@ bool ExecutionPlan::validate(std::string* error) const {
       return false;
     }
     std::vector<NodeTable::Ref> resolved_node_refs;
+    std::vector<TaskKind> resolved_node_domains;
     resolved_node_refs.reserve(resolved_nodes.size());
-    for (const auto& node : resolved_nodes) resolved_node_refs.push_back(node.ref);
+    resolved_node_domains.reserve(resolved_nodes.size());
+    for (const auto& node : resolved_nodes) {
+      resolved_node_refs.push_back(node.ref);
+      resolved_node_domains.push_back(node.execution_domain);
+    }
     if (!semantic_seal ||
         !same_task_records(task_graph.tasks(), semantic_seal->tasks) ||
         task_graph.dependencies() != semantic_seal->dependencies ||
         !same_node_refs(resolved_node_refs, semantic_seal->resolved_node_refs) ||
+        resolved_node_domains != semantic_seal->resolved_node_domains ||
         !same_task_effects(task_effects, semantic_seal->task_effects) ||
+        !same_task_facet_uses(task_facet_uses, semantic_seal->task_facet_uses) ||
         !same_effects(instantiated_effects, semantic_seal->instantiated_effects) ||
         !same_effect_edges(validated_effect_graph.edges(), semantic_seal->effect_edges) ||
         task_order != semantic_seal->task_order ||
+        !same_schedule(execution_schedule, semantic_seal->execution_schedule) ||
         required_capabilities != semantic_seal->required_capabilities ||
         !same_effects(certificate.ranges, semantic_seal->certificate_ranges) ||
         !same_pointer_ref_list(touched_allocations, semantic_seal->touched_allocations) ||
         !same_lifetime_uses(lifetime_facets, semantic_seal->lifetime_facets)) {
       if (error) *error = "assembled execution plan semantic facts disagree with the immutable assembler seal";
+      return false;
+    }
+    ExecutionSchedule expected_schedule;
+    const auto representation_facts = schedule_representation_facts(representation_plan);
+    std::string schedule_error;
+    if (!derive_execution_schedule(validated_effect_graph, task_effects,
+                                   task_facet_uses, representation_facts,
+                                   task_order, &expected_schedule,
+                                   &schedule_error) ||
+        !same_schedule(expected_schedule, execution_schedule)) {
+      if (error) *error = schedule_error.empty()
+          ? "sealed execution schedule disagrees with Stage-5 semantic facts"
+          : schedule_error;
       return false;
     }
     std::vector<uint32_t> effect_order;
@@ -943,6 +1096,7 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
     }
   }
   plan.task_effects.resize(graph.tasks().size());
+  plan.task_facet_uses.resize(graph.tasks().size());
   for (uint32_t task_index = 0; task_index < graph.tasks().size(); ++task_index) {
     const TaskRecord& task = graph.tasks()[task_index];
     const NodeTable::Ref ref{task.node_index, task.node_generation};
@@ -996,10 +1150,12 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
         // this point: canonical IR verification rejects them rather than
         // silently treating them as a certificate-free graph.
         if (!append_bounded_pointer_targets(module, arena, &actual_touched, error)) return false;
-        plan.resolved_nodes.push_back({ref, snapshot.code_object, snapshot.entry_name, module, std::nullopt});
+        plan.resolved_nodes.push_back({ref, snapshot.code_object, snapshot.entry_name,
+                                       module, std::nullopt, task.kind});
       } else {
         plan.resolved_nodes.push_back({ref, snapshot.code_object, snapshot.entry_name, std::nullopt,
-                                       snapshot.code_object->user_raster_shader});
+                                       snapshot.code_object->user_raster_shader,
+                                       TaskKind::Raster});
       }
     }
     // Effects are instantiated per Task, not per unique program.  Reusing a
@@ -1021,7 +1177,8 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
       if (!instantiate_raster_task_effects(task, root_schema, arena,
                                            inputs.facet_pool, &effects,
                                            &actual_touched,
-                                           &plan.lifetime_facets, error))
+                                           &plan.lifetime_facets,
+                                           &plan.task_facet_uses[task_index], error))
         return false;
     }
     plan.task_effects[task_index] = effects;
@@ -1034,6 +1191,14 @@ bool ExecutionPlanAssembler::assemble(const ExecutionPlanAssemblerInputs& inputs
   if (!effect_graph_deterministic_order(plan.validated_effect_graph,
                                         static_cast<uint32_t>(plan.task_effects.size()),
                                         &plan.task_order, error)) return false;
+  const auto representation_facts =
+      schedule_representation_facts(plan.representation_plan);
+  if (!derive_execution_schedule(plan.validated_effect_graph, plan.task_effects,
+                                 plan.task_facet_uses, representation_facts,
+                                 plan.task_order, &plan.execution_schedule,
+                                 error))
+    return false;
+  plan.execution_schedule_derived = true;
   plan.instantiated_effects.clear();
   for (uint32_t task_index : plan.task_order)
     plan.instantiated_effects.insert(plan.instantiated_effects.end(),

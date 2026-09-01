@@ -74,7 +74,12 @@ add_library(vg_ir STATIC
 target_compile_features(vg_ir PUBLIC cxx_std_20)
 target_include_directories(vg_ir PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-add_library(vg_core STATIC src/core/core.cpp src/core/execution_plan.cpp src/core/task_schema.cpp src/core/scene_root.cpp)
+add_library(vg_core STATIC
+  src/core/core.cpp
+  src/core/execution_plan.cpp
+  src/core/execution_schedule.cpp
+  src/core/task_schema.cpp
+  src/core/scene_root.cpp)
 target_compile_features(vg_core PUBLIC cxx_std_20)
 target_include_directories(vg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(vg_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -289,6 +294,11 @@ if(BUILD_TESTING)
   target_link_libraries(vg_execution_plan_test PRIVATE vg_core vg_backend_reference)
   target_compile_features(vg_execution_plan_test PRIVATE cxx_std_20)
   add_test(NAME core.execution-plan COMMAND vg_execution_plan_test)
+
+  add_executable(vg_execution_schedule_test tests/unit/execution_schedule_test.cpp)
+  target_link_libraries(vg_execution_schedule_test PRIVATE vg_core)
+  target_compile_features(vg_execution_schedule_test PRIVATE cxx_std_20)
+  add_test(NAME core.execution-schedule COMMAND vg_execution_schedule_test)
 
   # F6's generated root contract is validated in core, independently of the
   # Reference/Metal physical raster paths.  This owns the malformed root and

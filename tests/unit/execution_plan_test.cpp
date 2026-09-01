@@ -990,6 +990,14 @@ void test_submission_lifetime_hold_deduplicates_facets_and_backing() {
   CHECK(plan.lifetime_plan_derived);
   CHECK(plan.lifetime_facets.size() == 3);  // two Tasks, one capability set
   CHECK(plan.task_effects.size() == 2);
+  CHECK(plan.task_facet_uses.size() == 2);
+  CHECK(plan.task_facet_uses[0].size() == 3);
+  CHECK(plan.task_facet_uses[1].size() == 3);
+  CHECK(plan.task_facet_uses[0][0].ref.index == source_ref.index);
+  CHECK(plan.task_facet_uses[0][0].kind == vg::core::FacetKind::Sample);
+  CHECK(plan.task_facet_uses[0][0].view.allocation == source.id);
+  CHECK(plan.task_facet_uses[0][1].kind == vg::core::FacetKind::Attachment);
+  CHECK(plan.task_facet_uses[0][2].kind == vg::core::FacetKind::Address);
   CHECK(plan.task_effects[0].size() == 3);  // source read, target write, vertex read
   CHECK(plan.task_effects[1].size() == 3);
   CHECK(plan.task_effects[0][2].size == vertex.size);
@@ -997,6 +1005,42 @@ void test_submission_lifetime_hold_deduplicates_facets_and_backing() {
   CHECK(plan.validated_effect_graph.edges()[0].kind ==
         vg::core::EffectEdgeKind::InferredConflict);
   CHECK(plan.task_order == std::vector<uint32_t>({0, 1}));
+  CHECK(plan.execution_schedule_derived);
+  CHECK(plan.execution_schedule.components.size() == 1);
+  CHECK(plan.execution_schedule.components[0].waves.size() == 2);
+  CHECK(plan.execution_schedule.components[0].waves[0].tasks ==
+        std::vector<uint32_t>({0}));
+  CHECK(plan.execution_schedule.components[0].waves[1].tasks ==
+        std::vector<uint32_t>({1}));
+  CHECK(plan.execution_schedule.structural_successors[0] ==
+        std::vector<uint32_t>({1}));
+  CHECK(plan.resolved_nodes.size() == 1);
+  CHECK(plan.resolved_nodes[0].execution_domain == vg::core::TaskKind::Raster);
+
+  auto schedule_tampered = plan;
+  schedule_tampered.execution_schedule.components[0].waves[0].tasks[0] = 1;
+  CHECK(!schedule_tampered.validate(&error));
+  CHECK(error == "assembled execution plan semantic facts disagree with the immutable assembler seal");
+
+  auto transition_tampered = plan;
+  transition_tampered.execution_schedule.transitions.back().requires_execution_completion = false;
+  CHECK(!transition_tampered.validate(&error));
+  CHECK(error == "assembled execution plan semantic facts disagree with the immutable assembler seal");
+
+  auto successor_tampered = plan;
+  successor_tampered.execution_schedule.structural_successors[0].clear();
+  CHECK(!successor_tampered.validate(&error));
+  CHECK(error == "assembled execution plan semantic facts disagree with the immutable assembler seal");
+
+  auto domain_tampered = plan;
+  domain_tampered.resolved_nodes[0].execution_domain = vg::core::TaskKind::Compute;
+  CHECK(!domain_tampered.validate(&error));
+  CHECK(error == "resolved Node execution domain disagrees with its Tasks or contract");
+
+  auto facet_tampered = plan;
+  ++facet_tampered.task_facet_uses[0][0].view.width;
+  CHECK(!facet_tampered.validate(&error));
+  CHECK(error == "assembled execution plan semantic facts disagree with the immutable assembler seal");
   auto raster_tampered = plan;
   --raster_tampered.task_effects[0][1].size;
   --raster_tampered.task_effects[1][1].size;
@@ -1009,6 +1053,20 @@ void test_submission_lifetime_hold_deduplicates_facets_and_backing() {
   raster_tampered.certificate.ranges = raster_tampered.instantiated_effects;
   CHECK(!raster_tampered.validate(&error));
   CHECK(error == "assembled execution plan semantic facts disagree with the immutable assembler seal");
+
+  // The current narrowing remains in force.  Freezing Node domain and a
+  // schedule must not make a representable mixed graph executable before
+  // the later Stage-6/Reference work packages exist.
+  vg::test_support::AssembledPlanFixture mixed_fixture;
+  vg::core::ExecutionPlan mixed_plan;
+  auto compute = vg::test_support::compute_task(source.id, source.generation);
+  vg::test_support::AssemblyOptions mixed_options;
+  mixed_options.facet_pool = &pool;
+  error.clear();
+  CHECK(!vg::test_support::assemble_single_node_plan(
+      arena, canonical_module(source.id), {compute, raster}, &mixed_fixture,
+      &mixed_plan, &error, mixed_options));
+  CHECK(error == "compute+raster mixed-domain TaskGraphs remain Unsupported");
 
   const auto expect_raster_assembly_rejection = [&](vg::core::TaskRecord invalid,
                                                      const char* expected) {
@@ -1090,6 +1148,11 @@ void test_submission_lifetime_hold_deduplicates_facets_and_backing() {
   live_raster.raster_facets.target = while_held;
   CHECK(vg::test_support::assemble_single_user_raster_plan(
       arena, shader, {live_raster}, &conflicting_fixture, &conflicting_plan, &error, options));
+  CHECK(conflicting_plan.execution_schedule.transitions.size() == 1);
+  CHECK(conflicting_plan.execution_schedule.transitions[0].before_wave ==
+        vg::core::kExecutionSchedulePrelude);
+  CHECK(conflicting_plan.execution_schedule.transitions[0].representation_operations ==
+        std::vector<uint32_t>({0}));
   vg::hal::SubmissionLifetimeHold conflicting_hold;
   CHECK(!conflicting_hold.prepare(conflicting_plan, arena, pool, &error));
   CHECK(error ==
@@ -1158,6 +1221,10 @@ void test_submission_lifetime_hold_deduplicates_facets_and_backing() {
       arena, scene_shader, {scene_task}, &scene_fixture, &scene_plan, &error,
       raster_options));
   CHECK(scene_plan.lifetime_facets.size() == 5);
+  CHECK(scene_plan.task_facet_uses.size() == 1);
+  CHECK(scene_plan.task_facet_uses[0].size() == 6);  // depth contributes read + write
+  CHECK(scene_plan.task_facet_uses[0][0].ref.index == albedo_ref.index);
+  CHECK(scene_plan.task_facet_uses[0][0].view.allocation == albedo.id);
   CHECK(std::ranges::any_of(scene_plan.task_effects[0], [&](const auto& effect) {
     return effect.allocation == scene_index.id && effect.size == 6 &&
            effect.access == vg::ir::Access::Read;

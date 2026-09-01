@@ -2,6 +2,7 @@
 #define VG_CORE_EXECUTION_PLAN_H_
 
 #include "core/core.h"
+#include "core/execution_schedule.h"
 
 namespace vg::core {
 
@@ -93,6 +94,7 @@ struct ExecutionPlan {
     std::string entry_name;
     std::optional<ir::Module> module;
     std::optional<ir::UserRasterShaderContract> user_raster_shader;
+    TaskKind execution_domain{TaskKind::Compute};
   };
   std::vector<ResolvedNode> resolved_nodes;
   // Stage 0--4 facts produced by the sole core assembler.  They are not a
@@ -106,14 +108,17 @@ struct ExecutionPlan {
   // this set before Task execution continues.
   std::vector<FacetLifetimeUse> lifetime_facets;
   bool lifetime_plan_derived{};
-  // Effects are instantiated once per Task from that Task's immutable
-  // resolved Node snapshot.  The flattened form remains the certificate
-  // vocabulary; the per-Task form plus validated_effect_graph is the sole
-  // executable happens-before fact consumed by Stage 6/7.
+  // Effects and facet uses are instantiated once per Task from immutable
+  // Node/Facet snapshots. The flattened effects remain the certificate
+  // vocabulary; ExecutionSchedule is the sealed execution fact Stage 6/7
+  // will consume once the MD-2 compatibility migration is complete.
   std::vector<std::vector<ir::Effect>> task_effects;
+  std::vector<std::vector<TaskFacetSemanticUse>> task_facet_uses;
   std::vector<ir::Effect> instantiated_effects;
   EffectGraph validated_effect_graph;
   EffectGraphShape validated_effect_graph_shape{EffectGraphShape::Unsupported};
+  ExecutionSchedule execution_schedule;
+  bool execution_schedule_derived{};
   std::optional<AccessCertificate> access_certificate;
   // Sealed access-planning facts.  These remain fields of the one execution
   // plan (rather than a backend-owned second plan): Stage 6/7 may record or
