@@ -488,7 +488,9 @@ class DeviceHal final : public vg::hal::DeviceHal {
   // Publication-only pass. Canonical program execution is performed by
   // dispatch_task_graph below; the Task ring cannot select a Node pipeline or
   // become a second execution authority.
-  bool dispatch_task_ring_publication(const TaskRingBuffers& buffers, std::string* error);
+  struct TaskDispatchCounts;
+  bool dispatch_task_ring_publication(const TaskRingBuffers& buffers,
+                                       TaskDispatchCounts* counts, std::string* error);
 
   struct CanonicalTaskDispatch {
     uint32_t task_index{};
@@ -497,16 +499,19 @@ class DeviceHal final : public vg::hal::DeviceHal {
     uint32_t z{1};
     const ComputePipelineRecord* pipeline{};
     std::vector<VkDeviceAddress> addresses;
-    bool barrier_after{};
+    // Physical operations admitted by Stage 6 at this wave's first Task.
+    std::vector<uint32_t> transitions_before;
   };
   struct TaskDispatchCounts {
     uint64_t dispatch_count{};
     uint64_t barrier_count{};
+    uint64_t command_buffer_count{};
+    uint64_t queue_wait_count{};
+    std::vector<uint32_t> encoded_transitions;
   };
-  // Records the assembler-sealed task order in one command buffer. Each Task
+  // Records Core's component/wave schedule in one command buffer. Each Task
   // binds its own NodeRef-keyed Stage-6 pipeline and package bindings. A
-  // sync2 compute memory barrier is emitted exactly at sealed effect-conflict
-  // boundaries selected before this call.
+  // conservative sync2 barrier is emitted only for Stage-6 wave operations.
   bool dispatch_task_graph(const std::vector<CanonicalTaskDispatch>& dispatches,
                            uint64_t wait_value, uint64_t signal_value,
                            TaskDispatchCounts* counts, std::string* error);

@@ -251,6 +251,19 @@ if(BUILD_TESTING)
   target_compile_features(vg_multicode_taskgraph_conformance_test PRIVATE cxx_std_17)
   add_test(NAME api.multicode-taskgraph-conformance COMMAND vg_multicode_taskgraph_conformance_test)
 
+  add_executable(vg_mixed_domain_conformance_test tests/api/vg_mixed_domain_conformance_test.cpp)
+  target_link_libraries(vg_mixed_domain_conformance_test PRIVATE vg_api)
+  target_compile_features(vg_mixed_domain_conformance_test PRIVATE cxx_std_17)
+  add_test(NAME api.mixed-domain.reference COMMAND vg_mixed_domain_conformance_test reference)
+  if(VG_ENABLE_METAL)
+    add_test(NAME api.mixed-domain.metal COMMAND vg_mixed_domain_conformance_test metal)
+    set_tests_properties(api.mixed-domain.metal PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  if(VG_ENABLE_VULKAN)
+    add_test(NAME api.mixed-domain.vulkan COMMAND vg_mixed_domain_conformance_test vulkan)
+    set_tests_properties(api.mixed-domain.vulkan PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+
   # Stress the Device-owned NodeTable separately from the historical API
   # conformance executable.  C++20 provides deterministic barrier scheduling
   # without sleeps, and vg_core exposes the table's snapshot semantics.
@@ -300,6 +313,16 @@ if(BUILD_TESTING)
   target_compile_features(vg_execution_schedule_test PRIVATE cxx_std_20)
   add_test(NAME core.execution-schedule COMMAND vg_execution_schedule_test)
 
+  add_executable(vg_device_hal_transition_contract_test
+                 tests/unit/device_hal_transition_contract_test.cpp)
+  target_link_libraries(vg_device_hal_transition_contract_test PRIVATE
+                        vg_backend_reference vg_compiler)
+  target_include_directories(vg_device_hal_transition_contract_test PRIVATE
+                             "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
+  target_compile_features(vg_device_hal_transition_contract_test PRIVATE cxx_std_20)
+  add_test(NAME core.device-hal-transition-contract
+           COMMAND vg_device_hal_transition_contract_test)
+
   # F6's generated root contract is validated in core, independently of the
   # Reference/Metal physical raster paths.  This owns the malformed root and
   # capture-v1 rejection matrix rather than duplicating it in an adapter test.
@@ -335,6 +358,13 @@ if(BUILD_TESTING)
   target_include_directories(vg_reference_raster_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
   target_compile_features(vg_reference_raster_test PRIVATE cxx_std_20)
   add_test(NAME reference.facet-oracles COMMAND vg_reference_raster_test)
+
+  add_executable(vg_reference_mixed_domain_conformance
+                 tests/conformance/reference_mixed_domain_conformance.cpp)
+  target_link_libraries(vg_reference_mixed_domain_conformance PRIVATE vg_backend_reference vg_compiler)
+  target_include_directories(vg_reference_mixed_domain_conformance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
+  target_compile_features(vg_reference_mixed_domain_conformance PRIVATE cxx_std_20)
+  add_test(NAME conformance.reference-mixed-domain COMMAND vg_reference_mixed_domain_conformance)
 
   add_executable(vg_compute_package_golden_test tests/fixtures/compute_package_golden_test.cpp)
   target_link_libraries(vg_compute_package_golden_test PRIVATE vg_compiler vg_ir)
@@ -403,6 +433,16 @@ if(BUILD_TESTING)
                           vg_capture)
     target_include_directories(vg_metal_task_timeline_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
     target_compile_features(vg_metal_task_timeline_test PRIVATE cxx_std_20)
+    add_executable(vg_metal_mixed_domain_conformance
+                   tests/vertical_slice/metal_mixed_domain_conformance.cpp)
+    target_link_libraries(vg_metal_mixed_domain_conformance PRIVATE
+                          vg_backend_metal vg_backend_reference vg_compiler)
+    target_include_directories(vg_metal_mixed_domain_conformance PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
+    target_compile_features(vg_metal_mixed_domain_conformance PRIVATE cxx_std_20)
+    add_test(NAME vertical-slice.metal.mixed-domain
+             COMMAND vg_metal_mixed_domain_conformance)
+    set_tests_properties(vertical-slice.metal.mixed-domain PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME vertical-slice.metal.task-tier0 COMMAND vg_metal_task_timeline_test task-tier0 ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.timeline COMMAND vg_metal_task_timeline_test timeline ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME vertical-slice.metal.access-certificate COMMAND vg_metal_task_timeline_test access-certificate ${CMAKE_CURRENT_SOURCE_DIR})

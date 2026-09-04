@@ -254,5 +254,70 @@ int main() {
     assert(bad.published_tasks.empty());
   }
 
+  // Both the legacy compatibility order and the MD-1 schedule order are
+  // immutable sealed facts. A caller cannot tamper either copy to steer
+  // publication; the continuation boundary rejects before mint/take.
+  {
+    Fixture fixture(3);
+    auto legacy_tampered = fixture.compiled.plan;
+    std::swap(legacy_tampered.task_order[0], legacy_tampered.task_order[1]);
+    vg::hal::Submission submission;
+    std::vector<uint32_t> order;
+    std::string error;
+    assert(!vg::hal::apply_envelope_continuation(
+        legacy_tampered, &fixture.device->envelope_continuations(), &submission,
+        &order, &error));
+    assert(error.find("valid sealed schedule") != std::string::npos);
+    assert(order.empty());
+
+    auto schedule_tampered = fixture.compiled.plan;
+    std::swap(schedule_tampered.execution_schedule.task_order[0],
+              schedule_tampered.execution_schedule.task_order[1]);
+    error.clear();
+    assert(!vg::hal::apply_envelope_continuation(
+        schedule_tampered, &fixture.device->envelope_continuations(), &submission,
+        &order, &error));
+    assert(error.find("valid sealed schedule") != std::string::npos);
+    assert(order.empty());
+  }
+
+  // A continuation token is not an alternate ordering authority. Even a
+  // device-owned token whose indices are in range must preserve the sealed
+  // schedule's exact canonical suffix.
+  {
+    Fixture fixture(3);
+    auto continued = fixture.compiled.plan;
+    const uint64_t token =
+        fixture.device->envelope_continuations().mint({2, 1});
+    vg::core::EnvelopeOverflow overflow;
+    overflow.disposition = vg::core::EnvelopeOverflowDisposition::Deferred;
+    overflow.overflow_task_count = 2;
+    overflow.continuation_token = token;
+    assert(overflow.valid());
+    continued.pending_overflow = overflow;
+    vg::hal::Submission submission;
+    std::vector<uint32_t> order;
+    std::string error;
+    assert(!vg::hal::apply_envelope_continuation(
+        continued, &fixture.device->envelope_continuations(), &submission,
+        &order, &error));
+    assert(error ==
+           "envelope continuation leftover is not the canonical schedule suffix");
+    assert(fixture.device->envelope_continuations().contains(token));
+    assert(order.empty());
+
+    const uint64_t skipped_token =
+        fixture.device->envelope_continuations().mint({0, 2});
+    continued.pending_overflow->continuation_token = skipped_token;
+    error.clear();
+    assert(!vg::hal::apply_envelope_continuation(
+        continued, &fixture.device->envelope_continuations(), &submission,
+        &order, &error));
+    assert(error ==
+           "envelope continuation leftover is not the canonical schedule suffix");
+    assert(fixture.device->envelope_continuations().contains(skipped_token));
+    assert(order.empty());
+  }
+
   return 0;
 }

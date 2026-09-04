@@ -122,8 +122,19 @@ void test_validation_profile_matrix_and_reset() {
       plan.required_capabilities = {vg::core::CapabilityRequirement::ReferenceStrict};
     if (profile == vg::core::ValidationProfile::Capture)
       plan.required_capabilities = {vg::core::CapabilityRequirement::CaptureReplay};
-    CHECK(vg::hal::preflight_stage6(plan, capabilities, vg::hal::BackendKind::Reference,
-                                    &compiled, &error));
+    compiled.per_node_packages.emplace_back();
+    compiled.representation_operations.push_back({});
+    compiled.transition_operations.emplace_back();
+    compiled.representation_operation_execution_order.push_back(0);
+    CHECK(!vg::hal::preflight_stage6(plan, capabilities,
+                                     vg::hal::BackendKind::Reference,
+                                     &compiled, &error));
+    CHECK(error.find("Stage6 requires a valid immutable core plan") !=
+          std::string::npos);
+    CHECK(compiled.per_node_packages.empty());
+    CHECK(compiled.representation_operations.empty());
+    CHECK(compiled.transition_operations.empty());
+    CHECK(compiled.representation_operation_execution_order.empty());
   }
 
   plan.required_capabilities = {vg::core::CapabilityRequirement::ReferenceStrict};
@@ -143,10 +154,14 @@ void test_validation_profile_matrix_and_reset() {
   capabilities.capability_bits &= ~static_cast<uint64_t>(Capability::CaptureReplay);
   compiled.per_node_packages.emplace_back();
   compiled.representation_operations.push_back({});
+  compiled.transition_operations.emplace_back();
+  compiled.representation_operation_execution_order.push_back(0);
   CHECK(!vg::hal::preflight_stage6(plan, capabilities, vg::hal::BackendKind::Reference,
                                    &compiled, &error));
   CHECK(compiled.per_node_packages.empty());
   CHECK(compiled.representation_operations.empty());
+  CHECK(compiled.transition_operations.empty());
+  CHECK(compiled.representation_operation_execution_order.empty());
 }
 
 vg::core::TaskRecord task(uint32_t node, uint64_t root) {
@@ -1054,9 +1069,8 @@ void test_submission_lifetime_hold_deduplicates_facets_and_backing() {
   CHECK(!raster_tampered.validate(&error));
   CHECK(error == "assembled execution plan semantic facts disagree with the immutable assembler seal");
 
-  // The current narrowing remains in force.  Freezing Node domain and a
-  // schedule must not make a representable mixed graph executable before
-  // the later Stage-6/Reference work packages exist.
+  // A NodeRef owns exactly one execution domain even though a complete plan
+  // may now contain both domains through distinct NodeRefs.
   vg::test_support::AssembledPlanFixture mixed_fixture;
   vg::core::ExecutionPlan mixed_plan;
   auto compute = vg::test_support::compute_task(source.id, source.generation);
@@ -1066,7 +1080,7 @@ void test_submission_lifetime_hold_deduplicates_facets_and_backing() {
   CHECK(!vg::test_support::assemble_single_node_plan(
       arena, canonical_module(source.id), {compute, raster}, &mixed_fixture,
       &mixed_plan, &error, mixed_options));
-  CHECK(error == "compute+raster mixed-domain TaskGraphs remain Unsupported");
+  CHECK(error == "one resolved NodeRef is used by multiple execution domains");
 
   const auto expect_raster_assembly_rejection = [&](vg::core::TaskRecord invalid,
                                                      const char* expected) {

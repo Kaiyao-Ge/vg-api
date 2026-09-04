@@ -949,19 +949,19 @@ bool bytes_match_pattern(const std::vector<uint8_t>& bytes, WordAt word) {
   return got == word.pattern;
 }
 
-// TASK-B14 (E012): exercises all 3 in-scope validated EffectGraph shapes
-// (classify_effect_graph_shape, ADR-027) end to end through a real Metal
-// submit(), plus one construction confirmed to fall outside those 3 shapes
-// so compile() must honestly report it Unsupported rather than guess a
-// fence placement. The ForkJoin construction is not a "textbook diamond":
+// TASK-B14 (E012), updated by MD-4: exercises the legacy diagnostic shape
+// classifications end to end, while execution consumes Core's sealed
+// component/wave schedule. Metal conservatively submits and host-waits one
+// command buffer per Task, so every shape has one compute encoder/wait per
+// Task and no MTLFence barrier hidden behind the report. The ForkJoin
+// construction is not a "textbook diamond":
 // classify_effect_graph_shape's edge-count invariant (structural_edges ==
 // 2*(node_count-1)) is only satisfiable for node_count==4 when every node
 // pair conflicts, so all 4 passes deliberately write the *same* allocation
 // with mutually-conflicting effects and zero explicit dependencies, letting
 // seal() generate the full C(4,2)=6-edge transitive closure automatically
-// (see dispatch_task_graph's ForkJoin branch doc comment in
-// metal_device_hal.mm for why this is the only shape that classifies
-// ForkJoin, confirmed empirically, not just by inspection).
+// this remains useful coverage for the Core diagnostic classifier, not a
+// second backend-local scheduling authority.
 bool run_effect_dag(const std::string& root) {
   (void)root;
   auto metal_device = vg::metal::make_device_hal();
@@ -1068,9 +1068,11 @@ bool run_effect_dag(const std::string& root) {
                 << ", expected " << expected_barrier_count << "\n";
       return false;
     }
-    if (submission.report.command_buffer_count != 2 || submission.report.queue_wait_count != 2) {
+    const uint64_t expected_buffers = expected_node_count + 1;  // Tasks plus compute-ring publication.
+    if (submission.report.command_buffer_count != expected_buffers ||
+        submission.report.queue_wait_count != expected_buffers) {
       std::cerr << "effect-dag: " << label
-                << " command-buffer/host-wait count does not match compute plus publication\n";
+                << " command-buffer/host-wait count does not match scheduled Tasks plus publication\n";
       return false;
     }
     const auto& dispatches = metal_device->last_node_aware_dispatches();
@@ -1136,7 +1138,7 @@ bool run_effect_dag(const std::string& root) {
     std::vector<vg::ir::Module> passes{make_store_pass(a, 0, 20), make_store_pass(b, 0, 21),
                                        make_store_pass(c, 0, 22)};
     if (!check_shape("linear-chain", passes, {{0, 1}, {1, 2}}, {0, 1, 2},
-                     vg::core::EffectGraphShape::LinearChain, 2, 0, arena,
+                     vg::core::EffectGraphShape::LinearChain, 4, 0, arena,
                      {{a.id, 20}, {b.id, 21}, {c.id, 22}}))
       return false;
   }
@@ -1150,7 +1152,7 @@ bool run_effect_dag(const std::string& root) {
     // 4 mutually-conflicting writes to the same allocation is what produces
     // the ForkJoin-classified transitive closure here, not add_dependency().
     if (!check_shape("fork-join", passes, {}, {0, 1, 2, 3},
-                     vg::core::EffectGraphShape::ForkJoin, 5, 6, arena, {{a.id, 33}}))
+                     vg::core::EffectGraphShape::ForkJoin, 5, 0, arena, {{a.id, 33}}))
       return false;
   }
 
@@ -1163,7 +1165,7 @@ bool run_effect_dag(const std::string& root) {
     const auto& b = arena.allocate(4);
     std::vector<vg::ir::Module> passes{make_store_pass(a, 0, 34), make_store_pass(b, 0, 35)};
     if (!check_shape("reverse-storage-order", passes, {{1, 0}}, {1, 0},
-                     vg::core::EffectGraphShape::LinearChain, 2, 0, arena,
+                     vg::core::EffectGraphShape::LinearChain, 3, 0, arena,
                      {{a.id, 34}, {b.id, 35}}))
       return false;
   }
@@ -1217,8 +1219,8 @@ bool run_effect_dag(const std::string& root) {
         dispatches[0].threadgroups != std::array<uint32_t, 3>{2, 5, 4} ||
         dispatches[1].threadgroups != std::array<uint32_t, 3>{7, 3, 2} ||
         dispatches[0].pipeline_ordinal != dispatches[1].pipeline_ordinal ||
-        submission.report.encoder_count != 2 || submission.report.barrier_count != 0 ||
-        submission.report.command_buffer_count != 2 || submission.report.queue_wait_count != 2) {
+        submission.report.encoder_count != 3 || submission.report.barrier_count != 0 ||
+        submission.report.command_buffer_count != 3 || submission.report.queue_wait_count != 3) {
       std::cerr << "effect-dag: same-Node dispatch/order/pipeline/report mismatch\n";
       return false;
     }
@@ -1270,12 +1272,10 @@ bool run_effect_dag(const std::string& root) {
   }
 
   {
-    // A textbook four-edge diamond is intentionally outside the current
-    // classifier's closed fork/join profile, which requires the source and
-    // join to be connected to every other node (including source->join).
-    // The assembler does not duplicate already-ordered hazards; this shape is
-    // Unsupported because its four explicit edges are not one of the three
-    // lowering profiles, not because a second pass list inflated the graph.
+    // A textbook four-edge diamond remains outside the legacy diagnostic
+    // classifier's three named shapes. MD-4 nevertheless lowers it from the
+    // sealed component/wave schedule, proving that the diagnostic shape is no
+    // longer a backend execution authority.
     vg::core::Arena arena;
     const auto& a = arena.allocate(4);
     const auto& b = arena.allocate(4);
@@ -1342,24 +1342,21 @@ bool run_effect_dag(const std::string& root) {
       return false;
     }
     vg::hal::CompiledPlan compiled;
-    if (metal_device->compile(plan, &compiled, &error)) {
-      std::cerr << "effect-dag: unsupported-shape unexpectedly compiled successfully\n";
+    vg::hal::Submission submission;
+    if (!metal_device->compile(plan, &compiled, &error) ||
+        !metal_device->submit(compiled, arena, &submission, &error) ||
+        !submission.result.ok || plan.execution_schedule.components.size() != 1 ||
+        plan.execution_schedule.components[0].waves.size() != 3 ||
+        submission.report.command_buffer_count != 5 ||
+        submission.report.queue_wait_count != 5 ||
+        !bytes_match_pattern(a.bytes, {.offset = 0, .pattern = store_word_pattern(40)}) ||
+        !bytes_match_pattern(b.bytes, {.offset = 0, .pattern = store_word_pattern(41)}) ||
+        !bytes_match_pattern(c.bytes, {.offset = 0, .pattern = store_word_pattern(42)})) {
+      std::cerr << "effect-dag: generic sealed schedule lowering failed: "
+                << (error.empty() ? submission.result.message : error) << "\n";
       return false;
     }
-    if (compiled.report.supported) {
-      std::cerr << "effect-dag: unsupported-shape report claims supported\n";
-      return false;
-    }
-    bool found_unsupported = false;
-    for (const auto& event : compiled.report.events) {
-      if (event.operation == "task_graph_lowering" && event.classification == vg::hal::LoweringClass::Unsupported)
-        found_unsupported = true;
-    }
-    if (!found_unsupported) {
-      std::cerr << "effect-dag: unsupported-shape missing honest Unsupported report event\n";
-      return false;
-    }
-    std::cout << "effect-dag: unsupported-shape honestly unsupported\n";
+    std::cout << "effect-dag: generic sealed schedule lowering ok\n";
   }
 
   std::cout << "effect-dag: ok\n";
@@ -2211,8 +2208,10 @@ bool run_task_graph_raster(const std::string& root) {
     std::cerr << "task-graph-raster: Metal execution reported failure: " << submission.result.message << "\n";
     return false;
   }
-  if (!submission.published_tasks.empty()) {
-    std::cerr << "task-graph-raster: raster Task must not enter the compute-only publication ring\n";
+  if (submission.published_tasks.size() != 1 ||
+      submission.published_tasks[0].kind != vg::core::TaskKind::Raster ||
+      submission.published_tasks[0].node_index != plan.task_graph.tasks()[0].node_index) {
+    std::cerr << "task-graph-raster: complete canonical publication omitted or changed the Raster Task\n";
     return false;
   }
   if (submission.result.trace.size() != plan.task_effects[0].size() ||
@@ -2367,9 +2366,10 @@ bool run_task_graph_raster(const std::string& root) {
     return false;
   }
 
-  // ADR-047/052 narrowing remains authoritative: a mixed compute+raster
-  // graph is rejected by semantic assembly and never reaches Metal.  This is
-  // intentionally a negative conformance case, not partial-execution logic.
+  // A resolved NodeRef cannot serve both execution domains. This is distinct
+  // from a legitimate canonical mixed-domain plan (one Node per domain), which
+  // Metal now executes through the sealed schedule. Restricted user shading
+  // retains its separate Stage-6 mixed-domain rejection.
   const auto& mixed_root = arena.allocate(4);
   TaskRecord compute_task{};
   compute_task.root_allocation = mixed_root.id;
@@ -2385,15 +2385,15 @@ bool run_task_graph_raster(const std::string& root) {
   std::string mixed_error;
   if (assemble_compute_plan(arena, module, {compute_task, mixed_raster_task}, &mixed_plan, &mixed_error,
                             mixed_options)) {
-    std::cerr << "task-graph-raster: semantic assembly unexpectedly accepted mixed compute+raster\n";
+    std::cerr << "task-graph-raster: semantic assembly accepted a NodeRef shared across execution domains\n";
     return false;
   }
-  if (mixed_error != "compute+raster mixed-domain TaskGraphs remain Unsupported") {
-    std::cerr << "task-graph-raster: unexpected mixed-domain rejection: " << mixed_error << "\n";
+  if (mixed_error != "one resolved NodeRef is used by multiple execution domains") {
+    std::cerr << "task-graph-raster: unexpected shared-NodeRef rejection: " << mixed_error << "\n";
     return false;
   }
   if (mixed_root.in_flight != 0) {
-    std::cerr << "task-graph-raster: rejected mixed-domain assembly acquired a lifetime hold\n";
+    std::cerr << "task-graph-raster: rejected shared NodeRef acquired a lifetime hold\n";
     return false;
   }
 

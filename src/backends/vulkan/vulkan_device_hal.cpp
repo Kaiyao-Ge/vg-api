@@ -77,26 +77,23 @@ bool node_ref_equal(vg::core::NodeTable::Ref left, vg::core::NodeTable::Ref righ
   return left.index == right.index && left.generation == right.generation;
 }
 
+// Stage 6 chooses one conservative compute-wide sync2 memory barrier for
+// each dependent wave. Prelude representation work has already completed in
+// the shared once-per-submission representation stage, so it needs no extra
+// compute barrier. No raw graph/effect interpretation belongs in this adapter.
 #if defined(VG_HAS_VULKAN)
-std::vector<uint8_t> sealed_structural_barriers(const vg::core::ExecutionPlan& plan) {
-  const size_t task_count = plan.task_graph.tasks().size();
-  std::vector<size_t> order_position(task_count, task_count);
-  for (size_t position = 0; position < plan.task_order.size(); ++position)
-    order_position[plan.task_order[position]] = position;
-
-  // One compute memory barrier after each producer that has at least one
-  // later direct structural successor. The edges and order are both sealed by
-  // Core; the backend neither rebuilds the topology nor re-derives conflicts.
-  std::vector<uint8_t> barrier_after(task_count);
-  for (const auto& edge : plan.validated_effect_graph.edges()) {
-    if (edge.kind != vg::core::EffectEdgeKind::Explicit &&
-        edge.kind != vg::core::EffectEdgeKind::InferredConflict)
-      continue;
-    if (edge.before < task_count && edge.after < task_count &&
-        order_position[edge.before] < order_position[edge.after])
-      barrier_after[edge.before] = 1;
+void lower_wave_transitions(vg::hal::CompiledPlan* compiled) {
+  for (auto& transition : compiled->transition_operations) {
+    transition.state = vg::hal::CompiledPlan::TransitionLoweringState::Lowered;
+    if (!transition.covers_execution_completion) continue;
+    transition.barrier_count = 1;
+    transition.serialized_fallback = true;
+    ++compiled->report.transition_barrier_count;
+    ++compiled->report.transition_serialized_fallback_count;
+    compiled->report.add("task_effect_barrier", vg::hal::LoweringClass::Serialized, 1, 0,
+                         "sealed wave transition=" + std::to_string(transition.semantic_transition) +
+                         "; conservative global compute memory visibility via vkCmdPipelineBarrier2");
   }
-  return barrier_after;
 }
 #endif
 }  // namespace
@@ -491,7 +488,8 @@ bool allocate_command_buffer(VkDevice device, VkCommandPool pool, VkCommandBuffe
 bool submit_and_wait(VkDevice device, VkQueue queue, VkCommandPool pool, VkCommandBuffer command_buffer,
                      const void* submit_pnext, uint32_t wait_count, const VkSemaphore* wait_semaphores,
                      const VkPipelineStageFlags* wait_stage_mask, uint32_t signal_count,
-                     const VkSemaphore* signal_semaphores, std::string* error) {
+                     const VkSemaphore* signal_semaphores, std::string* error,
+                     uint64_t* actual_host_waits = nullptr) {
   VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
   VkFence fence{VK_NULL_HANDLE};
   if (vkCreateFence(device, &fence_info, nullptr, &fence) != VK_SUCCESS) {
@@ -514,6 +512,7 @@ bool submit_and_wait(VkDevice device, VkQueue queue, VkCommandPool pool, VkComma
     if (error) *error = "vkQueueSubmit failed";
     return false;
   }
+  if (actual_host_waits != nullptr) ++*actual_host_waits;
   const VkResult wait_result = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
   vkDestroyFence(device, fence, nullptr);
   vkFreeCommandBuffers(device, pool, 1, &command_buffer);
@@ -805,12 +804,28 @@ bool DeviceHal::dispatch_task_graph(const std::vector<CanonicalTaskDispatch>& di
     set_error(error, "vkBeginCommandBuffer failed for canonical task graph");
     return false;
   }
+  if (counts != nullptr) ++counts->command_buffer_count;
   for (const auto& dispatch : dispatches) {
     if (dispatch.pipeline == nullptr || dispatch.pipeline->pipeline == VK_NULL_HANDLE ||
         dispatch.pipeline->pipeline_layout == VK_NULL_HANDLE) {
       vkFreeCommandBuffers(device_, command_pool_, 1, &command_buffer);
       set_error(error, "Vulkan task references an unavailable Node pipeline");
       return false;
+    }
+    for (uint32_t transition_index : dispatch.transitions_before) {
+      VkMemoryBarrier2 task_memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      task_memory.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      task_memory.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+      task_memory.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      task_memory.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+      VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      dependency.memoryBarrierCount = 1;
+      dependency.pMemoryBarriers = &task_memory;
+      vkCmdPipelineBarrier2(command_buffer, &dependency);
+      if (counts != nullptr) {
+        ++counts->barrier_count;
+        counts->encoded_transitions.push_back(transition_index);
+      }
     }
     vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                       dispatch.pipeline->pipeline);
@@ -822,19 +837,6 @@ bool DeviceHal::dispatch_task_graph(const std::vector<CanonicalTaskDispatch>& di
     }
     vkCmdDispatch(command_buffer, dispatch.x, dispatch.y, dispatch.z);
     if (counts != nullptr) ++counts->dispatch_count;
-
-    if (dispatch.barrier_after) {
-      VkMemoryBarrier2 task_memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-      task_memory.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-      task_memory.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
-      task_memory.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-      task_memory.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
-      VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-      dependency.memoryBarrierCount = 1;
-      dependency.pMemoryBarriers = &task_memory;
-      vkCmdPipelineBarrier2(command_buffer, &dependency);
-      if (counts != nullptr) ++counts->barrier_count;
-    }
   }
   if (vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
     vkFreeCommandBuffers(device_, command_pool_, 1, &command_buffer);
@@ -864,7 +866,8 @@ bool DeviceHal::dispatch_task_graph(const std::vector<CanonicalTaskDispatch>& di
   return submit_and_wait(device_, compute_queue_, command_pool_, command_buffer, pnext, wait_count,
                          wait_count != 0 ? &timeline_semaphore_ : nullptr,
                          wait_count != 0 ? &wait_stage_mask : nullptr, signal_count,
-                         signal_count != 0 ? &timeline_semaphore_ : nullptr, error);
+                         signal_count != 0 ? &timeline_semaphore_ : nullptr, error,
+                         counts != nullptr ? &counts->queue_wait_count : nullptr);
 }
 
 bool DeviceHal::ensure_timeline_semaphore(std::string* error) {
@@ -1002,7 +1005,9 @@ void DeviceHal::destroy_task_ring_buffers(TaskRingBuffers* buffers) {
   *buffers = TaskRingBuffers{};
 }
 
-bool DeviceHal::dispatch_task_ring_publication(const TaskRingBuffers& buffers, std::string* error) {
+bool DeviceHal::dispatch_task_ring_publication(const TaskRingBuffers& buffers,
+                                               TaskDispatchCounts* counts, std::string* error) {
+  if (counts != nullptr) *counts = {};
   if (!ensure_command_pool(device_, compute_queue_family_, &command_pool_, error)) return false;
   VkCommandBuffer cb{VK_NULL_HANDLE};
   if (!allocate_command_buffer(device_, command_pool_, &cb, error)) return false;
@@ -1014,6 +1019,7 @@ bool DeviceHal::dispatch_task_ring_publication(const TaskRingBuffers& buffers, s
     set_error(error, "vkBeginCommandBuffer failed for task publication");
     return false;
   }
+  if (counts != nullptr) ++counts->command_buffer_count;
 
   // Tier0: one dispatch, one invocation per task (gl_GlobalInvocationID.x ==
   // its own ring slot), matching task_ring_vulkan_source()'s local_size_x=1.
@@ -1025,6 +1031,7 @@ bool DeviceHal::dispatch_task_ring_publication(const TaskRingBuffers& buffers, s
   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, task_ring_pipeline_);
   vkCmdPushConstants(cb, task_ring_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(task_pc), &task_pc);
   vkCmdDispatch(cb, std::max<uint32_t>(buffers.task_count, 1), 1, 1);
+  if (counts != nullptr) ++counts->dispatch_count;
 
   // Publication is a distinct physical operation. Canonical Node programs
   // have already executed through dispatch_task_graph; this barrier only
@@ -1039,13 +1046,15 @@ bool DeviceHal::dispatch_task_ring_publication(const TaskRingBuffers& buffers, s
   publication_dependency.memoryBarrierCount = 1;
   publication_dependency.pMemoryBarriers = &publish_to_host;
   vkCmdPipelineBarrier2(cb, &publication_dependency);
+  if (counts != nullptr) ++counts->barrier_count;
 
   if (vkEndCommandBuffer(cb) != VK_SUCCESS) {
     vkFreeCommandBuffers(device_, command_pool_, 1, &cb);
     set_error(error, "vkEndCommandBuffer failed for task publication");
     return false;
   }
-  return submit_and_wait(device_, compute_queue_, command_pool_, cb, nullptr, 0, nullptr, nullptr, 0, nullptr, error);
+  return submit_and_wait(device_, compute_queue_, command_pool_, cb, nullptr, 0, nullptr, nullptr, 0, nullptr, error,
+                         counts != nullptr ? &counts->queue_wait_count : nullptr);
 }
 
 namespace {
@@ -2065,6 +2074,12 @@ bool DeviceHal::compile(const vg::core::ExecutionPlan& plan,
     set_error(error, message.c_str());
     return false;
   };
+  for (const auto& task : plan.task_graph.tasks()) {
+    if (task.kind == vg::core::TaskKind::Raster)
+      return reject_plan_requirement(
+          "raster_task", "Vulkan Unsupported: NodeRef{" + std::to_string(task.node_index) + "," +
+              std::to_string(task.node_generation) + "} domain=Raster; complete plan rejected before Commit");
+  }
   if (!plan.discovery_seeds.empty())
     return reject_plan_requirement("discovery",
                                    "discovery is Unsupported on Vulkan: no host-assisted reachable-set walk is "
@@ -2073,15 +2088,6 @@ bool DeviceHal::compile(const vg::core::ExecutionPlan& plan,
     return reject_plan_requirement("working_set_sparse",
                                    "working-set residency is Unsupported on Vulkan: sparse binding is not an "
                                    "automatic fault-managed working-set implementation");
-  if (std::ranges::any_of(plan.resolved_nodes, [](const auto& node) {
-        return node.user_raster_shader.has_value();
-      }))
-    return reject_plan_requirement("user_raster_shader",
-                                   "user raster shader import is Unsupported on Vulkan");
-  for (const auto& task : plan.task_graph.tasks()) {
-    if (task.kind == vg::core::TaskKind::Raster)
-      return reject_plan_requirement("raster_task", "raster tasks not supported on Vulkan backend");
-  }
   if (!vg::hal::preflight_stage6(plan, capabilities(), vg::hal::BackendKind::Vulkan, compiled, error)) return false;
   // F2 (ADR-046) wired TaskGraph-driven rasterization through compile()/
   // submit() for the reference and Metal backends only; this backend's own
@@ -2235,16 +2241,7 @@ bool DeviceHal::compile(const vg::core::ExecutionPlan& plan,
         1, 0,
         "Vulkan task ring GPU publication pass; canonical Nodes execute separately per Task");
   }
-  if (plan.task_graph.tasks().size() > 1) {
-    const auto barrier_after = sealed_structural_barriers(plan);
-    const uint64_t effect_barriers = static_cast<uint64_t>(
-        std::ranges::count(barrier_after, static_cast<uint8_t>(1)));
-    if (effect_barriers != 0)
-      compiled->report.add("task_effect_barrier", vg::hal::LoweringClass::Direct,
-                           effect_barriers, 0,
-                           "sync2 compute memory barriers derived from the sealed Explicit/"
-                           "InferredConflict edges and task_order");
-  }
+  lower_wave_transitions(compiled);
   if (plan.timeline_wait != 0 || plan.timeline_signal != 0) {
     compiled->report.add("timeline", vg::hal::LoweringClass::Direct, 1, 0,
                          "VkSemaphore(TIMELINE) wait/signal surrounds the canonical task-graph submission");
@@ -2259,6 +2256,17 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
   if (!submission) { set_error(error, "submission output is null"); return false; }
   if (!compiled.report.supported) { set_error(error, "compiled plan is unsupported"); return false; }
   if (!compiled.plan.validate(error)) return false;
+  for (const auto& transition : compiled.transition_operations) {
+    const uint64_t expected_barriers = transition.covers_execution_completion ? 1 : 0;
+    if (transition.state != vg::hal::CompiledPlan::TransitionLoweringState::Lowered ||
+        transition.barrier_count != expected_barriers ||
+        transition.serialized_fallback != transition.covers_execution_completion ||
+        transition.fence_count != 0 || transition.encoder_boundary_count != 0 ||
+        transition.host_wait_count != 0) {
+      set_error(error, "Vulkan compiled wave transition does not match its physical lowering");
+      return false;
+    }
+  }
   if (compiled.per_node_packages.size() != compiled.plan.resolved_nodes.size()) {
     set_error(error, "compiled plan must contain exactly one package for every immutable NodeRef");
     return false;
@@ -2291,8 +2299,18 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
   }
   if (!compiled.plan.graph_epoch_matches(arena, error)) return false;
 
+  *submission = {};
   submission->abi_version = vg::hal::kDeviceHalAbiVersion;
   submission->report = compiled.report;
+  // Compilation costs remain historical facts. Planned execution costs are
+  // replaced below only after the corresponding commands were really encoded.
+  std::erase_if(submission->report.events, [](const auto& event) {
+    return event.operation == "task_effect_barrier" || event.operation == "representation_transform" ||
+           event.operation == "image_layout_transition" || event.operation == "consume_input" ||
+           event.operation == "timeline";
+  });
+  submission->report.transition_barrier_count = 0;
+  submission->report.transition_serialized_fallback_count = 0;
   if (!vg::hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
   if (!vg::hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
 
@@ -2347,6 +2365,14 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
     }
   }
 
+  // Validate and consume the shared continuation exactly once, before any
+  // representation commit, GPU execution, output writeback, or Timeline signal.
+  // The resulting order filters publication only; all scheduled Tasks still run.
+  std::vector<uint32_t> publish_order;
+  if (!vg::hal::apply_envelope_continuation(compiled.plan, &envelope_continuations(),
+                                            submission, &publish_order, error))
+    return false;
+
   vg::hal::SubmissionLifetimeHold lifetime_hold;
   if (!lifetime_hold.prepare(compiled.plan, arena, facet_pool(), error)) return false;
 
@@ -2369,14 +2395,19 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
     // and writing the RepresentationEvent into the submission (02 §4.2, 06
     // §11). This backend supplies only the physical step below, which is why
     // ConsumeInput is never inferred here.
-    if (!vg::hal::commit_representation_operations(
+    const bool representation_committed = vg::hal::commit_representation_operations(
             compiled.plan, compiled.representation_operations, arena, facet_pool(),
             [&](const vg::core::RepresentationSemanticPlanItem& request, const vg::hal::CompiledPlan::PhysicalRepresentationOperation&, vg::core::FacetRef facet,
                 vg::hal::RepresentationTransformCost* cost, std::string* physical_error) {
               return transform_representation(arena, request, facet, cost, &representation_counts,
                                               physical_error);
             },
-            submission, &representation_error)) {
+            submission, &representation_error);
+    submission->report.barrier_count = representation_counts.barrier_count;
+    submission->report.command_buffer_count = representation_counts.command_buffer_count;
+    submission->report.encoder_count = representation_counts.command_buffer_count;
+    submission->report.queue_wait_count = representation_counts.queue_wait_count;
+    if (!representation_committed) {
       // A physical failure mid-stage is a hard submit() failure rather than a
       // poisoned result: the transform either happened or it did not, and the
       // helper has already recorded an Unsupported event describing which
@@ -2435,12 +2466,30 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
   if (!lifetime_hold.acquire(submission->representation_facets, error)) return false;
 
   const auto& tasks = compiled.plan.task_graph.tasks();
-  const auto barrier_after = sealed_structural_barriers(compiled.plan);
   std::vector<CanonicalTaskDispatch> task_dispatches;
-  task_dispatches.reserve(compiled.plan.task_order.size());
+  task_dispatches.reserve(tasks.size());
+  const auto& schedule = compiled.plan.execution_schedule;
+  for (uint32_t component_index = 0; component_index < schedule.components.size(); ++component_index) {
+    const auto& component = schedule.components[component_index];
+    for (uint32_t wave_index = 0; wave_index < component.waves.size(); ++wave_index) {
+      const auto& wave = component.waves[wave_index];
+      bool first_in_wave = true;
+      for (uint32_t task_index : wave.tasks) {
+        CanonicalTaskDispatch dispatch;
+        dispatch.task_index = task_index;
+        if (first_in_wave)
+          for (const auto& transition : compiled.transition_operations)
+            if (transition.component == component_index && transition.after_wave == wave_index &&
+                transition.barrier_count != 0)
+              dispatch.transitions_before.push_back(transition.semantic_transition);
+        task_dispatches.push_back(std::move(dispatch));
+        first_in_wave = false;
+      }
+    }
+  }
   std::vector<vg::core::Allocation*> touched;
-  for (size_t order_index = 0; order_index < compiled.plan.task_order.size(); ++order_index) {
-    const uint32_t task_index = compiled.plan.task_order[order_index];
+  for (auto& dispatch : task_dispatches) {
+    const uint32_t task_index = dispatch.task_index;
     const auto& task = tasks[task_index];
     const vg::core::NodeTable::Ref task_ref{task.node_index, task.node_generation};
     const auto node_it = std::ranges::find_if(compiled.plan.resolved_nodes, [&](const auto& node) {
@@ -2471,8 +2520,6 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
           instruction.allocation,
           std::make_pair(instruction.generation, instruction.representation_epoch));
 
-    CanonicalTaskDispatch dispatch;
-    dispatch.task_index = task_index;
     dispatch.x = task.x;
     dispatch.y = task.y;
     dispatch.z = task.z;
@@ -2512,26 +2559,17 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
       if (std::ranges::find(touched, allocation) == touched.end()) touched.push_back(allocation);
     }
 
-    dispatch.barrier_after = barrier_after[task_index] != 0;
-    task_dispatches.push_back(std::move(dispatch));
   }
 
   std::string dispatch_error;
   const auto dispatch_start = std::chrono::steady_clock::now();
   TaskDispatchCounts dispatch_counts;
-  if (!dispatch_task_graph(task_dispatches, wait_value, signal_value,
-                           &dispatch_counts, &dispatch_error)) {
-    submission->result.ok = false;
-    submission->result.outputs_valid = false;
-    submission->result.poison = vg::core::PoisonState::Poisoned;
-    submission->result.message = "Vulkan dispatch failed: " + dispatch_error;
-    submission->result.fault.code = "BACKEND_DISPATCH_FAILED";
-    submission->result.fault.message = submission->result.message;
-    return true;
-  }
+  const bool dispatched = dispatch_task_graph(task_dispatches, wait_value, signal_value,
+                                               &dispatch_counts, &dispatch_error);
   submission->cpu_submit_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - dispatch_start).count();
-  for (const auto& dispatch : task_dispatches) {
+  for (size_t i = 0; i < dispatch_counts.dispatch_count; ++i) {
+    const auto& dispatch = task_dispatches[i];
     const auto& task = tasks[dispatch.task_index];
     submission->report.add(
         "vulkan_task_dispatch", vg::hal::LoweringClass::Direct, 1, 0,
@@ -2540,11 +2578,31 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
             "} groups=" + std::to_string(dispatch.x) + "x" +
             std::to_string(dispatch.y) + "x" + std::to_string(dispatch.z));
   }
-  submission->report.command_buffer_count = representation_counts.command_buffer_count + 1;
-  submission->report.encoder_count = representation_counts.command_buffer_count + 1;
+  submission->report.command_buffer_count = representation_counts.command_buffer_count + dispatch_counts.command_buffer_count;
+  submission->report.encoder_count = representation_counts.command_buffer_count + dispatch_counts.command_buffer_count;
   submission->report.barrier_count =
       representation_counts.barrier_count + dispatch_counts.barrier_count;
-  submission->report.queue_wait_count = representation_counts.queue_wait_count + 1;
+  submission->report.queue_wait_count = representation_counts.queue_wait_count + dispatch_counts.queue_wait_count;
+  for (uint32_t transition : dispatch_counts.encoded_transitions) {
+    ++submission->report.transition_barrier_count;
+    ++submission->report.transition_serialized_fallback_count;
+    submission->report.add("task_effect_barrier", vg::hal::LoweringClass::Serialized, 1, 0,
+                           "encoded sealed wave transition=" + std::to_string(transition) +
+                           "; conservative global compute visibility via vkCmdPipelineBarrier2");
+  }
+  if ((wait_value != 0 || signal_value != 0) && dispatch_counts.queue_wait_count != 0)
+    submission->report.add("timeline", vg::hal::LoweringClass::Direct, 1, 0,
+                           "submitted Vulkan timeline semaphore wait/signal");
+  if (!dispatched) {
+    submission->result.ok = false;
+    submission->result.outputs_valid = false;
+    submission->result.poison = dispatch_counts.queue_wait_count != 0
+        ? vg::core::PoisonState::PartiallyProduced : vg::core::PoisonState::Poisoned;
+    submission->result.message = "Vulkan dispatch failed: " + dispatch_error;
+    submission->result.fault.code = "BACKEND_DISPATCH_FAILED";
+    submission->result.fault.message = submission->result.message;
+    return true;
+  }
   // No separate host-side mirror: timeline_value always reflects what the
   // GPU actually reached, read back fresh rather than passed through from
   // the plan (which is merely the requested value).
@@ -2561,7 +2619,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
   }
 
   uint32_t witness_index = 0;
-  for (uint32_t task_index : compiled.plan.task_order)
+  for (uint32_t task_index : compiled.plan.execution_schedule.task_order)
     for (const auto& effect : compiled.plan.task_effects[task_index]) {
       submission->result.trace.push_back(effect);
       submission->result.witness.record(effect, witness_index++);
@@ -2572,7 +2630,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
 
   if (!compiled.plan.task_graph.tasks().empty()) {
     // TASK-D5 / ADR-039 (compile-review-only): envelope continuation is a
-    // host split of the assembler-sealed plan.task_order (HostAssisted). This
+    // host split of the assembler-sealed canonical schedule (HostAssisted). This
     // file does not implement overflow-buffer / next-submit, and must not
     // pretend a DelegatedEnvelope or firmware enlarge exists. Envelope
     // refusal uses "envelope task quota exceeded" / leftover deferred --
@@ -2583,13 +2641,13 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
     // submission->published_tasks is sequence-identical to
     // reference::execute_task_graph()'s oracle output (same ordering
     // convention as Metal's submit()).
-    const std::vector<uint32_t>& order = compiled.plan.task_order;
     const auto& tasks = compiled.plan.task_graph.tasks();
     const uint32_t count = static_cast<uint32_t>(tasks.size());
 
     std::string task_pipeline_error;
     if (!ensure_task_ring_pipeline(&task_pipeline_error)) {
       submission->result.ok = false;
+      submission->result.outputs_valid = false;
       submission->result.poison = vg::core::PoisonState::PartiallyProduced;
       submission->result.message = "Vulkan task ring pipeline compile failed: " + task_pipeline_error;
       submission->result.fault.code = "TASK_PUBLICATION_FAILED";
@@ -2601,6 +2659,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
     std::string ring_error;
     if (!create_task_ring_buffers(count, &ring_buffers, &ring_error)) {
       submission->result.ok = false;
+      submission->result.outputs_valid = false;
       submission->result.poison = vg::core::PoisonState::PartiallyProduced;
       submission->result.message = "Vulkan task ring buffer allocation failed: " + ring_error;
       submission->result.fault.code = "TASK_PUBLICATION_FAILED";
@@ -2620,6 +2679,7 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
         submission->result.ok = false;
         submission->result.poison = vg::core::PoisonState::PartiallyProduced;
         submission->result.message = "Vulkan compute Task ring encode failed: " + codec_error;
+        submission->result.outputs_valid = false;
         submission->result.fault.code = "TASK_PUBLICATION_FAILED";
         submission->result.fault.message = submission->result.message;
         destroy_task_ring_buffers(&ring_buffers);
@@ -2629,8 +2689,25 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
 
     std::string publication_error;
     const auto publication_start = std::chrono::steady_clock::now();
-    if (!dispatch_task_ring_publication(ring_buffers, &publication_error)) {
+    TaskDispatchCounts publication_counts;
+    const bool published = dispatch_task_ring_publication(ring_buffers, &publication_counts, &publication_error);
+    submission->report.command_buffer_count += publication_counts.command_buffer_count;
+    submission->report.encoder_count += publication_counts.command_buffer_count;
+    submission->report.barrier_count += publication_counts.barrier_count;
+    submission->report.queue_wait_count += publication_counts.queue_wait_count;
+    if (publication_counts.dispatch_count != 0)
+      submission->report.add("task_publication_dispatch", vg::hal::LoweringClass::Direct,
+                             publication_counts.dispatch_count, 0,
+                             "compute-only GPU ring published " + std::to_string(count) +
+                             " records; Envelope-filtered canonical observation has " +
+                             std::to_string(publish_order.size()) + " Tasks");
+    if (publication_counts.barrier_count != 0)
+      submission->report.add(
+          "task_publication_barrier", vg::hal::LoweringClass::Direct, publication_counts.barrier_count, 0,
+          "vkCmdPipelineBarrier2 makes the publication shader writes visible to host readback");
+    if (!published) {
       submission->result.ok = false;
+      submission->result.outputs_valid = false;
       submission->result.poison = vg::core::PoisonState::PartiallyProduced;
       submission->result.message = "Vulkan task ring publication failed: " + publication_error;
       submission->result.fault.code = "TASK_PUBLICATION_FAILED";
@@ -2641,20 +2718,14 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
     submission->cpu_submit_ns +=
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - publication_start).count();
-    ++submission->report.command_buffer_count;
-    ++submission->report.encoder_count;
-    ++submission->report.barrier_count;
-    ++submission->report.queue_wait_count;
-    submission->report.add(
-        "task_publication_barrier", vg::hal::LoweringClass::Direct, 1, 0,
-        "vkCmdPipelineBarrier2 makes the publication shader writes visible to host readback");
 
     const uint32_t* states = static_cast<const uint32_t*>(ring_buffers.state_mapped);
     const uint32_t* fields = static_cast<const uint32_t*>(ring_buffers.fields_mapped);
     submission->published_tasks.reserve(count);
-    for (uint32_t index : order) {
+    for (uint32_t index : publish_order) {
       if (states[index] != static_cast<uint32_t>(vg::core::PublicationState::Published)) {
         submission->result.ok = false;
+        submission->result.outputs_valid = false;
         submission->result.poison = vg::core::PoisonState::PartiallyProduced;
         submission->result.message = "task ring slot did not reach Published state";
         submission->result.fault.code = "TASK_PUBLICATION_FAILED";
@@ -2671,12 +2742,26 @@ bool DeviceHal::submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& a
         submission->result.ok = false;
         submission->result.poison = vg::core::PoisonState::PartiallyProduced;
         submission->result.message = "Vulkan compute Task ring decode failed: " + codec_error;
+        submission->result.outputs_valid = false;
         submission->result.fault.code = "TASK_PUBLICATION_FAILED";
         submission->result.fault.message = submission->result.message;
         destroy_task_ring_buffers(&ring_buffers);
         return true;
       }
-      submission->published_tasks.push_back(vg::compiler::make_task_record(record));
+      const auto* expected_words = inputs + index * vg::compiler::kTaskRingWordsPerRecord;
+      const auto* published_words = fields + index * vg::compiler::kTaskRingWordsPerRecord;
+      if (!std::equal(expected_words, expected_words + vg::compiler::kTaskRingWordsPerRecord, published_words)) {
+        submission->result.ok = false;
+        submission->result.outputs_valid = false;
+        submission->result.poison = vg::core::PoisonState::PartiallyProduced;
+        submission->result.message = "Vulkan publication record disagrees with sealed Task";
+        submission->result.fault.code = "TASK_PUBLICATION_FAILED";
+        submission->result.fault.message = submission->result.message;
+        destroy_task_ring_buffers(&ring_buffers);
+        return true;
+      }
+      // The ring verifies physical publication; only Core owns Task identity.
+      submission->published_tasks.push_back(tasks[index]);
     }
     destroy_task_ring_buffers(&ring_buffers);
   }
@@ -3952,7 +4037,7 @@ std::unique_ptr<DeviceHal> DeviceHal::create_impl(const uint8_t* uuid, std::stri
     // host-read dependency. Canonical programs execute separately per Task;
     // this capability does not imply indirect execution.
     adapter->capabilities_.capability_bits |= static_cast<uint64_t>(vg::hal::Capability::TaskPublication);
-    // Multi-Task plans consume the assembler-sealed task_order and emit sync2
+    // Multi-Task plans consume the assembler-sealed component/wave schedule and emit sync2
     // compute memory dependencies at every conflicting effect boundary.
     adapter->capabilities_.capability_bits |= static_cast<uint64_t>(vg::hal::Capability::EffectDag);
   }

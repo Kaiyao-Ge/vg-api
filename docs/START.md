@@ -20,8 +20,12 @@ Phase F 的 TaskGraph 已由 ADR-053 重新收紧为 device-scoped、generation-
 `NodeRef` authority：ADR-044 的单 `CodeObject` builder narrowing 不再是合同。
 Reference 与 Metal 已有 per-Node lowering；Vulkan 的 per-Node Compute 实现仍需完成
 Linux SDK/真机验证。ADR-054 已冻结 mixed-domain 的 component/wave schedule、failure、
-publication 和 backend lowering 边界，但实现与 conformance 尚未完成；当前 runtime
-仍必须明确拒绝 compute+raster mixed submission，不得把已接受设计写成已交付能力。
+publication 和 backend lowering 边界。MD-1—4 已在当前工作树开放 Reference 与 Metal
+canonical Compute + built-in Raster；Metal 采用如实报告的保守串行，R→C 的 64-bit
+atomic 验收为 HostAssisted，不是原生 fence 证据。restricted user-raster mixed、
+SceneRoot narrowing 和同 NodeRef 跨域拒绝仍保留。MD-5/6 的公共路径/跨后端收口状态见
+[实施与验收台账](reports/md5-md6-mixed-domain-integration.md)；Vulkan concrete Raster
+整计划 Unsupported，Linux SDK/真机门禁未关闭，不得将局部绿灯写成完整路线完成。
 
 上一版「尚未建立 CMake / runtime / 测试」的句子描述的是文档初稿时的仓库，
 不再是当前 checkout 的事实。规范冲突优先级不变。
@@ -134,5 +138,5 @@ Agent 不得把 `NativeAdapter` 的成功写成“VG 已经是比 Vulkan/Metal �
 | [11-agent-workflow.md](vg-project/11-agent-workflow.md) | Agent 如何接单、修改、测试、交接 |
 | [12-roadmap-and-risks.md](vg-project/12-roadmap-and-risks.md) | 里程碑、决策记录、风险和停止条件 |
 | [13-repository-layout.md](vg-project/13-repository-layout.md) | 建议代码仓库和产物布局 |
-| [decisions/](decisions/) | 决策记录（当前最高：ADR-054；mixed-domain schedule 已冻结，实施待完成） |
+| [decisions/](decisions/) | 决策记录（当前最高：ADR-054；mixed-domain 分后端实施，Linux 平台门禁待完成） |
 | [issue/gpu-generated-cross-domain-tasks.md](issue/gpu-generated-cross-domain-tasks.md) | 未来 Tier 3：统一、带 domain discriminator 的 GPU 跨域 Task publication 研究项 |

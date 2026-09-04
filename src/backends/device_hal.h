@@ -112,6 +112,17 @@ struct LoweringReport {
   uint64_t encoder_count{};
   uint64_t command_buffer_count{};
   uint64_t queue_wait_count{};
+  // Counts below are reserved for physical lowering of Core's sealed
+  // WaveTransitions.  Shared Stage-6 preflight never increments them: only a
+  // backend which actually encodes (or performs) the named operation may do
+  // so.  MD-3/MD-4/MD-5 backend work will fill these alongside the transition
+  // records; zero therefore means "no such physical operation was reported",
+  // not an inferred no-op.
+  uint64_t transition_barrier_count{};
+  uint64_t transition_fence_count{};
+  uint64_t transition_encoder_boundary_count{};
+  uint64_t transition_host_wait_count{};
+  uint64_t transition_serialized_fallback_count{};
   // Shared representation-transform accounting, same additive/honest-zero
   // discipline as the counters above. Best-effort: a backend with no real
   // heap-fragmentation concept (reference, or Metal when it does not track
@@ -140,6 +151,37 @@ struct CompiledPlan {
     bool host_assisted{};
   };
   std::vector<PerNodePackage> per_node_packages;
+
+  // Stage 6 owns one record for every Core-sealed WaveTransition.  Requirement
+  // coverage is expressed by indices into the corresponding immutable Core
+  // vectors, so Stage 7 can reject a missing/duplicate prerequisite without
+  // reconstructing an EffectGraph.  `BackendExecutionRequired` is the narrow
+  // compatibility state while the existing single-domain backends migrate in
+  // MD-3/MD-4/MD-5: it makes no claim about a command or counter. A backend which
+  // sets `Lowered` must fill only counts for operations it actually emitted;
+  // validate_stage7_compiled_plan() reconciles their totals with the report.
+  enum class TransitionLoweringState : uint32_t {
+    BackendExecutionRequired,
+    Lowered,
+    Unsupported,
+  };
+  struct PhysicalWaveTransition {
+    uint32_t semantic_transition{};
+    uint32_t component{};
+    uint32_t before_wave{core::kExecutionSchedulePrelude};
+    uint32_t after_wave{};
+    bool covers_execution_completion{};
+    std::vector<uint32_t> covered_region_visibility;
+    std::vector<uint32_t> covered_facet_requirements;
+    std::vector<uint32_t> representation_operations;
+    TransitionLoweringState state{TransitionLoweringState::BackendExecutionRequired};
+    uint64_t barrier_count{};
+    uint64_t fence_count{};
+    uint64_t encoder_boundary_count{};
+    uint64_t host_wait_count{};
+    bool serialized_fallback{};
+  };
+  std::vector<PhysicalWaveTransition> transition_operations;
   LoweringReport report;
   // Stage-6 result: one descriptor per frozen Stage-5 item.  It contains no
   // authority or epoch derivation; submit only executes this already selected
@@ -151,6 +193,11 @@ struct CompiledPlan {
     std::string diagnostic;
   };
   std::vector<PhysicalRepresentationOperation> representation_operations;
+  // Unique execution ownership for the representation operation vector.
+  // Transitions may reference the same index, but this canonical list is a
+  // permutation-free, once-per-submission execution order (currently the
+  // frozen transform_order). Stage 7 validates it before Commit.
+  std::vector<uint32_t> representation_operation_execution_order;
 };
 
 // Stage 6 capability gate.  The plan remains core-owned; adapters supply
@@ -159,9 +206,10 @@ bool preflight_stage6(const core::ExecutionPlan& plan, const CapabilitySnapshot&
                       BackendKind expected_backend, CompiledPlan* compiled,
                       std::string* error = nullptr);
 
-// Stage 7 identity boundary.  This deliberately validates only the immutable
-// compiled-plan ABI and the adapter identity recorded by Stage 6; package
-// contents and plan semantics remain backend/Stage-7 concerns.
+// Stage 7 admission boundary. It validates the immutable plan seal, complete
+// NodeRef/package mapping, transition coverage, unique representation-operation
+// ownership, and report/evidence consistency before a backend may Commit or
+// publish anything. It does not choose or execute a backend algorithm.
 bool validate_stage7_compiled_plan(const CompiledPlan& compiled,
                                    BackendKind expected_backend,
                                    std::string* error = nullptr);
@@ -217,9 +265,10 @@ struct Submission {
   core::ExecutionResult result;
   uint64_t timeline_value{};
   LoweringReport report;
-  // Populated only when the submitted plan had a non-empty task_graph: the
-  // tasks in the order they were actually published (Empty->Writing->
-  // Published->Consumed), for byte-exact cross-backend comparison.
+  // Complete Envelope-filtered canonical sequence from
+  // plan.execution_schedule.task_order, across every execution domain.  A
+  // compute-only Task ring may publish a physical compute subset, but is never
+  // the membership/order authority for this domain-neutral observation.
   std::vector<core::TaskRecord> published_tasks;
   // Populated only when core::ExecutionPlan::requested_certificate_mode was set
   // and the mode has a real implementation (CertifiedPinned/Universe/
@@ -414,12 +463,13 @@ bool run_discovery_stage(const core::ExecutionPlan& plan, core::Arena& arena,
                          Submission* submission, std::string* error = nullptr);
 
 // TASK-D5 / ADR-039: portable envelope continuation. Host-splits the
-// assembler-sealed plan.task_order (HostAssisted). ADR-010 set_quota stays
+// assembler-sealed plan.execution_schedule.task_order (HostAssisted).
+// ADR-010 set_quota stays
 // build-time only; this helper never silently enlarges envelope_task_quota or
 // derives a second order from the raw TaskGraph.
 //
 // - quota unset and no valid Deferred pending: no-op, publish_order = full
-//   sealed task_order, envelope_overflow left unset
+//   sealed schedule order, envelope_overflow left unset
 // - task count <= quota and no valid Deferred pending: publish all
 // - task count > quota and no valid Deferred pending: publish first N,
 //   mint a token, set submission.envelope_overflow Deferred

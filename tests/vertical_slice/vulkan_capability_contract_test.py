@@ -67,17 +67,20 @@ for obsolete in (
 ):
     assert obsolete not in source + header, obsolete
 
-# Stage 7 consumes the sealed order and records a direct dispatch with each
-# Task's own shape and Node pipeline. sync2 barriers come from sealed effects,
+# Stage 7 consumes the sealed schedule and records a direct dispatch with each
+# Task's own shape and Node pipeline. sync2 barriers come from wave operations,
 # while the Task ring is publication-only and cannot dispatch a Node program.
-barrier_helper_start = must_contain("std::vector<uint8_t> sealed_structural_barriers(")
-barrier_helper_end = source.find("\n}  // namespace", barrier_helper_start)
-barrier_helper = source[barrier_helper_start:barrier_helper_end]
-assert "plan.validated_effect_graph.edges()" in barrier_helper
-assert "EffectEdgeKind::Explicit" in barrier_helper
-assert "EffectEdgeKind::InferredConflict" in barrier_helper
-assert "plan.task_order" in barrier_helper
-assert "EffectGraph::conflicts" not in barrier_helper
+for obsolete in ("sealed_structural_barriers", "plan.task_order", "validated_effect_graph",
+                 "EffectEdgeKind::", "EffectGraph::conflicts", "effect_graph_deterministic_order"):
+    assert obsolete not in source, obsolete
+assert "lower_wave_transitions(compiled)" in compile_body
+assert "TransitionLoweringState::Lowered" in source
+assert "transition.barrier_count = 1" in source
+assert "transition.serialized_fallback = true" in source
+assert '"raster_task", "Vulkan Unsupported: NodeRef{"' in compile_body
+assert '"} domain=Raster; complete plan rejected before Commit"' in compile_body
+assert "std::to_string(task.node_generation)" in compile_body
+assert compile_body.find("task.kind == vg::core::TaskKind::Raster") < compile_body.find("preflight_stage6")
 
 dispatch_start = must_contain("bool DeviceHal::dispatch_task_graph(")
 timeline_start = must_contain("bool DeviceHal::ensure_timeline_semaphore(")
@@ -96,9 +99,26 @@ assert "compute_pipeline_cache_" not in publication_body
 assert "vkCmdPipelineBarrier2(cb, &publication_dependency)" in publication_body
 
 submit_body = source[submit_start:source.find("// --- Phase C facet entry points", submit_start)]
-assert "for (size_t order_index = 0; order_index < compiled.plan.task_order.size(); ++order_index)" in submit_body
-assert "sealed_structural_barriers(plan)" in compile_body
-assert "sealed_structural_barriers(compiled.plan)" in submit_body
+assert "const auto& schedule = compiled.plan.execution_schedule" in submit_body
+assert "const auto& component = schedule.components[component_index]" in submit_body
+assert "const auto& wave = component.waves[wave_index]" in submit_body
+assert "compiled.transition_operations" in submit_body
+assert "dispatch.transitions_before" in source
+assert "apply_envelope_continuation(compiled.plan" in submit_body
+assert submit_body.count("apply_envelope_continuation(compiled.plan") == 1
+continuation_at = submit_body.index("apply_envelope_continuation(compiled.plan")
+for side_effect in (
+    "lifetime_hold.prepare(",
+    "commit_representation_operations(",
+    "lifetime_hold.acquire(",
+    "dispatch_task_graph(task_dispatches",
+    "std::memcpy(allocation->bytes.data()",
+    "dispatch_task_ring_publication(ring_buffers",
+):
+    assert continuation_at < submit_body.index(side_effect), side_effect
+assert "for (uint32_t index : publish_order)" in submit_body
+assert "submission->published_tasks.push_back(tasks[index])" in submit_body
+assert "submission->report.transition_barrier_count = 0" in submit_body
 assert "EffectGraph::conflicts" not in compile_body
 assert "EffectGraph::conflicts" not in submit_body
 assert "compute_pipeline_cache_.find(cache_key)" in submit_body

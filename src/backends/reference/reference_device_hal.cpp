@@ -72,6 +72,40 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     compiled->report = {};
     compiled->report.backend = hal::BackendKind::Reference;
     compiled->report.supported = true;
+    // ADR-054 opens canonical mixed execution, not the restricted-MSL
+    // contract. Keep its raster-only narrowing even for fixed C++ shading.
+    const bool has_compute = std::ranges::any_of(plan.task_graph.tasks(), [](const auto& task) {
+      return task.kind == core::TaskKind::Compute;
+    });
+    if (has_compute) {
+      for (const auto& node : plan.resolved_nodes) {
+        if (node.execution_domain != core::TaskKind::Raster || !node.user_raster_shader) continue;
+        compiled->report.supported = false;
+        compiled->report.diagnostic =
+            "Reference Unsupported: restricted user raster NodeRef{" +
+            std::to_string(node.ref.index) + "," + std::to_string(node.ref.generation) +
+            "} domain=Raster cannot participate in a mixed-domain ExecutionSchedule";
+        compiled->report.add("mixed_domain_user_raster_shader", hal::LoweringClass::Unsupported,
+                             1, 0, compiled->report.diagnostic);
+        if (error) *error = compiled->report.diagnostic;
+        return false;
+      }
+    }
+    // The reference backend is a deterministic CPU interpreter.  It does not
+    // invent GPU synchronization. Only a non-prelude wave dependency is a
+    // physical serialized fallback; prelude facet/representation admission is
+    // bookkeeping, not an execution boundary.
+    for (auto& transition : compiled->transition_operations) {
+      transition.state = hal::CompiledPlan::TransitionLoweringState::Lowered;
+      if (transition.covers_execution_completion) {
+        transition.serialized_fallback = true;
+        ++compiled->report.transition_serialized_fallback_count;
+      }
+    }
+    if (!plan.execution_schedule.task_order.empty())
+      compiled->report.add("schedule_program_order", hal::LoweringClass::Serialized,
+                           plan.execution_schedule.task_order.size(), 0,
+                           "reference CPU interpreter serializes sealed schedule tasks in program order");
     for (const auto& node : plan.resolved_nodes) {
       hal::CompiledPlan::PerNodePackage per_node;
       per_node.ref = node.ref;
@@ -208,8 +242,16 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       }
     }
     if (!compiled.plan.graph_epoch_matches(arena, error)) return false;
+    *submission = {};
     submission->abi_version = hal::kDeviceHalAbiVersion;
     submission->report = compiled.report;
+    // The compiled schedule describes planned work. Submission reports only
+    // reached interpreter steps and wave boundaries, retaining Node compile
+    // history without counting cancelled/unstarted work as execution.
+    submission->report.transition_serialized_fallback_count = 0;
+    std::erase_if(submission->report.events, [](const auto& event) {
+      return event.operation == "schedule_program_order";
+    });
     // TASK-D2 / ADR-036: record the core-sealed discovery/access operation;
     // this backend does not rescan the Arena to derive another touched set.
     if (!hal::run_discovery_stage(compiled.plan, arena, submission, error)) return false;
@@ -217,6 +259,25 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     // A set working_set_budget that the requested bytes exceed is a hard
     // refuse -- never a silent clamp, and never "unified memory is infinite".
     if (!hal::apply_working_set_budget(compiled.plan, arena, submission, error)) return false;
+    // Preserve Timeline admission before consuming a continuation token.
+    if (compiled.plan.timeline_wait != 0) {
+      std::string wait_error;
+      if (!timeline_.validate_wait(compiled.plan.timeline_wait, &wait_error)) {
+        submission->result.ok = false;
+        submission->result.outputs_valid = false;
+        submission->result.poison = core::PoisonState::Poisoned;
+        submission->result.message = wait_error;
+        submission->result.fault.code = "TIMELINE_WAIT_UNSATISFIED";
+        submission->result.fault.message = wait_error;
+        submission->timeline_value = timeline_.value();
+        return true;
+      }
+    }
+    // Admission must precede representation/lifetime side effects. Keep the
+    // single helper's result for publication; never mint/take a token twice.
+    std::vector<uint32_t> publish_order;
+    if (!hal::apply_envelope_continuation(compiled.plan, &envelope_continuations_, submission,
+                                          &publish_order, error)) return false;
     hal::SubmissionLifetimeHold lifetime_hold;
     if (!lifetime_hold.prepare(compiled.plan, arena, facet_pool(), error)) return false;
     // Stage 5 precedes Stage 6/7 (03 §7), and runs outside the cpu_submit_ns
@@ -249,20 +310,6 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
     submission->result = core::ExecutionResult{};
     submission->result.ok = true;
     const auto& tasks = compiled.plan.task_graph.tasks();
-    const bool raster_only = std::ranges::all_of(tasks, [](const auto& task) {
-      return task.kind == core::TaskKind::Raster;
-    });
-    if (raster_only && compiled.plan.timeline_wait != 0) {
-      std::string wait_error;
-      if (!timeline_.validate_wait(compiled.plan.timeline_wait, &wait_error)) {
-        submission->result.ok = false;
-        submission->result.outputs_valid = false;
-        submission->result.poison = core::PoisonState::Poisoned;
-        submission->result.message = wait_error;
-        submission->result.fault.code = "TIMELINE_WAIT_UNSATISFIED";
-        submission->result.fault.message = wait_error;
-      }
-    }
     const auto record_raster_failure = [&](uint32_t task_index, std::string code,
                                            std::string message) {
       auto& result = submission->result;
@@ -274,16 +321,9 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
       result.fault.task_index = task_index;
       result.fault.code = std::move(code);
       result.fault.message = result.message;
-      const bool prior_output = !submission->raster_results.empty() ||
-          std::ranges::any_of(result.trace, [](const ir::Effect& effect) {
-            return effect.access != ir::Access::Read;
-          });
-      result.poison = prior_output ? core::PoisonState::PartiallyProduced
-                                   : core::PoisonState::Poisoned;
+      result.poison = core::PoisonState::Poisoned;
     };
-    for (size_t order_index = 0; order_index < compiled.plan.task_order.size(); ++order_index) {
-        if (!submission->result.ok) break;
-        const auto task_index = compiled.plan.task_order[order_index];
+    const auto execute_compute_task = [&](uint32_t task_index) {
         const auto& task = tasks[task_index];
         const core::NodeTable::Ref ref{task.node_index, task.node_generation};
         const auto found = std::ranges::find_if(compiled.plan.resolved_nodes, [ref](const auto& node) {
@@ -292,7 +332,7 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         if (found == compiled.plan.resolved_nodes.end()) {
           submission->result.ok = false;
           submission->result.message = "reference per-Node execution could not resolve the Task NodeRef";
-          break;
+          return false;
         }
         const auto package = std::ranges::find_if(compiled.per_node_packages, [ref](const auto& item) {
           return item.ref.index == ref.index && item.ref.generation == ref.generation;
@@ -300,14 +340,14 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         if (package == compiled.per_node_packages.end()) {
           submission->result.ok = false;
           submission->result.message = "reference per-Node execution package is missing";
-          break;
+          return false;
         }
         if (task.kind == core::TaskKind::Compute) {
           if (!found->module.has_value() ||
               package->kind != hal::CompiledPlan::NodePackageKind::CanonicalCompute) {
             submission->result.ok = false;
             submission->result.message = "reference compute Task resolved a non-compute NodeRef package";
-            break;
+            return false;
           }
           if (!package->package.has_value() ||
               package->package->canonical_ir_hash != found->module->hash ||
@@ -315,20 +355,14 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
             submission->result.ok = false;
             submission->result.message =
                 "reference per-Node execution package disagrees with the resolved immutable module";
-            break;
+            return false;
           }
           auto result = execute(*found->module, arena,
                                 compiled.plan.certificate.ranges.empty() ? nullptr : &compiled.plan.certificate,
-                                &timeline_, {.wait = order_index == 0 ? compiled.plan.timeline_wait : 0,
-                                             .signal = order_index + 1 == compiled.plan.task_order.size()
-                                                           ? compiled.plan.timeline_signal : 0},
+                                &timeline_, {},
                                 &compiled.plan.task_effects[task_index]);
           if (!result.ok) {
             result.fault.task_index = task_index;
-            if (std::ranges::any_of(submission->result.trace, [](const ir::Effect& effect) {
-                  return effect.access != ir::Access::Read;
-                }) && result.poison == core::PoisonState::Poisoned)
-              result.poison = core::PoisonState::PartiallyProduced;
             result.trace.insert(result.trace.begin(), submission->result.trace.begin(),
                                 submission->result.trace.end());
             result.missing_effects.insert(result.missing_effects.begin(),
@@ -341,7 +375,7 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
               merged.record(entry.effect, entry.instruction_index);
             result.witness = std::move(merged);
             submission->result = std::move(result);
-            break;
+            return false;
           }
           submission->result.trace.insert(submission->result.trace.end(),
                                           result.trace.begin(), result.trace.end());
@@ -349,25 +383,13 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
             submission->result.witness.record(entry.effect, entry.instruction_index);
           submission->result.outputs_valid = submission->result.outputs_valid && result.outputs_valid;
         }
-    }
-    submission->timeline_value = timeline_.value();
-    if (!submission->result.ok) {
-      submission->cpu_submit_ns =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submit_start).count();
-      return true;
-    }
-    if (!compiled.plan.task_graph.tasks().empty()) {
-      // TASK-D5 / ADR-039: host-split on deterministic_order. Unset quota
+        return true;
+    };
+    const auto publish_tasks = [&] {
+      // TASK-D5 / ADR-039: host-split on the admitted canonical order. Unset quota
       // keeps the pre-D5 full publish. A set cap publishes a prefix and
       // parks leftover under a device token; the next submit must present
       // that record as pending_overflow.
-      std::vector<uint32_t> publish_order;
-      if (!hal::apply_envelope_continuation(compiled.plan, &envelope_continuations_, submission,
-                                            &publish_order, error)) {
-        submission->cpu_submit_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submit_start).count();
-        return false;
-      }
       if (!publish_order.empty()) {
         std::string task_error;
         core::PublicationRing ring(static_cast<uint32_t>(publish_order.size()));
@@ -376,8 +398,10 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         submission->published_tasks.reserve(publish_order.size());
         for (uint32_t index : publish_order) {
           uint32_t slot = 0;
-          if (index >= tasks.size() || !ring.publish_task(tasks[index], &slot, &task_error) ||
-              !ring.consume(slot, &task_error)) {
+          if (index >= tasks.size() ||
+              (tasks[index].kind == core::TaskKind::Compute &&
+               (!ring.publish_task(tasks[index], &slot, &task_error) ||
+                !ring.consume(slot, &task_error)))) {
             submission->result.ok = false;
             submission->result.message = task_error.empty() ? "envelope task index is out of range"
                                                             : task_error;
@@ -390,13 +414,54 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
           submission->published_tasks.push_back(tasks[index]);
         }
       }
-      // Raster tasks execute only through their NodeRef-keyed Raster package,
-      // in the assembler-sealed order. A canonical module carried by a raster
-      // Node describes the raster contract; it is never run once as compute.
+      // Execute one sealed component/wave schedule.  The reference interpreter
+      // serializes ready Tasks, but never derives a second order from the raw
+      // graph or the legacy plan task_order observation view.
       const auto& all_tasks = compiled.plan.task_graph.tasks();
-      for (uint32_t task_index : compiled.plan.task_order) {
+      std::vector<uint32_t> scheduled_tasks;
+      for (const auto& component : compiled.plan.execution_schedule.components)
+        for (const auto& wave : component.waves)
+          scheduled_tasks.insert(scheduled_tasks.end(), wave.tasks.begin(), wave.tasks.end());
+      std::vector<uint8_t> started(all_tasks.size());
+      std::vector<uint8_t> cancelled(all_tasks.size());
+      std::vector<core::FaultRecord> logical_failures;
+      // A trace records an attempted effect before all runtime preconditions
+      // have passed. Keep actual output production separate for poison state.
+      bool produced_output = false;
+      const auto cancel_descendants = [&](uint32_t failed_task) {
+        std::vector<uint32_t> pending{failed_task};
+        for (size_t i = 0; i < pending.size(); ++i) {
+          for (uint32_t successor :
+               compiled.plan.execution_schedule.structural_successors[pending[i]]) {
+            if (!started[successor] && !cancelled[successor]) {
+              cancelled[successor] = 1;
+              pending.push_back(successor);
+            }
+          }
+        }
+      };
+      bool made_progress = false;
+      do {
+        made_progress = false;
+        submission->result.ok = true;
+        submission->result.outputs_valid = true;
+        uint32_t failed_task = UINT32_MAX;
+        for (uint32_t task_index : scheduled_tasks) {
+        if (started[task_index] || cancelled[task_index]) continue;
+        started[task_index] = 1;
+        made_progress = true;
         const core::TaskRecord& task = all_tasks[task_index];
-        if (task.kind != core::TaskKind::Raster) continue;
+        if (task.kind == core::TaskKind::Compute) {
+          if (!execute_compute_task(task_index)) {
+            failed_task = task_index;
+            break;
+          }
+          produced_output = produced_output || std::ranges::any_of(
+              compiled.plan.task_effects[task_index], [](const ir::Effect& effect) {
+                return effect.access != ir::Access::Read;
+              });
+          continue;
+        }
         const core::NodeTable::Ref task_ref{task.node_index, task.node_generation};
         const auto resolved = std::ranges::find_if(compiled.plan.resolved_nodes, [task_ref](const auto& node) {
           return node.ref.index == task_ref.index && node.ref.generation == task_ref.generation;
@@ -560,13 +625,52 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         task_result.stored = raster_result.stored;
         task_result.contents_defined = raster_result.contents_defined;
         submission->raster_results.push_back(std::move(task_result));
+        produced_output = true;
         for (const auto& effect : compiled.plan.task_effects[task_index]) {
           submission->result.trace.push_back(effect);
           submission->result.witness.record(
               effect, static_cast<uint32_t>(submission->result.witness.entries().size()));
         }
+        if (!submission->result.ok) break;
       }
-      if (submission->result.ok && raster_only && compiled.plan.timeline_signal != 0) {
+      if (!submission->result.ok) {
+        if (failed_task == UINT32_MAX)
+          failed_task = submission->result.fault.task_index;
+        logical_failures.push_back(submission->result.fault);
+        produced_output = produced_output ||
+            submission->result.poison == core::PoisonState::PartiallyProduced;
+        cancel_descendants(failed_task);
+      }
+      } while (made_progress);
+      const auto executed_steps = std::ranges::count(started, uint8_t{1});
+      if (executed_steps != 0)
+        submission->report.add("schedule_program_order", hal::LoweringClass::Serialized,
+                               executed_steps, 0,
+                               "reference CPU interpreter entered these sealed Task steps, including failed attempts");
+      for (const auto& transition : compiled.transition_operations) {
+        if (!transition.covers_execution_completion) continue;
+        const auto& consumer_wave = compiled.plan.execution_schedule
+            .components[transition.component].waves[transition.after_wave];
+        // A cancelled consumer never crosses this boundary. A failed consumer
+        // that was actually entered does, just as on the Metal schedule path.
+        if (std::ranges::any_of(consumer_wave.tasks, [&](uint32_t task) { return started[task] != 0; }))
+          ++submission->report.transition_serialized_fallback_count;
+      }
+      if (!logical_failures.empty()) {
+        std::vector<uint32_t> canonical_rank(all_tasks.size());
+        for (uint32_t rank = 0; rank < compiled.plan.execution_schedule.task_order.size(); ++rank)
+          canonical_rank[compiled.plan.execution_schedule.task_order[rank]] = rank;
+        const auto primary = std::ranges::min_element(logical_failures, [&](const auto& left, const auto& right) {
+          return canonical_rank[left.task_index] < canonical_rank[right.task_index];
+        });
+        submission->result.ok = false;
+        submission->result.outputs_valid = false;
+        submission->result.fault = *primary;
+        submission->result.message = primary->message;
+        submission->result.poison = produced_output ? core::PoisonState::PartiallyProduced
+                                             : core::PoisonState::Poisoned;
+      }
+      if (logical_failures.empty() && compiled.plan.timeline_signal != 0) {
         std::string signal_error;
         if (!timeline_.signal(compiled.plan.timeline_signal, &signal_error)) {
           submission->result.ok = false;
@@ -577,7 +681,12 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
           submission->result.fault.message = signal_error;
         }
       }
-    }
+      return submission->result.ok;
+    };
+    // Logical Task failure is an ExecutionResult, not a Stage-7 API failure.
+    // The continuation helper itself has already returned false above for
+    // structural/admission errors before any interpreter work starts.
+    if (submission->result.ok && !publish_tasks() && submission->result.ok) return false;
     submission->timeline_value = timeline_.value();
     submission->cpu_submit_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submit_start).count();
