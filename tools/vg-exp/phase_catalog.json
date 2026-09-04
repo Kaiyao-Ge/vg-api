@@ -1,0 +1,520 @@
+{
+  "version": 1,
+  "phases": {
+    "phase-a": {
+      "title": "Phase A Semantic Core",
+      "definition_files": {
+        "E001": "E001-lifecycle-epoch.json",
+        "E003": "E003-task-publication.json",
+        "E006": "E006-access-witness.json",
+        "E015": "E015-fault-poison.json",
+        "E018": "E018-graph-epoch-publication.json"
+      },
+      "experiments": {
+        "E001": [
+          {
+            "ctest": "model.phase-a",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E003": [
+          {
+            "ctest": "model.phase-a",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E006": [
+          {
+            "ctest": "conformance.phase-a",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E015": [
+          {
+            "ctest": "conformance.phase-a",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E018": [
+          {
+            "ctest": "core.unit",
+            "backend": "cpu-reference"
+          }
+        ]
+      },
+      "report_footer": "\n\nNativeAdapter results are deferred to Phase B.\n",
+      "summary_extra": {
+        "native_adapter": "deferred"
+      },
+      "resolved_extra": {},
+      "non_executed": [],
+      "csv_fields": [
+        "experiment",
+        "status",
+        "return_code"
+      ],
+      "sample_variant": "reference-conformance",
+      "simple_report": true
+    },
+    "phase-b": {
+      "title": "Phase B Gate Experiments",
+      "definition_files": {
+        "E002": "E002-typed-pointer-graph.json",
+        "E004": "E004-access-certificate.json",
+        "E007": "E007-root-pointer-vs-bindless.json",
+        "E009": "E009-gpu-generated-same-node-work.json",
+        "E012": "E012-effect-dag-sync-quality.json"
+      },
+      "experiments": {
+        "E002": [
+          {
+            "ctest": "vertical-slice.metal.pointer-graph",
+            "backend": "metal"
+          },
+          {
+            "ctest": "compiler.compute-package-golden",
+            "backend": "metal"
+          }
+        ],
+        "E004": [
+          {
+            "ctest": "vertical-slice.metal.access-certificate",
+            "backend": "metal"
+          }
+        ],
+        "E007": [
+          {
+            "ctest": "vertical-slice.metal.indexed-binding",
+            "backend": "metal"
+          }
+        ],
+        "E009": [
+          {
+            "ctest": "vertical-slice.metal.tier1-indirect",
+            "backend": "metal"
+          },
+          {
+            "ctest": "vertical-slice.metal.cull-compact",
+            "backend": "metal"
+          }
+        ],
+        "E012": [
+          {
+            "ctest": "vertical-slice.metal.effect-dag",
+            "backend": "metal"
+          }
+        ]
+      },
+      "report_footer": "\n\nVulkan samples are compile-review-only (ADR-024): documentation-level source mapping, not executed evidence.\n",
+      "summary_extra": {},
+      "resolved_extra": {},
+      "non_executed": [
+        {
+          "backend": "vulkan",
+          "evidence": "compile-review-only",
+          "summary_key": "vulkan_status"
+        }
+      ],
+      "csv_fields": [
+        "experiment",
+        "backend",
+        "variant",
+        "status",
+        "return_code"
+      ]
+    },
+    "phase-c": {
+      "title": "Phase C Gate Experiments",
+      "definition_files": {
+        "E005": "E005-consume-input-peak-memory.json",
+        "E008": "E008-sample-facet.json",
+        "E013": "E013-pipeline-classification.json",
+        "E016": "E016-representation-epoch-churn.json"
+      },
+      "experiments": {
+        "E005": [
+          {
+            "ctest": "vertical-slice.metal.consume-input",
+            "backend": "metal"
+          }
+        ],
+        "E008": [
+          {
+            "ctest": "vertical-slice.metal.sample-facet",
+            "backend": "metal"
+          }
+        ],
+        "E013": [
+          {
+            "ctest": "vertical-slice.metal.pipeline-classification",
+            "backend": "metal"
+          }
+        ],
+        "E016": [
+          {
+            "ctest": "vertical-slice.metal.representation-churn",
+            "backend": "metal"
+          }
+        ]
+      },
+      "report_footer": "\n\nGate closure uses E005/E008/E016 only (ADR-030); E013 is recorded but non-blocking.\nVulkan samples are compile-review-only (ADR-024/030): documentation-level source mapping, not executed evidence.\n",
+      "summary_extra": {
+        "e013_non_blocking": true
+      },
+      "resolved_extra": {},
+      "non_executed": [
+        {
+          "backend": "vulkan",
+          "evidence": "compile-review-only",
+          "summary_key": "vulkan_status"
+        }
+      ],
+      "csv_fields": [
+        "experiment",
+        "backend",
+        "variant",
+        "status",
+        "return_code"
+      ],
+      "gate_experiments": [
+        "E005",
+        "E008",
+        "E016"
+      ],
+      "gate_counts": true
+    },
+    "phase-d": {
+      "title": "Phase D Gate Experiments",
+      "definition_files": {
+        "E004": "E004-discovery-revisit.json",
+        "E010": "E010-heterogeneous-node-lowering.json",
+        "E011": "E011-residency-working-set.json",
+        "E014": "E014-capture-replay.json",
+        "E017": "E017-envelope-quota-continuation.json"
+      },
+      "experiments": {
+        "E004": [
+          {
+            "ctest": "core.discovery",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "vertical-slice.metal.discovery",
+            "backend": "metal"
+          }
+        ],
+        "E010": [
+          {
+            "ctest": "unit.tier2-oracle",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "vertical-slice.metal.tier2-nodes",
+            "backend": "metal"
+          }
+        ],
+        "E011": [
+          {
+            "ctest": "core.working-set",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "vertical-slice.metal.working-set",
+            "backend": "metal"
+          }
+        ],
+        "E014": [
+          {
+            "ctest": "capture.view",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "capture.view.cli",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E017": [
+          {
+            "ctest": "core.envelope-continuation",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "vertical-slice.metal.envelope-continuation",
+            "backend": "metal"
+          }
+        ]
+      },
+      "report_footer": "\n\nE004 uses E004-discovery-revisit.json; the B-era E004-access-certificate.json row is historical (ADR-025/035).\nVulkan samples are compile-review-only (ADR-024/035/041).\nBreak-even curves are unmeasured (sample insufficient); see docs/reports/phase-d-gate.md.\nHostAssisted boundary: docs/reports/host-assisted-boundary.md.\nNativeContractResearch v1: docs/reports/native-contract-research-v1.md.\n",
+      "summary_extra": {
+        "break_even_curves": "unmeasured",
+        "e004_historical_b_row": "experiments/definitions/E004-access-certificate.json"
+      },
+      "resolved_extra": {
+        "definition_files": {
+          "E004": "E004-discovery-revisit.json",
+          "E010": "E010-heterogeneous-node-lowering.json",
+          "E011": "E011-residency-working-set.json",
+          "E014": "E014-capture-replay.json",
+          "E017": "E017-envelope-quota-continuation.json"
+        },
+        "reports": [
+          "docs/reports/phase-d-gate.md",
+          "docs/reports/host-assisted-boundary.md",
+          "docs/reports/native-contract-research-v1.md"
+        ]
+      },
+      "non_executed": [
+        {
+          "backend": "vulkan",
+          "evidence": "compile-review-only",
+          "summary_key": "vulkan_status"
+        }
+      ],
+      "csv_fields": [
+        "experiment",
+        "backend",
+        "variant",
+        "status",
+        "return_code"
+      ],
+      "gate_experiments": [
+        "E004",
+        "E010",
+        "E011",
+        "E014",
+        "E017"
+      ],
+      "classification_field": "phase_d_classification"
+    },
+    "phase-e": {
+      "title": "Phase E Research Alpha",
+      "definition_files": {
+        "E001": "E001-lifecycle-epoch.json",
+        "E002": "E002-typed-pointer-graph.json",
+        "E003": "E003-task-publication.json",
+        "E004": "E004-discovery-revisit.json",
+        "E005": "E005-consume-input-peak-memory.json",
+        "E006": "E006-access-witness.json",
+        "E007": "E007-root-pointer-vs-bindless.json",
+        "E008": "E008-sample-facet.json",
+        "E009": "E009-gpu-generated-same-node-work.json",
+        "E010": "E010-heterogeneous-node-lowering.json",
+        "E011": "E011-residency-working-set.json",
+        "E012": "E012-effect-dag-sync-quality.json",
+        "E013": "E013-pipeline-classification.json",
+        "E014": "E014-capture-replay.json",
+        "E015": "E015-fault-poison.json",
+        "E016": "E016-representation-epoch-churn.json",
+        "E017": "E017-envelope-quota-continuation.json",
+        "E018": "E018-graph-epoch-publication.json"
+      },
+      "experiments": {
+        "E001": [
+          {
+            "ctest": "model.phase-a",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E002": [
+          {
+            "ctest": "vertical-slice.metal.pointer-graph",
+            "backend": "metal"
+          },
+          {
+            "ctest": "compiler.compute-package-golden",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E003": [
+          {
+            "ctest": "model.phase-a",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E004": [
+          {
+            "ctest": "core.discovery",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "vertical-slice.metal.discovery",
+            "backend": "metal"
+          }
+        ],
+        "E005": [
+          {
+            "ctest": "vertical-slice.metal.consume-input",
+            "backend": "metal"
+          }
+        ],
+        "E006": [
+          {
+            "ctest": "conformance.phase-a",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E007": [
+          {
+            "ctest": "vertical-slice.metal.indexed-binding",
+            "backend": "metal"
+          }
+        ],
+        "E008": [
+          {
+            "ctest": "vertical-slice.metal.sample-facet",
+            "backend": "metal"
+          }
+        ],
+        "E009": [
+          {
+            "ctest": "vertical-slice.metal.tier1-indirect",
+            "backend": "metal"
+          },
+          {
+            "ctest": "vertical-slice.metal.cull-compact",
+            "backend": "metal"
+          }
+        ],
+        "E010": [
+          {
+            "ctest": "unit.tier2-oracle",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "vertical-slice.metal.tier2-nodes",
+            "backend": "metal"
+          }
+        ],
+        "E011": [
+          {
+            "ctest": "core.working-set",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "vertical-slice.metal.working-set",
+            "backend": "metal"
+          }
+        ],
+        "E012": [
+          {
+            "ctest": "vertical-slice.metal.effect-dag",
+            "backend": "metal"
+          }
+        ],
+        "E013": [
+          {
+            "ctest": "vertical-slice.metal.pipeline-classification",
+            "backend": "metal"
+          }
+        ],
+        "E014": [
+          {
+            "ctest": "capture.view",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "capture.view.cli",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E015": [
+          {
+            "ctest": "conformance.phase-a",
+            "backend": "cpu-reference"
+          }
+        ],
+        "E016": [
+          {
+            "ctest": "vertical-slice.metal.representation-churn",
+            "backend": "metal"
+          }
+        ],
+        "E017": [
+          {
+            "ctest": "core.envelope-continuation",
+            "backend": "cpu-reference"
+          },
+          {
+            "ctest": "vertical-slice.metal.envelope-continuation",
+            "backend": "metal"
+          }
+        ],
+        "E018": [
+          {
+            "ctest": "core.unit",
+            "backend": "cpu-reference"
+          }
+        ]
+      },
+      "report_footer": "\n\nE004 uses E004-discovery-revisit.json; the B-era E004-access-certificate.json row is historical (ADR-025/035/042).\nVulkan samples are compile-review-only (ADR-024/042) and are not mixed into passed.\nThis runner aggregates existing ctests; it does not invent measurements.\nSee docs/reports/phase-e-gate.md.\n",
+      "summary_extra": {
+        "break_even_curves": "unmeasured",
+        "e004_historical_b_row": "experiments/definitions/E004-access-certificate.json",
+        "evidence_policy": "ADR-042"
+      },
+      "resolved_extra": {
+        "definition_files": {
+          "E001": "E001-lifecycle-epoch.json",
+          "E002": "E002-typed-pointer-graph.json",
+          "E003": "E003-task-publication.json",
+          "E004": "E004-discovery-revisit.json",
+          "E005": "E005-consume-input-peak-memory.json",
+          "E006": "E006-access-witness.json",
+          "E007": "E007-root-pointer-vs-bindless.json",
+          "E008": "E008-sample-facet.json",
+          "E009": "E009-gpu-generated-same-node-work.json",
+          "E010": "E010-heterogeneous-node-lowering.json",
+          "E011": "E011-residency-working-set.json",
+          "E012": "E012-effect-dag-sync-quality.json",
+          "E013": "E013-pipeline-classification.json",
+          "E014": "E014-capture-replay.json",
+          "E015": "E015-fault-poison.json",
+          "E016": "E016-representation-epoch-churn.json",
+          "E017": "E017-envelope-quota-continuation.json",
+          "E018": "E018-graph-epoch-publication.json"
+        },
+        "e004_historical_b_row": "experiments/definitions/E004-access-certificate.json",
+        "reports": [
+          "docs/reports/phase-e-gate.md",
+          "docs/reports/p0-risk-register.md",
+          "docs/reports/external-repro-runbook.md",
+          "docs/reports/architecture-research-alpha.md"
+        ]
+      },
+      "non_executed": [
+        {
+          "backend": "vulkan",
+          "evidence": "compile-review-only",
+          "summary_key": "vulkan_status"
+        }
+      ],
+      "csv_fields": [
+        "experiment",
+        "backend",
+        "variant",
+        "status",
+        "return_code"
+      ],
+      "gate_experiments": [
+        "E001",
+        "E002",
+        "E003",
+        "E004",
+        "E005",
+        "E006",
+        "E007",
+        "E008",
+        "E009",
+        "E010",
+        "E011",
+        "E012",
+        "E013",
+        "E014",
+        "E015",
+        "E016",
+        "E017",
+        "E018"
+      ]
+    }
+  }
+}

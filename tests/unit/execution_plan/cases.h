@@ -1,0 +1,22 @@
+#pragma once
+
+namespace vg::tests::execution_plan {
+void test_stage6_capability_preflight_rejects_without_weakening();
+void test_validation_profile_matrix_and_reset();
+void test_basic_execution_plan_validation();
+void test_effect_conflicts_are_deterministic_or_reject_reverse_cycle();
+void test_execution_plan_assembler_sound_counterexamples();
+void test_validated_effect_graph_and_full_noderef_packages_are_sealed();
+void test_certificate_and_access_witness_reject_partial_coverage();
+void test_bounded_pointer_graph_canonical_identity();
+void test_execution_plan_assembler_bounded_pointer_graph_access();
+void test_execution_plan_assembler_seals_access_planning();
+void test_representation_stage5_assembler_boundaries();
+void test_representation_semantic_plan_is_sealed();
+void test_consume_input_proof_rejections();
+void test_submission_lifetime_hold_is_transactional_and_repeatable();
+void test_submission_lifetime_hold_deduplicates_facets_and_backing();
+void test_representation_outputs_join_lifetime_after_physical_stage();
+void test_reference_multi_node_runtime_pointer_fault_preserves_prefix();
+void test_reference_submit_releases_holds_on_success_and_repeat();
+}

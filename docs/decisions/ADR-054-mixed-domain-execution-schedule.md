@@ -1,6 +1,6 @@
 # ADR-054: Mixed-domain TaskGraph Execution Schedule
 
-Status: Accepted (design frozen; implementation and conformance pending)
+Status: Accepted (design frozen; implementation delivered by backend; Linux platform gate pending)
 
 ## Context
 
@@ -19,8 +19,10 @@ per-Task effects over immutable Node snapshots, finite access/lifetime sets,
 per-Node `CompiledPlan` packages, and Node-aware Reference/Metal/Vulkan compute
 lowering. These repairs remove the architectural reason to treat execution domain
 as a whole-plan variant. They do not by themselves make mixed-domain execution an
-implemented capability: the current runtime rejection remains required until the
-schedule, backend lowering, and conformance gates in this ADR are delivered.
+implemented capability: at design freeze, the runtime rejection remained required
+until the schedule, backend lowering, and conformance gates in this ADR were
+delivered. Current per-backend evidence and remaining restrictions are recorded
+under Implementation status below; the decision itself is unchanged.
 
 The existing `task_order` is a deterministic topological serialization used for
 cross-backend comparison, capture, diagnostics, and publication. Treating it as a
@@ -195,9 +197,9 @@ shared by every execution domain.
 ## Consequences
 
 - ADR-047's and ADR-052's mixed compute+raster restrictions are reopened as an
-  implementation target, but they remain the current runtime behavior until the
-  validation gates below pass. This ADR must not be cited as evidence that a
-  checkout already supports mixed execution.
+  implementation target; each restriction remains until its validation gates
+  pass. The accepted design alone is not evidence of implementation. Current
+  canonical mixed support does not remove restricted-MSL or SceneRoot narrowing.
 - Core gains one richer immutable schedule fact rather than a second graph or
   backend-local scheduler.
 - Independent components and waves are parallelism permissions, not mandatory
@@ -212,8 +214,8 @@ shared by every execution domain.
 
 ## Evidence
 
-This ADR freezes a reviewed design; it does not claim implementation evidence.
-Existing foundations are:
+At design freeze this ADR recorded a reviewed design, not implementation evidence.
+The foundations at that time were:
 
 - `ExecutionPlanAssembler` already seals per-Task effects, the validated
   EffectGraph, and deterministic `task_order` from immutable per-Node snapshots;
@@ -244,6 +246,24 @@ Implementation is complete only when all of the following hold:
    every backend; optional compute-ring events and counts remain physically true.
 6. Static gates confirm no backend rebuilds order/effects/components from the raw
    graph and no mixed path projects to a first/global Node package.
+
+### Implementation status (2026-09-03)
+
+MD-1/2 seal the schedule and shared Stage 6/7 transition contract. MD-3 supplies
+the Reference mixed semantic baseline. MD-4 implements canonical Compute plus
+built-in Raster on real Metal with explicit conservative serialization; its
+[delivery record](../reports/md4-metal-mixed-domain-completion.md) preserves the
+exact physical counts, failure evidence, and narrowing. Its R→C atomic coverage
+is explicitly HostAssisted, not native render-to-compute fence evidence.
+
+MD-5 adapts Vulkan to the sealed schedule while keeping concrete Raster plans
+whole-plan Unsupported. MD-6 adds public C ABI mixed conformance with distinct
+CodeObjects/NodeRefs, observable C→R/R→C, and precise rejection/no-partial-execution
+checks. The [integration ledger](../reports/md5-md6-mixed-domain-integration.md)
+separates implementation, local verification, platform verification, and
+documentation. Linux Vulkan SDK/device validation remains pending; this is not
+whole-route closure. No ABI, Task ring schema, new submit primitive, or resource
+lifecycle is added. Restricted user-raster mixed and SceneRoot narrowing remain.
 
 ## Revisit trigger
 

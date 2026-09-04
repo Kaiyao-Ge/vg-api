@@ -1256,6 +1256,19 @@ compute+raster 拒绝没有改变。
 12. 用 schema 生成或验证单一 Task ring 编码；明确 compute-only ring 或带 discriminator 的多域 ring；
 13. Node-aware 路径稳定后，再以独立 ADR 和 conformance 解除 ADR-047/052 的 mixed compute+raster 限制，验证跨 Node effect、失败/poison 合并和 per-Node LoweringReport。
 
+**MD-4 进度记录（2026-09-03）：** ADR-054 下的 Metal canonical mixed-domain
+schedule lowering、独立审阅与真实设备回归见
+[MD-4 Metal mixed-domain 交付记录](md4-metal-mixed-domain-completion.md)。
+该交付保留保守串行、restricted user-raster mixed 等明确边界，不代表 Vulkan 或
+完整跨后端 mixed-domain 路线已经完成。
+
+**MD-5/6 进度台账（2026-09-03）：** Vulkan sealed schedule 适配与公共 C ABI mixed
+conformance 并行实施；四级状态、具体文件与可复现命令见
+[MD-5/6 集成台账](md5-md6-mixed-domain-integration.md)。保留 Vulkan concrete Raster
+整计划 Unsupported、Metal restricted user-raster mixed/SceneRoot narrowing，以及
+R→C atomic 的 HostAssisted 分类。Linux SDK/真机验证仍为未关闭门禁；不得以
+Reference/Metal 本地绿灯宣布 §9.2.13 全路线已完成。
+
 这组不引入顶层主意图 variant，不增加公共 handle/TaskGraph/submit 原语，也不改变既有 struct 布局。NodeRef namespace、builder descriptor 可空/弃用语义和 API 版本属于已存在 ABI 的语义修复，必须通过第 1 项 ADR 与兼容测试完成，不能伪装成纯机械重构。
 
 ### 9.3 第三组：按既有边界拆分实现
@@ -1270,6 +1283,17 @@ compute+raster 拒绝没有改变。
 - CMake schema/测试登记和 `vg_exp.py` phase runner 改为数据驱动。
 
 拆分验收看依赖方向、职责和测试影响面；行数只作提示。
+
+**G0 基线准备（2026-09-03）：** 已将 discovery/working-set/envelope 生产源码登记
+移出测试专属 CMake fragment，Tier2 实验归独立测试支撑库；Reference/真实 Metal 的
+ON/OFF 构建、原有测试映射与下一工作包边界见 [G0 构建基线](g0-build-baseline.md)。
+该记录不是 Core/backend 文件拆分完成声明，Linux SDK/真实 Vulkan 门禁仍 pending。
+
+**G6 构建/runner治理（2026-09-03）：** CMake已按显式source/schema/test登记拆分，
+Phase A—E使用数据清单与唯一执行循环，capture-view解除BUILD_TESTING依赖。
+原测试映射与生成物守恒，新增runner契约测试后Reference39/39、真实Metal73/73；
+缺测/skip/review-only不计执行通过。本人实施及复核记录见[G6 工具治理](g6-tooling-governance.md)。
+Linux SDK/真实Vulkan验证仍pending，本记录不宣布全部跨平台整改完成。
 
 ### 9.4 第四组：再进入 F8/F9/F10
 

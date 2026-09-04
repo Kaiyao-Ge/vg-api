@@ -129,6 +129,32 @@ bool same_task(const TaskRecord& a, const TaskRecord& b) {
          a.payload_size == b.payload_size && a.payload_or_offset == b.payload_or_offset;
 }
 
+bool make_raster_task(vg::hal::DeviceHal& device, vg::core::Arena& arena,
+                      TaskRecord* task, std::string* error) {
+  task->kind = vg::core::TaskKind::Raster;
+  auto acquire = [&](vg::core::FacetKind kind, uint32_t width, uint32_t height,
+                     vg::core::FacetRef* ref) {
+    auto& allocation = arena.allocate(width * height * 4);
+    vg::core::CanonicalView view;
+    view.allocation = allocation.id;
+    view.allocation_generation = allocation.generation;
+    view.format = vg::core::PixelFormat::RGBA8Unorm;
+    view.dimension = vg::core::ViewDimension::Texture2D;
+    view.width = width;
+    view.height = height;
+    return device.facet_pool().acquire(arena, view, kind, ref, error);
+  };
+  return acquire(vg::core::FacetKind::Sample, 2, 2, &task->raster_facets.source) &&
+         acquire(vg::core::FacetKind::Attachment, 2, 2, &task->raster_facets.target) &&
+         acquire(vg::core::FacetKind::Address, 15, 1, &task->vertex_buffer_ref);
+}
+
+std::string raster_rejection(const TaskRecord& task) {
+  return "Vulkan Unsupported: NodeRef{" + std::to_string(task.node_index) + "," +
+         std::to_string(task.node_generation) +
+         "} domain=Raster; complete plan rejected before Commit";
+}
+
 // Per-Node Stage 6 and per-Task Stage 7 conformance. This stays in the existing
 // task-tier0 executable so Linux hardware runs it automatically without a new
 // CMake test lane.
@@ -354,6 +380,228 @@ bool run_task_tier0(const std::string& root) {
   auto bindings = same_compiled;
   ++bindings.per_node_packages.front().package->bindings.front().binding;
   if (!expect_tamper_rejected(std::move(bindings), "bindings")) return false;
+  auto missing_transition = same_compiled;
+  missing_transition.transition_operations.clear();
+  if (!expect_tamper_rejected(std::move(missing_transition), "missing transition")) return false;
+  auto fake_physical = same_compiled;
+  for (auto& transition : fake_physical.transition_operations) {
+    transition.barrier_count = 0;
+    transition.serialized_fallback = false;
+  }
+  fake_physical.report.transition_barrier_count = 0;
+  fake_physical.report.transition_serialized_fallback_count = 0;
+  if (!expect_tamper_rejected(std::move(fake_physical), "omitted physical barrier")) return false;
+  auto wave_tamper = same_compiled;
+  wave_tamper.plan.execution_schedule.components[0].waves[0].tasks.clear();
+  if (!expect_tamper_rejected(std::move(wave_tamper), "schedule wave")) return false;
+
+  // Ready frontier {0,1} -> {2} -> {3}, plus independent component {4}.
+  // Five Nodes, three waves in one component, two transitions regardless of
+  // how many Task edges the frontiers contain. The adapter consumes waves,
+  // not a producer-by-producer reconstruction of the EffectGraph.
+  vg::core::Arena wave_arena;
+  std::vector<vg::ir::Module> wave_modules;
+  std::vector<TaskRecord> wave_tasks;
+  std::vector<uint64_t> wave_allocations;
+  for (uint32_t i = 0; i < 5; ++i) {
+    auto& allocation = wave_arena.allocate(64);
+    wave_allocations.push_back(allocation.id);
+    wave_modules.push_back(make_store_module(allocation, i + 2));
+    wave_tasks.push_back(vg::test_support::compute_task(allocation.id, allocation.generation));
+  }
+  vg::test_support::MultiNodePlanFixture wave_fixture;
+  vg::core::ExecutionPlan wave_plan;
+  vg::hal::CompiledPlan wave_compiled;
+  vg::hal::Submission wave_submission;
+  if (!vg::test_support::assemble_multi_node_plan(wave_arena, wave_modules, wave_tasks,
+          {{0, 2}, {1, 2}, {2, 3}}, &wave_fixture, &wave_plan, &error) ||
+      wave_plan.execution_schedule.components.size() != 2 ||
+      wave_plan.execution_schedule.components[0].waves.size() != 3 ||
+      !vulkan_device->compile(wave_plan, &wave_compiled, &error) ||
+      wave_compiled.report.transition_barrier_count != 2 ||
+      wave_compiled.report.transition_serialized_fallback_count != 2 ||
+      !vulkan_device->submit(wave_compiled, wave_arena, &wave_submission, &error) ||
+      !wave_submission.result.ok || wave_submission.report.transition_barrier_count != 2 ||
+      wave_submission.report.transition_serialized_fallback_count != 2 ||
+      wave_submission.report.barrier_count != 3 ||
+      event_count(wave_submission.report, "vulkan_task_dispatch") != 5 ||
+      wave_submission.published_tasks.size() != 5) {
+    std::cerr << "task-tier0: sealed component/wave execution failed: " << error << "\n";
+    return false;
+  }
+  for (uint32_t i = 0; i < 5; ++i) {
+    const auto* output = wave_arena.lookup(vg::core::PointerRef{wave_allocations[i], 1});
+    if (output == nullptr || output->bytes[0] != i + 2 ||
+        !same_task(wave_submission.published_tasks[i],
+                   wave_plan.task_graph.tasks()[wave_plan.execution_schedule.task_order[i]])) return false;
+  }
+
+  // Envelope filters observation/publication only, using the shared sealed
+  // canonical suffix machinery, not ring slot order or a backend quota copy.
+  vg::core::Arena quota_arena;
+  auto& quota_output = quota_arena.allocate(64);
+  const auto quota_module = make_store_module(quota_output, 7);
+  const auto quota_task = probe_task(quota_module);
+  std::vector<TaskRecord> quota_tasks(3, quota_task);
+  for (uint32_t i = 0; i < quota_tasks.size(); ++i) quota_tasks[i].flags = i;
+  vg::test_support::AssemblyOptions quota_options;
+  quota_options.task_quota = 1;
+  quota_options.timeline_signal = 1;
+  vg::core::ExecutionPlan quota_plan;
+  vg::hal::CompiledPlan quota_compiled;
+  vg::hal::Submission quota_submission;
+  if (!assemble_compute_plan(quota_arena, quota_module, quota_tasks,
+          &quota_plan, &error, quota_options) ||
+      !vulkan_device->compile(quota_plan, &quota_compiled, &error) ||
+      !vulkan_device->submit(quota_compiled, quota_arena, &quota_submission, &error) ||
+      !quota_submission.result.ok || quota_submission.published_tasks.size() != 1 ||
+      !quota_submission.envelope_overflow.has_value() ||
+      quota_submission.envelope_overflow->overflow_task_count != 2 ||
+      quota_submission.timeline_value != 1 || load_u64(quota_output) != 0x07070707ULL ||
+      event_count(quota_submission.report, "vulkan_task_dispatch") != 3 ||
+      !same_task(quota_submission.published_tasks[0], quota_plan.task_graph.tasks()[0])) {
+    std::cerr << "task-tier0: Envelope canonical publication split failed: " << error << "\n";
+    return false;
+  }
+  const auto valid_overflow = *quota_submission.envelope_overflow;
+
+  // Obtain a real device continuation from an alternate, reverse-order graph.
+  // Its legitimate suffix [1,0] is not the canonical suffix [1,2] of this graph.
+  // Neither plan is manually modified or stamped after assembly.
+  const std::vector<std::pair<uint32_t, uint32_t>> reverse_edges{{2, 1}, {1, 0}};
+  auto alternate_options = quota_options;
+  alternate_options.timeline_signal = 0;
+  alternate_options.dependencies = &reverse_edges;
+  vg::core::ExecutionPlan alternate_plan;
+  vg::hal::CompiledPlan alternate_compiled;
+  vg::hal::Submission alternate_submission;
+  if (!assemble_compute_plan(quota_arena, quota_module, quota_tasks, &alternate_plan,
+                             &error, alternate_options) ||
+      !vulkan_device->compile(alternate_plan, &alternate_compiled, &error) ||
+      !vulkan_device->submit(alternate_compiled, quota_arena, &alternate_submission, &error) ||
+      !alternate_submission.result.ok || !alternate_submission.envelope_overflow.has_value()) {
+    std::cerr << "task-tier0: alternate continuation setup failed: " << error << "\n";
+    return false;
+  }
+
+  // Every refused continuation carries both an observable store and a valid
+  // representation transform on a separate allocation. Refusal must precede
+  // bytes, epoch/facet lifecycle, holds, and Timeline effects, not merely precede
+  // the physical publication ring. The accepted resume below signals the same
+  // point to prove the refused submits never advanced the device Timeline.
+  auto& representation_source = quota_arena.allocate(64);
+  vg::core::RepresentationRequest representation;
+  representation.view.allocation = representation_source.id;
+  representation.view.allocation_generation = representation_source.generation;
+  representation.view.format = vg::core::PixelFormat::RGBA8Unorm;
+  representation.view.dimension = vg::core::ViewDimension::Texture2D;
+  representation.view.width = representation.view.height = 2;
+  const std::vector<vg::core::RepresentationRequest> representations{representation};
+  const auto reject_before_effects = [&](const vg::core::EnvelopeOverflow& pending,
+                                        const char* expected, uint64_t signal) {
+    auto options = vg::test_support::AssemblyOptions{};
+    options.pending_overflow = &pending;
+    options.timeline_signal = signal;
+    options.representation_requests = &representations;
+    options.facet_pool = &vulkan_device->facet_pool();
+    vg::core::ExecutionPlan rejected_plan;
+    vg::hal::CompiledPlan rejected_compiled;
+    vg::hal::Submission rejected_submission;
+    std::fill(quota_output.bytes.begin(), quota_output.bytes.end(), 0x55);
+    const auto before_output = quota_output.bytes;
+    const auto before_representation = representation_source.bytes;
+    const auto before_epoch = representation_source.representation_epoch;
+    std::vector<uint32_t> before_generations;
+    vulkan_device->facet_pool().snapshot_generations(&before_generations);
+    std::string rejection_error;
+    if (!assemble_compute_plan(quota_arena, quota_module, quota_tasks, &rejected_plan,
+                               &rejection_error, options) ||
+        !vulkan_device->compile(rejected_plan, &rejected_compiled, &rejection_error)) {
+      std::cerr << "task-tier0: refusal fixture must reach submit: " << rejection_error << "\n";
+      return false;
+    }
+    const bool accepted = vulkan_device->submit(rejected_compiled, quota_arena,
+                                               &rejected_submission, &rejection_error);
+    std::vector<uint32_t> after_generations;
+    vulkan_device->facet_pool().snapshot_generations(&after_generations);
+    if (accepted || rejection_error != expected || quota_output.bytes != before_output ||
+        representation_source.bytes != before_representation ||
+        representation_source.representation_epoch != before_epoch ||
+        before_generations != after_generations ||
+        quota_output.in_flight != 0 || representation_source.in_flight != 0 ||
+        !rejected_submission.published_tasks.empty() ||
+        !rejected_submission.representation_facets.empty() ||
+        rejected_submission.result.poison == vg::core::PoisonState::PartiallyProduced ||
+        rejected_submission.report.barrier_count != 0 ||
+        rejected_submission.report.command_buffer_count != 0 ||
+        rejected_submission.report.encoder_count != 0 ||
+        rejected_submission.report.queue_wait_count != 0 ||
+        rejected_submission.report.transition_barrier_count != 0 ||
+        rejected_submission.report.transition_serialized_fallback_count != 0 ||
+        event_count(rejected_submission.report, "vulkan_task_dispatch") != 0 ||
+        event_count(rejected_submission.report, "task_publication_dispatch") != 0 ||
+        event_count(rejected_submission.report, "timeline") != 0) {
+      std::cerr << "task-tier0: continuation refusal had side effects or wrong result: "
+                << rejection_error << "\n";
+      return false;
+    }
+    return true;
+  };
+  auto rejected = valid_overflow;
+  rejected.disposition = vg::core::EnvelopeOverflowDisposition::Rejected;
+  rejected.continuation_token = 0;
+  auto unknown = valid_overflow;
+  unknown.continuation_token += 100;
+  if (!reject_before_effects(rejected, "envelope leftover was rejected", 2) ||
+      !reject_before_effects(unknown, "envelope continuation token does not match", 2) ||
+      !reject_before_effects(*alternate_submission.envelope_overflow,
+          "envelope continuation leftover is not the canonical schedule suffix", 2) ||
+      !vulkan_device->envelope_continuations().contains(valid_overflow.continuation_token) ||
+      !vulkan_device->envelope_continuations().contains(
+          alternate_submission.envelope_overflow->continuation_token)) return false;
+
+  // Refusal fixtures leave the sentinel intact; the store updates only bytes
+  // [0,4). Compare the whole allocation so untouched bytes must stay 0x55.
+  std::vector<uint8_t> expected_recovered_output(quota_output.bytes.size(), 0x55);
+  std::fill_n(expected_recovered_output.begin(), 4, 0x07);
+  vg::test_support::AssemblyOptions resume_options;
+  resume_options.pending_overflow = &valid_overflow;
+  resume_options.timeline_signal = 2;
+  vg::core::ExecutionPlan resume_plan;
+  vg::hal::CompiledPlan resume_compiled;
+  vg::hal::Submission resume_submission;
+  if (!assemble_compute_plan(quota_arena, quota_module, quota_tasks,
+          &resume_plan, &error, resume_options) ||
+      !vulkan_device->compile(resume_plan, &resume_compiled, &error) ||
+      !vulkan_device->submit(resume_compiled, quota_arena, &resume_submission, &error) ||
+      !resume_submission.result.ok || resume_submission.published_tasks.size() != 2 ||
+      resume_submission.envelope_overflow.has_value() || resume_submission.timeline_value != 2 ||
+      quota_output.bytes != expected_recovered_output ||
+      event_count(resume_submission.report, "vulkan_task_dispatch") != 3 ||
+      !same_task(resume_submission.published_tasks[0], resume_plan.task_graph.tasks()[1]) ||
+      !same_task(resume_submission.published_tasks[1], resume_plan.task_graph.tasks()[2]) ||
+      vulkan_device->envelope_continuations().contains(valid_overflow.continuation_token)) {
+    std::cerr << "task-tier0: Envelope canonical suffix resume failed: " << error << "\n";
+    return false;
+  }
+  if (!reject_before_effects(valid_overflow, "envelope continuation token does not match", 3))
+    return false;
+  vg::test_support::AssemblyOptions after_rejection_options;
+  after_rejection_options.timeline_signal = 3;
+  vg::core::ExecutionPlan after_rejection_plan;
+  vg::hal::CompiledPlan after_rejection_compiled;
+  vg::hal::Submission after_rejection_submission;
+  if (!assemble_compute_plan(quota_arena, quota_module, quota_tasks, &after_rejection_plan,
+                             &error, after_rejection_options) ||
+      !vulkan_device->compile(after_rejection_plan, &after_rejection_compiled, &error) ||
+      !vulkan_device->submit(after_rejection_compiled, quota_arena,
+                             &after_rejection_submission, &error) ||
+      !after_rejection_submission.result.ok || after_rejection_submission.timeline_value != 3 ||
+      after_rejection_submission.published_tasks.size() != 3 ||
+      quota_output.bytes != expected_recovered_output || quota_output.in_flight != 0) {
+    std::cerr << "task-tier0: consumed-token refusal changed Timeline or lifetime: " << error << "\n";
+    return false;
+  }
 
   std::cout << "task-tier0: ok\n";
   return true;
@@ -445,7 +693,11 @@ bool run_timeline(const std::string& root) {
     std::cerr << "timeline: submit (stuck) call itself failed: " << error << "\n";
     return false;
   }
-  if (stuck_submission.result.ok || stuck_submission.result.fault.code != "TIMELINE_WAIT_UNSATISFIED") {
+  if (stuck_submission.result.ok || stuck_submission.result.fault.code != "TIMELINE_WAIT_UNSATISFIED" ||
+      stuck_submission.report.transition_barrier_count != 0 ||
+      stuck_submission.report.command_buffer_count != 0 ||
+      event_count(stuck_submission.report, "vulkan_task_dispatch") != 0 ||
+      event_count(stuck_submission.report, "timeline") != 0 || !stuck_submission.published_tasks.empty()) {
     std::cerr << "timeline: unsatisfied wait did not fault as expected\n";
     return false;
   }
@@ -479,16 +731,23 @@ bool run_raster_rejected(const std::string& root) {
   vg::core::Arena arena;
   const auto module = make_probe_module(arena);
 
-  // An otherwise-default TaskRecord is enough to reach the kind==Raster
-  // rejection: TaskGraph::validate_execution() (run inside plan.validate(),
-  // ahead of this check) only requires the graph to be sealed/published with
-  // non-zero node/root generation, both of which default to 1, and never
-  // inspects FacetRef contents.
+  // Real Stage-5 facets/effects and distinct NodeRefs ensure this reaches the
+  // backend guard, not a malformed-plan or same-Node domain rejection.
   TaskRecord raster_task{};
-  raster_task.kind = vg::core::TaskKind::Raster;
   vg::core::ExecutionPlan plan;
   std::string error;
-  if (!assemble_compute_plan(arena, module, {raster_task}, &plan, &error)) {
+  if (!make_raster_task(*vulkan_device, arena, &raster_task, &error)) return false;
+  vg::test_support::AssemblyOptions options;
+  options.facet_pool = &vulkan_device->facet_pool();
+  vg::test_support::MultiNodePlanFixture fixture;
+  auto& compute_output = arena.allocate(64);
+  TaskRecord compute_task{};
+  compute_task.root_allocation = compute_output.id;
+  compute_task.root_generation = compute_output.generation;
+  const auto original_bytes = compute_output.bytes;
+  if (!vg::test_support::assemble_multi_node_plan(arena,
+          {make_store_module(compute_output, 9), module}, {compute_task, raster_task}, {},
+          &fixture, &plan, &error, options)) {
     std::cerr << "raster-rejected: plan assembly failed: " << error << "\n";
     return false;
   }
@@ -497,7 +756,9 @@ bool run_raster_rejected(const std::string& root) {
     std::cerr << "raster-rejected: compile() unexpectedly accepted a Raster-kind task\n";
     return false;
   }
-  if (error != "raster tasks not supported on Vulkan backend") {
+  if (error != raster_rejection(plan.task_graph.tasks()[1]) ||
+      compiled.report.diagnostic != error || !compiled.per_node_packages.empty() ||
+      event_count(compiled.report, "vulkan_pipeline") != 0 || compute_output.bytes != original_bytes) {
     std::cerr << "raster-rejected: unexpected error message: " << error << "\n";
     return false;
   }
@@ -507,13 +768,21 @@ bool run_raster_rejected(const std::string& root) {
   }
   bool found_unsupported_event = false;
   for (const auto& event : compiled.report.events) {
-    if (event.operation == "raster_task" && event.classification == vg::hal::LoweringClass::Unsupported) {
+    if (event.operation == "raster_task" && event.classification == vg::hal::LoweringClass::Unsupported &&
+        event.reason == raster_rejection(plan.task_graph.tasks()[1])) {
       found_unsupported_event = true;
       break;
     }
   }
   if (!found_unsupported_event) {
     std::cerr << "raster-rejected: missing Unsupported raster_task LoweringEvent\n";
+    return false;
+  }
+  vg::hal::Submission rejected;
+  if (vulkan_device->submit(compiled, arena, &rejected, &error) ||
+      !rejected.published_tasks.empty() || rejected.report.command_buffer_count != 0 ||
+      compute_output.bytes != original_bytes) {
+    std::cerr << "raster-rejected: unsupported mixed plan reached Commit\n";
     return false;
   }
   std::cout << "raster-rejected: ok\n";
@@ -523,9 +792,8 @@ bool run_raster_rejected(const std::string& root) {
 // F3 (ADR-043 Decision #4): the restricted-import raster contract is placed
 // in a real CodeObject/Node by assemble_single_user_raster_plan, producing
 // an assembled plan whose resolved node carries the shader contract. Vulkan
-// intentionally projects that transitional raster shape to its explicit
-// Unsupported path before task-ring packing; it must retain the same named
-// raster_task diagnostic rather than reinterpret it as compute.
+// rejects the actual Raster Node before task-ring packing, naming its complete
+// NodeRef and domain rather than reinterpreting it as compute.
 bool run_raster_msl_rejected(const std::string& root) {
   (void)root;
   std::string device_error;
@@ -535,8 +803,7 @@ bool run_raster_msl_rejected(const std::string& root) {
     return false;
   }
 
-  // An otherwise-default TaskRecord is enough to reach the kind==Raster
-  // rejection, same as raster-rejected above.
+  // Raster facets must be valid before testing a backend capability rejection.
   TaskRecord raster_task{};
   raster_task.kind = vg::core::TaskKind::Raster;
   vg::core::Arena arena;
@@ -549,8 +816,11 @@ bool run_raster_msl_rejected(const std::string& root) {
   vg::test_support::AssembledPlanFixture fixture;
   vg::core::ExecutionPlan plan;
   std::string error;
+  if (!make_raster_task(*vulkan_device, arena, &raster_task, &error)) return false;
+  vg::test_support::AssemblyOptions options;
+  options.facet_pool = &vulkan_device->facet_pool();
   if (!vg::test_support::assemble_single_user_raster_plan(
-          arena, shader, {raster_task}, &fixture, &plan, &error)) {
+          arena, shader, {raster_task}, &fixture, &plan, &error, options)) {
     std::cerr << "raster-msl-rejected: plan assembly failed: " << error << "\n";
     return false;
   }
@@ -559,7 +829,7 @@ bool run_raster_msl_rejected(const std::string& root) {
     std::cerr << "raster-msl-rejected: compile() unexpectedly accepted a user_raster_shader Raster-kind task\n";
     return false;
   }
-  if (error != "raster tasks not supported on Vulkan backend") {
+  if (error != raster_rejection(plan.task_graph.tasks()[0])) {
     std::cerr << "raster-msl-rejected: unexpected error message: " << error << "\n";
     return false;
   }

@@ -11,10 +11,45 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
+// Each CLI invocation owns its directory, even when test processes share TMPDIR.
+// create_directory claims it atomically; cleanup never targets the shared root.
+class CaptureTempDirectory {
+ public:
+  CaptureTempDirectory() {
+    const auto root = std::filesystem::temp_directory_path();
+    std::random_device random;
+    for (unsigned attempt = 0; attempt < 128; ++attempt) {
+      auto candidate = root / ("vg-e014-capture-view-" + std::to_string(random()) + "-" +
+                               std::to_string(random()) + "-" + std::to_string(random()) + "-" +
+                               std::to_string(random()));
+      std::error_code error;
+      if (std::filesystem::create_directory(candidate, error)) {
+        path_ = std::move(candidate);
+        return;
+      }
+      if (error && error != std::errc::file_exists)
+        throw std::filesystem::filesystem_error("cannot create capture test directory", candidate, error);
+    }
+    throw std::runtime_error("cannot claim a unique capture test directory");
+  }
+  ~CaptureTempDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+  CaptureTempDirectory(const CaptureTempDirectory&) = delete;
+  CaptureTempDirectory& operator=(const CaptureTempDirectory&) = delete;
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
+
 vg::core::ConsumeProof discharged_proof() { return {true, true, true, true}; }
 
 bool has_gpu_address_pattern(const std::string& text) {
@@ -316,8 +351,9 @@ int main(int argc, char** argv) {
 
 #if defined(VG_CAPTURE_VIEW)
   {
-    const auto fixture = std::filesystem::temp_directory_path() / "vg-e014-capture-view.json";
-    const auto report_path = std::filesystem::temp_directory_path() / "vg-e014-capture-view.md";
+    const CaptureTempDirectory temporary;
+    const auto fixture = temporary.path() / "vg-e014-capture-view.json";
+    const auto report_path = temporary.path() / "vg-e014-capture-view.md";
     write_text(fixture, first);
     const std::string command = std::string("\"") + VG_CAPTURE_VIEW + "\" --format markdown --output \"" +
                                 report_path.string() + "\" \"" + fixture.string() + "\"";
@@ -328,8 +364,6 @@ int main(int argc, char** argv) {
     assert(cli.find("generation") != std::string::npos);
     assert(cli.find("representation_epoch") != std::string::npos);
     assert(!has_gpu_address_pattern(cli));
-    std::filesystem::remove(fixture);
-    std::filesystem::remove(report_path);
   }
 #endif
   return 0;

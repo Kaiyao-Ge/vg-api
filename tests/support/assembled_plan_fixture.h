@@ -121,7 +121,8 @@ inline bool assemble_multi_node_plan(core::Arena& arena, std::vector<ir::Module>
                                      std::vector<core::TaskRecord> tasks,
                                      const std::vector<std::pair<uint32_t, uint32_t>>& dependencies,
                                      MultiNodePlanFixture* fixture, core::ExecutionPlan* out,
-                                     std::string* error = nullptr) {
+                                     std::string* error = nullptr,
+                                     const AssemblyOptions& options = {}) {
   if (fixture == nullptr || out == nullptr || modules.empty() || modules.size() != tasks.size()) {
     if (error) *error = "multi-Node fixture requires one module per task, fixture, and output";
     return false;
@@ -157,8 +158,23 @@ inline bool assemble_multi_node_plan(core::Arena& arena, std::vector<ir::Module>
   if (!builder.seal(&fixture->graph, error) || !fixture->graph.publish()) return false;
   fixture->envelope = {};
   fixture->envelope.allowed_nodes = fixture->node_refs;
+  fixture->envelope.timeline_wait = options.timeline_wait;
+  fixture->envelope.timeline_signal = options.timeline_signal;
+  fixture->envelope.certificate_touched = options.certificate_touched;
+  if (options.certificate_mode.has_value()) {
+    fixture->envelope.has_certificate_mode = true;
+    fixture->envelope.certificate_mode = *options.certificate_mode;
+  }
+  if (options.task_quota.has_value()) {
+    fixture->envelope.has_task_quota = true;
+    fixture->envelope.task_quota = *options.task_quota;
+  }
   core::ExecutionPlanAssemblerInputs inputs{&fixture->graph, &fixture->nodes, &fixture->envelope,
-                                             &arena, nullptr, nullptr, nullptr, 0};
+                                             &arena, options.certificate, options.access_certificate,
+                                             options.discovery_witness, options.graph_epoch};
+  inputs.facet_pool = options.facet_pool;
+  inputs.representation_requests = options.representation_requests;
+  inputs.pending_overflow = options.pending_overflow;
   return core::ExecutionPlanAssembler::assemble(inputs, out, error);
 }
 

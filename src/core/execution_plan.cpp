@@ -618,10 +618,6 @@ bool derive_capability_requirements(ExecutionPlan* plan, std::string* error) {
         return false;
     }
   }
-  if (has_compute && has_raster) {
-    if (error) *error = "compute+raster mixed-domain TaskGraphs remain Unsupported";
-    return false;
-  }
   for (const auto& node : plan->resolved_nodes) {
     if (node.user_raster_shader.has_value()) add_requirement(&requirements, CapabilityRequirement::UserShaderImport);
     if (!node.module.has_value() && !node.user_raster_shader.has_value()) {

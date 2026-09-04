@@ -1,7 +1,8 @@
 #ifndef VG_CORE_SCENE_ROOT_H_
 #define VG_CORE_SCENE_ROOT_H_
 
-#include "core/core.h"
+#include "core/arena.h"
+#include "core/task_graph.h"
 
 #include <array>
 #include <string>

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <numeric>
 #include <utility>
 
 namespace vg::hal {
@@ -47,6 +48,17 @@ bool facet_use_less(const core::FacetLifetimeUse& left, const core::FacetLifetim
 
 bool same_facet_ref(core::FacetRef left, core::FacetRef right) {
   return left.index == right.index && left.generation == right.generation;
+}
+
+bool same_node_ref(core::NodeTable::Ref left, core::NodeTable::Ref right) {
+  return left.index == right.index && left.generation == right.generation;
+}
+
+bool canonical_coverage(const std::vector<uint32_t>& coverage, size_t count) {
+  if (coverage.size() != count) return false;
+  for (size_t index = 0; index < count; ++index)
+    if (coverage[index] != index) return false;
+  return true;
 }
 
 void sort_unique_allocations(std::vector<core::PointerRef>* refs) {
@@ -123,6 +135,44 @@ bool preflight_stage6(const core::ExecutionPlan& plan, const CapabilitySnapshot&
                             std::string("required HAL capability is unsupported: ") +
                                 core::capability_requirement_name(requirement), error);
   }
+  // Keep capability failures diagnostically prior to admission, but never
+  // allow a fully-capable adapter to turn a caller-stamped or forged plan
+  // into a Stage-6 artifact. Production plans, including any hypothetical
+  // empty shape, require the canonical assembler's immutable semantic seal.
+  std::string plan_error;
+  if (!plan.validate(&plan_error))
+    return preflight_fail(plan, capabilities, compiled,
+                          "Stage6 requires a valid immutable core plan: " + plan_error,
+                          error);
+
+  // Seed only semantic coverage and unique ownership. No barrier, fence,
+  // encoder, host wait, or fallback is inferred here: those are physical
+  // backend facts and remain zero until the responsible backend records them.
+  compiled->abi_version = kDeviceHalAbiVersion;
+  compiled->plan = plan;
+  compiled->transition_operations.clear();
+  compiled->transition_operations.reserve(plan.execution_schedule.transitions.size());
+  for (uint32_t index = 0; index < plan.execution_schedule.transitions.size(); ++index) {
+    const auto& semantic = plan.execution_schedule.transitions[index];
+    CompiledPlan::PhysicalWaveTransition physical;
+    physical.semantic_transition = index;
+    physical.component = semantic.component;
+    physical.before_wave = semantic.before_wave;
+    physical.after_wave = semantic.after_wave;
+    physical.covers_execution_completion = semantic.requires_execution_completion;
+    physical.covered_region_visibility.resize(semantic.region_visibility.size());
+    std::iota(physical.covered_region_visibility.begin(),
+              physical.covered_region_visibility.end(), 0u);
+    physical.covered_facet_requirements.resize(semantic.facet_requirements.size());
+    std::iota(physical.covered_facet_requirements.begin(),
+              physical.covered_facet_requirements.end(), 0u);
+    physical.representation_operations = semantic.representation_operations;
+    compiled->transition_operations.push_back(std::move(physical));
+  }
+  compiled->representation_operation_execution_order.resize(
+      plan.representation_plan.size());
+  std::iota(compiled->representation_operation_execution_order.begin(),
+            compiled->representation_operation_execution_order.end(), 0u);
   return true;
 }
 
@@ -136,6 +186,132 @@ bool validate_stage7_compiled_plan(const CompiledPlan& compiled,
   if (compiled.report.backend != expected_backend) {
     if (error) *error = "compiled plan backend does not match adapter";
     return false;
+  }
+  if (compiled.report.abi_version != kDeviceHalAbiVersion) {
+    if (error) *error = "compiled plan report ABI version is unsupported";
+    return false;
+  }
+  std::string plan_error;
+  if (!compiled.plan.validate(&plan_error)) {
+    if (error) *error = "compiled plan contains an invalid core seal: " + plan_error;
+    return false;
+  }
+
+  if (compiled.per_node_packages.size() != compiled.plan.resolved_nodes.size()) {
+    if (error) *error = "compiled plan does not contain exactly one package per resolved NodeRef";
+    return false;
+  }
+  for (const auto& node : compiled.plan.resolved_nodes) {
+    const auto matches = std::count_if(
+        compiled.per_node_packages.begin(), compiled.per_node_packages.end(),
+        [&](const auto& package) { return same_node_ref(package.ref, node.ref); });
+    if (matches != 1) {
+      if (error) *error = "compiled plan contains a duplicate or missing NodeRef package";
+      return false;
+    }
+    const auto package = std::ranges::find_if(
+        compiled.per_node_packages,
+        [&](const auto& candidate) { return same_node_ref(candidate.ref, node.ref); });
+    const bool raster = node.execution_domain == core::TaskKind::Raster;
+    if ((raster &&
+         (package->kind != CompiledPlan::NodePackageKind::Raster ||
+          package->package.has_value())) ||
+        (!raster &&
+         (package->kind != CompiledPlan::NodePackageKind::CanonicalCompute ||
+          !package->package.has_value()))) {
+      if (error) *error = "compiled NodeRef package kind disagrees with the sealed Node domain";
+      return false;
+    }
+    if (!raster &&
+        (!node.module.has_value() ||
+         package->package->canonical_ir_hash != node.module->hash ||
+         package->package->root_schema != node.module->root_schema)) {
+      if (error) *error =
+          "compiled per-Node package disagrees with the resolved immutable module";
+      return false;
+    }
+  }
+
+  const auto& semantic_transitions = compiled.plan.execution_schedule.transitions;
+  if (compiled.transition_operations.size() != semantic_transitions.size()) {
+    if (error) *error = "compiled transition operations do not cover the sealed execution schedule";
+    return false;
+  }
+  uint64_t transition_barriers = 0;
+  uint64_t transition_fences = 0;
+  uint64_t transition_encoder_boundaries = 0;
+  uint64_t transition_host_waits = 0;
+  uint64_t serialized_fallbacks = 0;
+  for (uint32_t index = 0; index < semantic_transitions.size(); ++index) {
+    const auto& semantic = semantic_transitions[index];
+    const auto& physical = compiled.transition_operations[index];
+    if (physical.semantic_transition != index ||
+        physical.component != semantic.component ||
+        physical.before_wave != semantic.before_wave ||
+        physical.after_wave != semantic.after_wave) {
+      if (error) *error = "compiled transition identity disagrees with the sealed component/wave schedule";
+      return false;
+    }
+    if (physical.covers_execution_completion !=
+            semantic.requires_execution_completion ||
+        !canonical_coverage(physical.covered_region_visibility,
+                            semantic.region_visibility.size()) ||
+        !canonical_coverage(physical.covered_facet_requirements,
+                            semantic.facet_requirements.size()) ||
+        physical.representation_operations != semantic.representation_operations) {
+      if (error) *error = "compiled transition does not cover every sealed semantic prerequisite exactly once";
+      return false;
+    }
+    for (uint32_t operation : physical.representation_operations) {
+      if (operation >= compiled.plan.representation_plan.size()) {
+        if (error) *error = "compiled transition references an out-of-range representation operation";
+        return false;
+      }
+    }
+    if (physical.state == CompiledPlan::TransitionLoweringState::Unsupported) {
+      if (error) *error = "compiled transition lowering is unsupported";
+      return false;
+    }
+    if (physical.state ==
+            CompiledPlan::TransitionLoweringState::BackendExecutionRequired &&
+        (physical.barrier_count != 0 || physical.fence_count != 0 ||
+         physical.encoder_boundary_count != 0 || physical.host_wait_count != 0 ||
+         physical.serialized_fallback)) {
+      if (error) *error = "unfinalized transition lowering claims physical operations";
+      return false;
+    }
+    transition_barriers += physical.barrier_count;
+    transition_fences += physical.fence_count;
+    transition_encoder_boundaries += physical.encoder_boundary_count;
+    transition_host_waits += physical.host_wait_count;
+    serialized_fallbacks += physical.serialized_fallback ? 1u : 0u;
+  }
+  if (compiled.report.transition_barrier_count != transition_barriers ||
+      compiled.report.transition_fence_count != transition_fences ||
+      compiled.report.transition_encoder_boundary_count !=
+          transition_encoder_boundaries ||
+      compiled.report.transition_host_wait_count != transition_host_waits ||
+      compiled.report.transition_serialized_fallback_count !=
+          serialized_fallbacks) {
+    if (error) *error = "transition lowering evidence disagrees with LoweringReport";
+    return false;
+  }
+
+  const size_t representation_count = compiled.plan.representation_plan.size();
+  if (compiled.representation_operations.size() != representation_count ||
+      !canonical_coverage(compiled.representation_operation_execution_order,
+                          representation_count)) {
+    if (error) *error = "compiled representation operations lack unique canonical execution ownership";
+    return false;
+  }
+  for (size_t index = 0; index < representation_count; ++index) {
+    const auto& operation = compiled.representation_operations[index];
+    if (operation.semantic_order !=
+            compiled.plan.representation_plan[index].transform_order ||
+        operation.operation == CompiledPlan::RepresentationOperation::Unsupported) {
+      if (error) *error = "compiled representation operation disagrees with its frozen semantic order";
+      return false;
+    }
   }
   return true;
 }
@@ -167,9 +343,24 @@ std::string LoweringReport::canonical_json() const {
       {"reason", json::Value(event.reason)}}));
   return json::canonical(json::Value(json::Value::Object{
       {"abi_version", json::Value(static_cast<int64_t>(abi_version))},
+      {"barrier_count", json::Value(static_cast<int64_t>(barrier_count))},
       {"backend", json::Value(static_cast<int64_t>(backend))},
+      {"command_buffer_count", json::Value(static_cast<int64_t>(command_buffer_count))},
       {"diagnostic", json::Value(diagnostic)},
+      {"encoder_count", json::Value(static_cast<int64_t>(encoder_count))},
       {"events", json::Value(std::move(serialized))},
+      {"heap_fragmentation_bytes", json::Value(static_cast<int64_t>(heap_fragmentation_bytes))},
+      {"queue_wait_count", json::Value(static_cast<int64_t>(queue_wait_count))},
+      {"transition_barrier_count",
+       json::Value(static_cast<int64_t>(transition_barrier_count))},
+      {"transition_encoder_boundary_count",
+       json::Value(static_cast<int64_t>(transition_encoder_boundary_count))},
+      {"transition_fence_count",
+       json::Value(static_cast<int64_t>(transition_fence_count))},
+      {"transition_host_wait_count",
+       json::Value(static_cast<int64_t>(transition_host_wait_count))},
+      {"transition_serialized_fallback_count",
+       json::Value(static_cast<int64_t>(transition_serialized_fallback_count))},
       {"supported", json::Value(static_cast<int64_t>(supported ? 1 : 0))}}));
 }
 bool commit_representation_operations(const core::ExecutionPlan& plan,

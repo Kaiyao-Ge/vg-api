@@ -1181,10 +1181,9 @@ int main() {
       raster_api.destroyCodeObject(raster_bad_code_object);
     }
 
-    // ---- (c) Backend-agnostic negative: a "vg.msl.raster/v1" submission may
-    // only contain raster tasks -- device_hal.cpp's ExecutionPlan::validate()
-    // rejects any mix of compute+raster under a user_raster_shader plan,
-    // independent of backend. ----
+    // ---- (c) Node-domain negative: the SAME restricted Raster NodeRef is
+    // incorrectly reused as Compute. This is not evidence for rejecting a
+    // legal mixed graph with two domain-correct NodeRefs (ADR-054). ----
     {
       const std::string raster_mixed_envelope_json =
           make_raster_envelope_json(raster_good_fragment_entry, raster_good_fragment_entry);
@@ -1223,14 +1222,14 @@ int main() {
 
       VgTaskRecord raster_mixed_tasks[2]{};
       raster_mixed_tasks[0].node = raster_mixed_node_ref;
-      raster_mixed_tasks[0].root = 0;
-      raster_mixed_tasks[0].root_generation = 1;
+      raster_mixed_tasks[0].root = raster_source_id;
+      raster_mixed_tasks[0].root_generation = raster_source_gen;
       raster_mixed_tasks[0].shape = {1, 1, 1, 0};
       raster_mixed_tasks[0].kind = VG_TASK_KIND_COMPUTE;
 
       raster_mixed_tasks[1].node = raster_mixed_node_ref;
-      raster_mixed_tasks[1].root = 0;
-      raster_mixed_tasks[1].root_generation = 1;
+      raster_mixed_tasks[1].root = raster_source_id;
+      raster_mixed_tasks[1].root_generation = raster_source_gen;
       raster_mixed_tasks[1].shape = {1, 1, 1, 0};
       raster_mixed_tasks[1].kind = VG_TASK_KIND_RASTER;
       raster_mixed_tasks[1].topology = VG_TOPOLOGY_TRIANGLE_LIST;
@@ -1278,7 +1277,9 @@ int main() {
       VgSubmission raster_mixed_submission = nullptr;
       check(raster_api.submit(raster_device, &raster_mixed_submit_desc, &raster_mixed_submission) ==
                 VG_ERROR_INVALID_ARGUMENT,
-            "raster: submit rejects a mixed compute+raster user_raster_shader submission (backend-agnostic)");
+            "raster: submit rejects one restricted Raster NodeRef reused as Compute");
+      check(std::strstr(vgGetLastDiagnostic(), "domain") != nullptr,
+            "raster: rejection identifies the Node execution domain mismatch");
 
       raster_api.destroyExecutionEnvelope(raster_mixed_envelope);
       raster_api.destroyTimeline(raster_mixed_timeline);

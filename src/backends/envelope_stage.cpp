@@ -20,11 +20,20 @@ void report_host_split(Submission* submission, uint64_t count, const char* reaso
   submission->report.add("envelope_continuation", LoweringClass::HostAssisted, count, 0, reason);
 }
 
-bool leftover_matches_graph(const core::ExecutionPlan& plan, const std::vector<uint32_t>& leftover,
-                            std::string* error) {
+bool leftover_matches_schedule(const core::ExecutionPlan& plan,
+                               const std::vector<uint32_t>& leftover,
+                               std::string* error) {
   const auto task_count = static_cast<uint32_t>(plan.task_graph.tasks().size());
   if (!std::ranges::all_of(leftover, [task_count](uint32_t index) { return index < task_count; })) {
     if (error) *error = "envelope continuation leftover does not match this graph";
+    return false;
+  }
+  const auto& order = plan.execution_schedule.task_order;
+  if (leftover.size() > order.size() ||
+      !std::equal(leftover.begin(), leftover.end(),
+                  order.end() - static_cast<std::ptrdiff_t>(leftover.size()))) {
+    if (error)
+      *error = "envelope continuation leftover is not the canonical schedule suffix";
     return false;
   }
   return true;
@@ -46,6 +55,12 @@ bool apply_envelope_continuation(const core::ExecutionPlan& plan, core::Envelope
   publish_order->clear();
   submission->envelope_overflow.reset();
 
+  std::string plan_error;
+  if (!plan.validate(&plan_error)) {
+    if (error) *error = "envelope continuation requires a valid sealed schedule: " + plan_error;
+    return false;
+  }
+
   if (plan.pending_overflow.has_value() && !plan.pending_overflow->valid(error)) return false;
 
   if (pending_is_rejected(plan)) {
@@ -64,7 +79,7 @@ bool apply_envelope_continuation(const core::ExecutionPlan& plan, core::Envelope
       if (error) *error = "envelope continuation leftover does not match";
       return false;
     }
-    if (!leftover_matches_graph(plan, leftover, error)) return false;
+    if (!leftover_matches_schedule(plan, leftover, error)) return false;
     if (!table->take(plan.pending_overflow->continuation_token, &leftover, error)) return false;
     *publish_order = std::move(leftover);
     report_host_split(submission, publish_order->size(),
@@ -75,7 +90,7 @@ bool apply_envelope_continuation(const core::ExecutionPlan& plan, core::Envelope
   // Stage 3 already reconciled TaskGraph dependencies with actual per-Task
   // effects. Publication must consume that sealed order rather than derive a
   // second ordering fact from the raw graph.
-  std::vector<uint32_t> order = plan.task_order;
+  std::vector<uint32_t> order = plan.execution_schedule.task_order;
 
   if (!plan.envelope_task_quota.has_value()) {
     *publish_order = std::move(order);
