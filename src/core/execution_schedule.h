@@ -1,7 +1,8 @@
 #ifndef VG_CORE_EXECUTION_SCHEDULE_H_
 #define VG_CORE_EXECUTION_SCHEDULE_H_
 
-#include "core/core.h"
+#include "core/effect_graph.h"
+#include "core/facet.h"
 
 namespace vg::core {
 

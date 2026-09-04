@@ -1,0 +1,8 @@
+# Narrow physical harness: never linked into the production backend archive.
+add_library(vg_metal_adapter_harness STATIC tests/support/metal_adapter_harness.mm)
+target_compile_features(vg_metal_adapter_harness PUBLIC cxx_std_20)
+target_include_directories(vg_metal_adapter_harness PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
+target_include_directories(vg_metal_adapter_harness PRIVATE "${VG_GENERATED_DIR}")
+target_link_libraries(vg_metal_adapter_harness PUBLIC vg_backend_metal)
+add_dependencies(vg_metal_adapter_harness vg_schema_generate)
+target_link_libraries(vg_metal_task_timeline_test PRIVATE vg_metal_adapter_harness)

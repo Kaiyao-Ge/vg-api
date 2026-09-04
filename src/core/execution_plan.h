@@ -1,7 +1,10 @@
 #ifndef VG_CORE_EXECUTION_PLAN_H_
 #define VG_CORE_EXECUTION_PLAN_H_
 
-#include "core/core.h"
+#include "core/arena.h"
+#include "core/envelope.h"
+#include "core/representation.h"
+#include "core/task_graph.h"
 #include "core/execution_schedule.h"
 
 namespace vg::core {

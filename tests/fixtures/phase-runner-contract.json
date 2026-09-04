@@ -1,0 +1,274 @@
+{
+  "phase-a": {
+    "passed": {
+      "artifacts": {
+        "summary.json": "732f383d64df287fbf7d8b90a4f9567aa4fb8cbcd75179bbe80e54dc9f332fa6",
+        "summary.csv": "f21947a2633da0a98a06f55ef20505864f9375ab44c9f063b71e681de7058929",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "f926c62965851dc3447fe0a6b88884614b05bd10ca45b7ad68267569d99b8de3",
+        "definition.resolved.json": "e8cff274359171dbe40a93e3b75a00441fc6f6791f9d44cc98e18814572e23f7",
+        "stdout.log": "260cef4f02463f152a05e2e40454168d3d7c54d1b4e24d4ebc290fd86eb38ad7",
+        "manifest.json": "d3c67f2edf6eed62dd1c639e53c1d51be7680e3315b68732ceda016ce042ee25",
+        "samples.jsonl": "129c6d701c566846b52ec0c25f53d4c5f6db7f87c0e75b5ccb08c265801859cc",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "8aad4550278ecd71e3c8d72176489bc248d5966b203598df29d5364feafe68f7"
+      },
+      "calls": [
+        "^model.phase-a$",
+        "^model.phase-a$",
+        "^conformance.phase-a$",
+        "^conformance.phase-a$",
+        "^core.unit$"
+      ]
+    },
+    "failed": {
+      "artifacts": {
+        "summary.json": "2e71de8a239ef6c31a26c73dd941f3213a2d8efef6d1f98c2aadf627469a702d",
+        "summary.csv": "29405e9bc7cc74da07f84e5731f92f11dad7de449cc9468a963f39302dd4d965",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "44b7ca1a9324c1ae91b9d548dad4ab13017dee0aca68534666c9af5b189e558b",
+        "definition.resolved.json": "e8cff274359171dbe40a93e3b75a00441fc6f6791f9d44cc98e18814572e23f7",
+        "stdout.log": "81c8660f38422bda153784681d0042a5c6cf3f956c745fc075764ba1a7967303",
+        "manifest.json": "3266fb1d1c9209ef99fd2b73d53d3812abdf295537cb5bee62f54e90b3c16a7b",
+        "samples.jsonl": "e9a15641d648d9f42fdfd6b610ce354b6bb2c29bf0141527688a4b656a99c5d2",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "8aad4550278ecd71e3c8d72176489bc248d5966b203598df29d5364feafe68f7"
+      },
+      "calls": [
+        "^model.phase-a$",
+        "^model.phase-a$",
+        "^conformance.phase-a$",
+        "^conformance.phase-a$",
+        "^core.unit$"
+      ]
+    }
+  },
+  "phase-b": {
+    "passed": {
+      "artifacts": {
+        "summary.json": "24ea4529a29126ef2d64d8052dd34c85c8a3bd78a8b01c4fb0b724913e47d801",
+        "summary.csv": "c1b0868f8272ac9e54a2dde308d2df5dfbbd6626ffefffb5059f781363b44ee4",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "2e5f3eabadbb6717211169671c64d0a29755ca415b056b2daec872653194d7ea",
+        "definition.resolved.json": "db5091fd63f84c463bc0c128c668037be55420facf5278355b4dd33e2f74f066",
+        "stdout.log": "ffa8ad26dcabbdb3e2deae45f5abf5897f321e106a5a36d52f904e4fca440ed7",
+        "manifest.json": "897b58c16fa51c238e45609d114d2405da3cdaf25da46fe245967eb1de789028",
+        "samples.jsonl": "05f003f87475684a1b7f7013e4599a2f2f32d8b8b9df26a1f0bf258dd9de0382",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "99ee23cf1ff2ff1eac80f395ec63a7176632511cc8969dce05cc06fe7f9a0088"
+      },
+      "calls": [
+        "^vertical-slice.metal.pointer-graph$",
+        "^compiler.compute-package-golden$",
+        "^vertical-slice.metal.access-certificate$",
+        "^vertical-slice.metal.indexed-binding$",
+        "^vertical-slice.metal.tier1-indirect$",
+        "^vertical-slice.metal.cull-compact$",
+        "^vertical-slice.metal.effect-dag$"
+      ]
+    },
+    "failed": {
+      "artifacts": {
+        "summary.json": "eee8468fc0bba49e67e8a65f1bd5ff453a85ba231b13a8ea5e11b314a53f3384",
+        "summary.csv": "4736fd99f1f78f3f0f88bd8d0adcb249c5219612d8509cb6ad1e235942480cdf",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "8f863ebd609c11e346b6185554259384d1fac11e729eecd0cfba220e7bf42f68",
+        "definition.resolved.json": "db5091fd63f84c463bc0c128c668037be55420facf5278355b4dd33e2f74f066",
+        "stdout.log": "91253558b9b092adc46103e54b71019220cfe0551ce45d37df657b1c4986aa79",
+        "manifest.json": "27eb71329b29765c11fa063ff64922893d51f40995e63b5a4ea493562de43445",
+        "samples.jsonl": "f787a9f0c3bea2fc3f67ef93cd7e52ce765468f04c7d756d63bf4f15847ed528",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "99ee23cf1ff2ff1eac80f395ec63a7176632511cc8969dce05cc06fe7f9a0088"
+      },
+      "calls": [
+        "^vertical-slice.metal.pointer-graph$",
+        "^compiler.compute-package-golden$",
+        "^vertical-slice.metal.access-certificate$",
+        "^vertical-slice.metal.indexed-binding$",
+        "^vertical-slice.metal.tier1-indirect$",
+        "^vertical-slice.metal.cull-compact$",
+        "^vertical-slice.metal.effect-dag$"
+      ]
+    }
+  },
+  "phase-c": {
+    "passed": {
+      "artifacts": {
+        "summary.json": "3f999d8ded28aa1862944f98c87beae6879426f3455f6babe7b211fb40f14375",
+        "summary.csv": "27c748295cfd9a5c4c8be10bef2bc564d6479a8567771fd2898fd5fa76773624",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "761743864b44904e227b76ec328fa8c83bf468958e7f47417cf49d1edf899fc2",
+        "definition.resolved.json": "f881dcc5bd19d14652cbdfc532f83bff9f0bc33b8abad75ba0d13d473d544c1d",
+        "stdout.log": "e6ff50bf2596ca1fea3500479b7bc4d2ca48b04ab1b4e650c86c19f354b9dde6",
+        "manifest.json": "4d3b6e9037758296cd0f34ce466c1dea6203070626d7f3b541b3b1cfd777a07f",
+        "samples.jsonl": "5efbdd0ca773c0e2245db724a54cc54deba259b896f8a0114580e36b8619f383",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "6160a2125932ee5546b5cee89be6fe6e925af3b0bccb9848332f41a8a1aea900"
+      },
+      "calls": [
+        "^vertical-slice.metal.consume-input$",
+        "^vertical-slice.metal.sample-facet$",
+        "^vertical-slice.metal.pipeline-classification$",
+        "^vertical-slice.metal.representation-churn$"
+      ]
+    },
+    "failed": {
+      "artifacts": {
+        "summary.json": "c86c699ad187213b4b0a019ee41047dca463d02b0cdfebdaa08345c8d773d4e9",
+        "summary.csv": "b24dda9c21d77dc4a0470d3829f4c86e7ef6fe30ca2ced30baff6e1e8c7b4f80",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "67ff82f4239d6c0c05d9045ba8378b82f1f06f60cdc9142d706b47daff4b679d",
+        "definition.resolved.json": "f881dcc5bd19d14652cbdfc532f83bff9f0bc33b8abad75ba0d13d473d544c1d",
+        "stdout.log": "3c0464449f83eed9a45dbf9ea1a5f6753dd5d676d907acf550cf5b1e5a29719a",
+        "manifest.json": "4ed6ada3e822fcec3ff4a2a187a560a3da9d2ed1f22dd1874fc37916428de3fb",
+        "samples.jsonl": "0d1d4bc628c54add2afd8f6afa4e3d3aa9047d9c6bf275931435dedefa56c826",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "6160a2125932ee5546b5cee89be6fe6e925af3b0bccb9848332f41a8a1aea900"
+      },
+      "calls": [
+        "^vertical-slice.metal.consume-input$",
+        "^vertical-slice.metal.sample-facet$",
+        "^vertical-slice.metal.pipeline-classification$",
+        "^vertical-slice.metal.representation-churn$"
+      ]
+    }
+  },
+  "phase-d": {
+    "passed": {
+      "artifacts": {
+        "summary.json": "3abcaca7f6cd457694a85d2d05ac5e9f77359c1b8e10d8241beaba2f7120b705",
+        "summary.csv": "5b897c2ee3b9367f70f966669159b5c50387f021084ea923ecae9751b285644d",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "d51e7ecf6a6c172d74069e3d0aeebf96ccf993338fdfb1319e07f415c330ee9e",
+        "definition.resolved.json": "a698c44d7d461b4c3b7be58d8de6997ae58f3324c8e01d7390209bb075edf37e",
+        "stdout.log": "d86bc5e98e3fc578d8067cf260d89b6ab83da88389b0cfdd51cef003637bc1cd",
+        "manifest.json": "678516a644e4761bb3a52b137df7e78c167f4beb70d4a580a07559f6851bed50",
+        "samples.jsonl": "b1659bae6b9fbd18eacc72ed25ee428b20bcfb7ab251bcb3d5c1f3c90c370fcd",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "135a0b514ac00600fd1964fbd6028dc83d5b2a94fcb6706e30014f7146b7f5b5"
+      },
+      "calls": [
+        "^core.discovery$",
+        "^vertical-slice.metal.discovery$",
+        "^unit.tier2-oracle$",
+        "^vertical-slice.metal.tier2-nodes$",
+        "^core.working-set$",
+        "^vertical-slice.metal.working-set$",
+        "^capture.view$",
+        "^capture.view.cli$",
+        "^core.envelope-continuation$",
+        "^vertical-slice.metal.envelope-continuation$"
+      ]
+    },
+    "failed": {
+      "artifacts": {
+        "summary.json": "e4557c243e1f293b6bbd0695881115fe4430e080c67f2c2c58962e44b78f0ae6",
+        "summary.csv": "21e908ee682a5ac8d733828c556646d0e96a3b7624e3f4a87750e1411216b4fc",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "9374f425612526dd73e6223363c2ec48abf248f6d5db74a72843a3c1ed28d8c8",
+        "definition.resolved.json": "a698c44d7d461b4c3b7be58d8de6997ae58f3324c8e01d7390209bb075edf37e",
+        "stdout.log": "b69ce44b8671066f79d85ca558de05a8e482db139aca242399a7280b007e6b65",
+        "manifest.json": "c1c4e2262b47486cae11124de9d283c7f2f7cf7edec85fd48e2d42046801b90f",
+        "samples.jsonl": "0c9114d4c8844b084a265eeac07421dd6c0926ecfe606cc6e96754670c02e675",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "135a0b514ac00600fd1964fbd6028dc83d5b2a94fcb6706e30014f7146b7f5b5"
+      },
+      "calls": [
+        "^core.discovery$",
+        "^vertical-slice.metal.discovery$",
+        "^unit.tier2-oracle$",
+        "^vertical-slice.metal.tier2-nodes$",
+        "^core.working-set$",
+        "^vertical-slice.metal.working-set$",
+        "^capture.view$",
+        "^capture.view.cli$",
+        "^core.envelope-continuation$",
+        "^vertical-slice.metal.envelope-continuation$"
+      ]
+    }
+  },
+  "phase-e": {
+    "passed": {
+      "artifacts": {
+        "summary.json": "6fab37085779fc30f6ab8b2d4ccd593b37588bd878fee2938d7add8b5d29cdd6",
+        "summary.csv": "8041b318c157aa63d6edc24e96a45fa7d941869c67aabca8ee9da44679c1266e",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "f75e74ff81848daf66ce5c1eb4ceb1f78bef5a5b7f870ac44f4cec5cf9cac959",
+        "definition.resolved.json": "11df243edc2c34be2eb6b0ff8f98fe8a1c7fc6e8fd6759c1462c0d884ad2facd",
+        "stdout.log": "20b4ee6e0f0ce6a7b0c96e5bc08d54eb3f089621fb67461628afdd9c64e93ae0",
+        "manifest.json": "f70e4147528776b37cbfbedc888f26a09e5374f8a0e3b22915754d71c95e4906",
+        "samples.jsonl": "a5fee92117671d6c366efecf2a84f78f050ae55a101b30f6663928ad0874e12e",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "f83974613a4da333ce166c1a6b4bac61ed0b87425ff3e6c67772d4d1855b9afc"
+      },
+      "calls": [
+        "^model.phase-a$",
+        "^vertical-slice.metal.pointer-graph$",
+        "^compiler.compute-package-golden$",
+        "^model.phase-a$",
+        "^core.discovery$",
+        "^vertical-slice.metal.discovery$",
+        "^vertical-slice.metal.consume-input$",
+        "^conformance.phase-a$",
+        "^vertical-slice.metal.indexed-binding$",
+        "^vertical-slice.metal.sample-facet$",
+        "^vertical-slice.metal.tier1-indirect$",
+        "^vertical-slice.metal.cull-compact$",
+        "^unit.tier2-oracle$",
+        "^vertical-slice.metal.tier2-nodes$",
+        "^core.working-set$",
+        "^vertical-slice.metal.working-set$",
+        "^vertical-slice.metal.effect-dag$",
+        "^vertical-slice.metal.pipeline-classification$",
+        "^capture.view$",
+        "^capture.view.cli$",
+        "^conformance.phase-a$",
+        "^vertical-slice.metal.representation-churn$",
+        "^core.envelope-continuation$",
+        "^vertical-slice.metal.envelope-continuation$",
+        "^core.unit$"
+      ]
+    },
+    "failed": {
+      "artifacts": {
+        "summary.json": "39d922afa105b0cd78b4dcf167a5f8e4748efb91f37f211ce1605655fc9870f5",
+        "summary.csv": "78876132f12cc9c39136401917d27d572c42c5c9a0be314ffaae6529af324c69",
+        "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "report.md": "73b1003348f2778fb91a70aac9452181d39fa41f1d134024c81f16d96633d313",
+        "definition.resolved.json": "11df243edc2c34be2eb6b0ff8f98fe8a1c7fc6e8fd6759c1462c0d884ad2facd",
+        "stdout.log": "c8bea2466c87d89c828e559768bd18946aaf849c554464791ed9fc76edbae3f4",
+        "manifest.json": "2e98dbaefec56e1c4e5d9dc2e205c7215db181d33df8a5501e6db31f52da485e",
+        "samples.jsonl": "bb73aa863c035cb9b63cb7cebd83c7b2d2dcf0a6f778718c42c04dacb9eab9d4",
+        "environment.json": "64215a6ae593fc3390f9f4535d15ca0926750666dfba99bbef0716ecff150f97",
+        "build.json": "f83974613a4da333ce166c1a6b4bac61ed0b87425ff3e6c67772d4d1855b9afc"
+      },
+      "calls": [
+        "^model.phase-a$",
+        "^vertical-slice.metal.pointer-graph$",
+        "^compiler.compute-package-golden$",
+        "^model.phase-a$",
+        "^core.discovery$",
+        "^vertical-slice.metal.discovery$",
+        "^vertical-slice.metal.consume-input$",
+        "^conformance.phase-a$",
+        "^vertical-slice.metal.indexed-binding$",
+        "^vertical-slice.metal.sample-facet$",
+        "^vertical-slice.metal.tier1-indirect$",
+        "^vertical-slice.metal.cull-compact$",
+        "^unit.tier2-oracle$",
+        "^vertical-slice.metal.tier2-nodes$",
+        "^core.working-set$",
+        "^vertical-slice.metal.working-set$",
+        "^vertical-slice.metal.effect-dag$",
+        "^vertical-slice.metal.pipeline-classification$",
+        "^capture.view$",
+        "^capture.view.cli$",
+        "^conformance.phase-a$",
+        "^vertical-slice.metal.representation-churn$",
+        "^core.envelope-continuation$",
+        "^vertical-slice.metal.envelope-continuation$",
+        "^core.unit$"
+      ]
+    }
+  }
+}

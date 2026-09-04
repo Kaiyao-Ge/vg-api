@@ -1,5 +1,6 @@
 #include "backends/device_hal.h"
 #include "backends/metal/metal_device_hal.h"
+#include "backends/metal/metal_physical_types.h"
 #include "ir/ir.h"
 #include "../support/assembled_plan_fixture.h"
 

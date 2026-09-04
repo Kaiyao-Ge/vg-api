@@ -1284,6 +1284,17 @@ Reference/Metal 本地绿灯宣布 §9.2.13 全路线已完成。
 
 拆分验收看依赖方向、职责和测试影响面；行数只作提示。
 
+**G0 基线准备（2026-09-03）：** 已将 discovery/working-set/envelope 生产源码登记
+移出测试专属 CMake fragment，Tier2 实验归独立测试支撑库；Reference/真实 Metal 的
+ON/OFF 构建、原有测试映射与下一工作包边界见 [G0 构建基线](g0-build-baseline.md)。
+该记录不是 Core/backend 文件拆分完成声明，Linux SDK/真实 Vulkan 门禁仍 pending。
+
+**G6 构建/runner治理（2026-09-03）：** CMake已按显式source/schema/test登记拆分，
+Phase A—E使用数据清单与唯一执行循环，capture-view解除BUILD_TESTING依赖。
+原测试映射与生成物守恒，新增runner契约测试后Reference39/39、真实Metal73/73；
+缺测/skip/review-only不计执行通过。本人实施及复核记录见[G6 工具治理](g6-tooling-governance.md)。
+Linux SDK/真实Vulkan验证仍pending，本记录不宣布全部跨平台整改完成。
+
 ### 9.4 第四组：再进入 F8/F9/F10
 
 窗口/present 是既有 PlatformHAL/ownership/timeline 合同的新实现，不应成为 `ExecutionPlan` 的又一个无约束 optional。开始 F8 前至少满足第十节 gate；F8 自身仍需 ADR 明确 drawable identity、display ownership、Timeline、fault 和 offscreen conformance 隔离。

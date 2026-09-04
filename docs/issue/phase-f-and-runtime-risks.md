@@ -128,7 +128,7 @@ happens-before 约束与环。现有冲突检测存在多层嵌套，任务数�
 相关实现：
 
 - [`submit` API 编排](../../src/api/vg_api_execution.cpp)
-- [`TaskGraphBuilder::seal`](../../src/core/core.cpp)
+- [`TaskGraphBuilder::seal`](../../src/core/task_graph.cpp)
 - [HAL 执行边界](../../src/backends/device_hal.h)
 
 ### 为什么这是风险

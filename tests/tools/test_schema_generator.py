@@ -27,19 +27,21 @@ assert "VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE" in scene_layout
 scene_msl = (out / "vg_scene_root_msl.h").read_text()
 assert "VgSchema_SceneRootRaster" in scene_msl
 assert "packed_float4 camera_clip_from_local[4]" in scene_msl
-metal_source = (root / "src/backends/metal/metal_device_hal.mm").read_text()
-assert "newBufferWithLength:VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE" in metal_source
-assert "id<MTLBuffer> identity_scene_root_buffer = nil;" in metal_source
-assert "std::lock_guard<std::mutex> lock(identity_scene_root_mutex);" in metal_source
-assert "if (identity_scene_root_buffer != nil) {" in metal_source
-assert "if (created != nullptr) *created = false;" in metal_source
-assert "return identity_scene_root_buffer;" in metal_source
-assert '"identity_scene_root_buffer_create"' in metal_source
-assert '"identity_scene_root_buffer_reuse"' in metal_source
-assert "identity_buffer_created ? VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE : 0" in metal_source
-assert "reused immutable device-local legacy SceneRoot buffer; no draw allocation" in metal_source
-compiler_source = (root / "src/compiler/compute_package.cpp").read_text()
-assert "VG_SCHEMA_SCENEROOTRASTER_MSL_DECLARATIONS" in compiler_source
+metal_resources = (root / "src/backends/metal/metal_resources.mm").read_text()
+metal_internal = (root / "src/backends/metal/metal_device_internal.h").read_text()
+metal_commit = (root / "src/backends/metal/metal_commit.mm").read_text()
+assert "newBufferWithLength:VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE" in metal_resources
+assert "id<MTLBuffer> identity_scene_root_buffer = nil;" in metal_internal
+assert "std::lock_guard<std::mutex> lock(identity_scene_root_mutex);" in metal_resources
+assert "if (identity_scene_root_buffer != nil) {" in metal_resources
+assert "if (created != nullptr) *created = false;" in metal_resources
+assert "return identity_scene_root_buffer;" in metal_resources
+assert '"identity_scene_root_buffer_create"' in metal_commit
+assert '"identity_scene_root_buffer_reuse"' in metal_commit
+assert "identity_buffer_created ? VG_SCHEMA_SCENEROOTRASTER_ROOT_SIZE : 0" in metal_commit
+assert "reused immutable device-local legacy SceneRoot buffer; no draw allocation" in metal_commit
+raster_source = (root / "src/compiler/shaders/raster.cpp").read_text()
+assert "VG_SCHEMA_SCENEROOTRASTER_MSL_DECLARATIONS" in raster_source
 scene_reflection = json.loads((out / "vg_scene_root.reflection.json").read_text())
 assert scene_reflection["layouts"]["SceneRootRaster"]["size"] == 64 + scene_reflection["layouts"]["Material"]["size"]
 assert scene_reflection["relocations"] == [{"path": ["SceneRootRaster", "material", "albedo"], "kind": "facet", "offset": 80}]
@@ -77,14 +79,19 @@ assert "#define VG_TASK_RING_X_WORD 5u" in ring_words
 
 # Both shader dialects splice the same generated fragment, and active backend
 # code owns neither a local codec nor numeric x/node offsets.
-assert compiler_source.count("schema::compute_task_ring::kShaderLayout") == 2
-assert "word < 14u" not in compiler_source
-metal_source = (root / "src/backends/metal/metal_device_hal.mm").read_text()
-vulkan_source = (root / "src/backends/vulkan/vulkan_device_hal.cpp").read_text()
-assert "void pack_task_record" not in metal_source
-assert "unpack_task_record(" not in metal_source
-assert "void pack_task_record" not in vulkan_source
-assert "unpack_task_record(" not in vulkan_source
-assert "kTaskRingDispatchXWord" in metal_source
-assert "kTaskRingDispatchXWord" in vulkan_source
+ring_source = (root / "src/compiler/shaders/task_ring.cpp").read_text()
+assert ring_source.count("schema::compute_task_ring::kShaderLayout") == 2
+assert "word < 14u" not in ring_source
+metal_sources = [path.read_text() for path in (root / "src/backends/metal").glob("*.mm")]
+metal_sources.append((root / "tests/support/metal_adapter_harness.mm").read_text())
+metal_encoding = (root / "src/backends/metal/metal_encoding.mm").read_text()
+vulkan_sources = [path.read_text() for path in (root / "src/backends/vulkan").glob("*.cpp")]
+vulkan_sources.append((root / "tests/support/vulkan_adapter_harness.cpp").read_text())
+vulkan_resources = (root / "src/backends/vulkan/vulkan_resources.cpp").read_text()
+assert all("void pack_task_record" not in source for source in metal_sources)
+assert all("unpack_task_record(" not in source for source in metal_sources)
+assert all("void pack_task_record" not in source for source in vulkan_sources)
+assert all("unpack_task_record(" not in source for source in vulkan_sources)
+assert "kTaskRingDispatchXWord" in metal_encoding
+assert "kTaskRingDispatchXWord" in vulkan_resources
 assert "kTaskRingNodeIndexWord" in (root / "src/backends/metal/metal_tier2.mm").read_text()
