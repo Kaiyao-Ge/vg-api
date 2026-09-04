@@ -13,6 +13,24 @@ int main() {
   assert(package.package.source_map.size() == 2);
   assert(package.package.metal_source.find("vg_linear_compute") != std::string::npos);
   assert(package.package.vulkan_glsl_source.find("atomicAdd") != std::string::npos);
+  const std::string int64_extension =
+      "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
+  assert(package.package.vulkan_glsl_source.find(int64_extension) <
+         package.package.vulkan_glsl_source.find("uint64_t words64"));
+
+  // BDA wrappers need no integer arithmetic extension; raw indexed addresses
+  // do. Neither load/store-only path should acquire an atomic requirement.
+  const auto store = vg::compiler::compile_c_like("@node @effects store(7,0,4,9)");
+  assert(store.ok);
+  const auto linear_store = vg::compiler::build_linear_compute_package(store.module);
+  assert(linear_store.ok);
+  assert(linear_store.package.vulkan_glsl_source.find(int64_extension) == std::string::npos);
+  assert(linear_store.package.vulkan_glsl_source.find("GL_EXT_shader_atomic_int64") == std::string::npos);
+  const auto indexed = vg::compiler::build_indexed_compute_package(store.module);
+  assert(indexed.ok);
+  assert(indexed.package.vulkan_glsl_source.find(int64_extension) <
+         indexed.package.vulkan_glsl_source.find("uint64_t table"));
+  assert(indexed.package.vulkan_glsl_source.find("GL_EXT_shader_atomic_int64") == std::string::npos);
 
   auto unsupported = vg::compiler::compile_c_like("@node @effects store(7,0,8,9)");
   assert(unsupported.ok);
