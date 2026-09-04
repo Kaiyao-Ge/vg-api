@@ -100,7 +100,10 @@ def create_run(definition: dict[str, Any], build_dir: Path) -> Path:
     (run_dir / "stdout.log").write_text(completed.stdout, encoding="utf-8")
     (run_dir / "stderr.log").write_text(completed.stderr, encoding="utf-8")
     if completed.returncode != 0:
-        raise RuntimeError(f"platform probe failed with exit code {completed.returncode}")
+        raise RuntimeError(
+            f"platform probe failed with exit code {completed.returncode}; "
+            f"diagnostics saved in {run_dir.relative_to(ROOT)}/stderr.log\n{completed.stderr}"
+        )
     platform_data = json.loads(completed.stdout)
     if platform_data.get("schema") != "vg.platform/v1":
         raise RuntimeError("platform probe did not produce vg.platform/v1 JSON")

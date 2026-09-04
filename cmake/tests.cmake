@@ -172,6 +172,16 @@ vg_target(vg_compute_package_golden_test TYPE EXECUTABLE
   FEATURES_PRIVATE cxx_std_20)
 vg_test(compiler.compute-package-golden COMMAND vg_compute_package_golden_test ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Mandatory in Vulkan configurations (targets.cmake already requires glslc),
+# also available on CPU-only hosts with glslc. No driver or device is loaded.
+find_program(VG_GLSLC_EXECUTABLE NAMES glslc)
+if(VG_GLSLC_EXECUTABLE)
+  vg_python_test(compiler.compute-glsl tests/tools/check_compute_glsl.py
+    --root ${CMAKE_CURRENT_SOURCE_DIR}
+    --emitter $<TARGET_FILE:vg_compute_package_golden_test>
+    --glslc ${VG_GLSLC_EXECUTABLE})
+endif()
+
 vg_target(vg_phase_a_model_test TYPE EXECUTABLE
   SOURCES tests/model/phase_a_model_test.cpp
   LINK_PRIVATE vg_core

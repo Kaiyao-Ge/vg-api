@@ -84,7 +84,11 @@ ComputeSources emit_linear_compute_sources(const ir::Module& module,
   // 4-byte word view (load/store) and 8-byte view (atomic_add) can coexist.
   std::ostringstream glsl;
   glsl << "#version 450\n#extension GL_EXT_buffer_reference2 : require\n";
-  if (has_atomic) glsl << "#extension GL_EXT_shader_atomic_int64 : require\n";
+  if (has_atomic) {
+    // Atomic overloads do not introduce the uint64_t type itself.
+    glsl << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
+    glsl << "#extension GL_EXT_shader_atomic_int64 : require\n";
+  }
   glsl << "layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;\n\n";
   glsl << "layout(buffer_reference, std430, buffer_reference_align = 4) buffer VgAllocationRef {\n  uint words[];\n};\n";
   if (has_atomic)
@@ -148,6 +152,7 @@ ComputeSources emit_indexed_compute_sources(const ir::Module& module,
   // uint64_t address to VgAllocationRef at the point of dereference.
   std::ostringstream glsl;
   glsl << "#version 450\n#extension GL_EXT_buffer_reference2 : require\n";
+  glsl << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
   glsl << "layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;\n\n";
   glsl << "layout(buffer_reference, std430, buffer_reference_align = 4) buffer VgAllocationRef {\n  uint words[];\n};\n\n";
   glsl << "layout(push_constant) uniform VgIndexedPushConstants {\n  uint64_t table["

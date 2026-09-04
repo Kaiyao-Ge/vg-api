@@ -28,10 +28,24 @@ bool check(const std::string& name, const std::string& kind, const std::string& 
   }
   return true;
 }
+
+bool write_glsl(const std::string& directory, const std::string& name, const std::string& source) {
+  std::ofstream output(directory + "/" + name + ".comp");
+  output << source;
+  output.close();
+  if (!output) {
+    std::cerr << "Failed to write generated GLSL for " << name << "\n";
+    return false;
+  }
+  return true;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2) { std::cerr << "usage: vg_compute_package_golden_test <repo_root>\n"; return 2; }
+  if (argc != 2 && argc != 3) {
+    std::cerr << "usage: vg_compute_package_golden_test <repo_root> [existing GLSL output directory]\n";
+    return 2;
+  }
   const std::string root = argv[1];
   bool all_ok = true;
   for (const char* name : vg::golden::kFixtureNames) {
@@ -55,6 +69,20 @@ int main(int argc, char** argv) {
     all_ok = check(name, "msl", package.package.metal_source, prefix + ".msl.golden") && all_ok;
     all_ok = check(name, "glsl", package.package.vulkan_glsl_source, prefix + ".glsl.golden") && all_ok;
     all_ok = check(name, "sourcemap", vg::golden::format_source_map(package.package), prefix + ".sourcemap.golden") && all_ok;
+    if (argc == 3) {
+      // The offline compiler consumes freshly generated sources, not just
+      // checked-in text. Normal golden verification remains read-only.
+      all_ok = write_glsl(argv[2], name, package.package.vulkan_glsl_source) && all_ok;
+      if (std::string(name) == "store_only") {
+        const auto indexed = vg::compiler::build_indexed_compute_package(module);
+        if (!indexed.ok) {
+          std::cerr << "indexed_store: codegen failed: " << indexed.message << "\n";
+          all_ok = false;
+        } else {
+          all_ok = write_glsl(argv[2], "indexed_store", indexed.package.vulkan_glsl_source) && all_ok;
+        }
+      }
+    }
   }
   return all_ok ? 0 : 1;
 }

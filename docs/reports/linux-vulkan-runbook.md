@@ -63,6 +63,8 @@ directory, verifies NVIDIA enumeration using the project's platform executable,
 checks that all seven expected Vulkan tests are registered, then runs the entire
 CTest suite serially. The platform check is necessary because the existing
 `platform.probe --validate` test only requires the reference adapter to exist.
+The GPU-independent `compiler.compute-glsl` regression is also required: it
+compiles freshly generated compute sources with the configured glslc.
 
 The loader's NVIDIA filename filter prevents llvmpipe from being the first Vulkan
 device. If the host uses an unusually named manifest, identify its actual NVIDIA
@@ -124,6 +126,7 @@ import json, sys
 tests = json.load(open(sys.argv[1]))['tests']
 names = {t['name'] for t in tests}
 required = {
+    'compiler.compute-glsl',
     'conformance.device-hal.vulkan',
     'vertical-slice.vulkan',
     'vertical-slice.vulkan.task-tier0',
@@ -136,7 +139,7 @@ missing = required - names
 if missing:
     raise SystemExit('Missing Vulkan tests: ' + ', '.join(sorted(missing)))
 print('Registered tests:', len(tests))
-print('Required Vulkan entries:', len(required))
+print('Required shader/Vulkan entries:', len(required))
 PY
 
 VG_CTEST_RC=0
@@ -195,7 +198,104 @@ raster test is not Vulkan raster evidence. Public tests
 `api.c-abi-conformance`, `api.multicode-taskgraph-conformance`,
 `api.f6-scene-root-c`, and `api.f7-checkpoint-a-c` select reference on this Linux
 configuration. The dedicated Vulkan tests enter internal DeviceHAL directly.
-There is no complete Vulkan public-ABI acceptance lane in this checkout.
+`api.mixed-domain.vulkan` additionally checks the public-ABI Unsupported contract
+for raster-containing plans; it is not evidence of Vulkan raster execution.
+
+## Triage of the first RTX 4070 test log (2026-09-04)
+
+The supplied log has 46 tests, 15 failures. They must not be treated as 15
+independent backend implementation failures:
+
+- `vertical-slice.vulkan` and `vertical-slice.vulkan.task-tier0` report GLSL
+  syntax errors on line 10. The generated `uint64_t` declarations lacked
+  `GL_EXT_shader_explicit_arithmetic_types_int64`. The atomic-overload extension
+  alone does not enable that type. The linear atomic and indexed generators
+  now declare it; load/store-only linear shaders keep their narrower requirements.
+- Four linear fixtures and an indexed-store fixture are now fed from the real
+  generator into `compiler.compute-glsl`, using the production flags
+  `-fshader-stage=compute --target-env=vulkan1.2`. This needs glslc, but no Vulkan
+  device or loader. It is registered whenever glslc is found and is mandatory
+  in Vulkan builds, which already require that compiler at configure time.
+- Many otherwise successful executables fail at exit with LeakSanitizer reports
+  containing `libdbus` frames and unloaded/unknown-module frames. Even the
+  enumeration-only platform probe fails. VG's normal probe path calls
+  `vkDestroyInstance`, and the DeviceHAL destructor destroys its device and
+  instance. This does **not** prove that all reported allocations are external:
+  the incomplete stacks require a controlled Linux reproduction.
+- `tooling.bundle` previously hid the captured probe error behind a Python
+  subprocess exit-code traceback. It now prints the error and the saved
+  `artifacts/runs/.../stderr.log` path. A failing probe still fails the test;
+  valid JSON on stdout must not override a sanitizer failure at process exit.
+
+Keep the original failed logs. Reconfigure and rebuild with the existing
+dev-vulkan commands, then isolate the shader check first:
+
+```bash
+ctest --preset dev-vulkan --verbose --no-tests=error -R '^compiler\.compute-glsl$'
+```
+
+For the leak investigation, the supplied loader trace shows that the optional
+`VK_LAYER_MESA_device_select` layer is inserted, and advertises
+`NODEVICE_SELECT` as its disable variable. Compare the following two **diagnostic**
+probe runs on the same NVIDIA host. The second removes only that optional layer;
+it does not disable Khronos validation or any sanitizer. This is an A/B test,
+not a confirmed fix and not a change to production defaults.
+
+```bash
+(
+set -u
+export VK_LOADER_DRIVERS_SELECT='*nvidia*'
+export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+export VK_LOADER_DEBUG=error,warn,layer
+export ASAN_OPTIONS=detect_leaks=1:fast_unwind_on_malloc=0
+export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+mkdir -p artifacts/runs
+VG_LEAK_RUN="$(mktemp -d "$PWD/artifacts/runs/vulkan-leaks-XXXXXX")"
+env -u NODEVICE_SELECT build/dev-vulkan/vg-platform-probe \
+  > "$VG_LEAK_RUN/default.json" 2> "$VG_LEAK_RUN/default.stderr.log"
+printf '%s\n' "$?" > "$VG_LEAK_RUN/default.exit-code.txt"
+NODEVICE_SELECT=1 build/dev-vulkan/vg-platform-probe \
+  > "$VG_LEAK_RUN/no-mesa.json" 2> "$VG_LEAK_RUN/no-mesa.stderr.log"
+printf '%s\n' "$?" > "$VG_LEAK_RUN/no-mesa.exit-code.txt"
+printf 'Diagnostic logs: %s\n' "$VG_LEAK_RUN"
+)
+```
+
+Check both JSON outputs still enumerate the RTX 4070, both traces insert
+`VK_LAYER_KHRONOS_validation`, and only the second trace omits insertion of
+`VK_LAYER_MESA_device_select`. Record any other inherited loader settings that
+could affect the comparison. If the leak persists without that layer, retain
+the deeper stacks and investigate driver/layer ownership; do not add a blanket
+libdbus suppression or set `detect_leaks=0`. Even if it disappears, rerun the full
+suite under the recorded environment before claiming resolution.
+
+Local verification on Apple M1: the Reference ASan/UBSan suite passed 39/39;
+the real-device Metal ASan/UBSan suite passed 73/73 outside the sandbox.
+A temporary official glslang 16.5.0 build (commit
+`efa016659ffc4f2ae566b6b1db71a70655ac33a1`) compiled all five generated shaders;
+removing the new extension reproduced the original line-10 syntax error in both
+atomic fixtures and in indexed-store. That is GLSL front-end evidence, **not** a
+Linux glslc/NVIDIA execution or LeakSanitizer pass. Remote revalidation is pending.
+
+Local regression commands (from the repository root):
+
+```bash
+cmake --preset dev-reference
+cmake --build --preset dev-reference --parallel 4
+ctest --preset dev-reference --parallel 4 --output-on-failure
+cmake --preset dev-metal
+cmake --build --preset dev-metal --parallel 4
+ctest --preset dev-metal --parallel 1 --output-on-failure
+```
+
+The new glslc runner's successful-output, compiler-error, and malformed-SPIR-V
+branches were also exercised locally with a mocked compiler and the real source
+emitter. That checks the runner contract only; the actual glslc CTest remains a
+Linux verification item (expected Vulkan suite size after reconfigure: 47).
+
+The language distinction is defined by Khronos's
+[explicit arithmetic types extension](https://github.com/KhronosGroup/GLSL/blob/main/extensions/ext/GL_EXT_shader_explicit_arithmetic_types.txt)
+and [64-bit atomic extension](https://github.com/KhronosGroup/GLSL/blob/main/extensions/ext/GL_EXT_shader_atomic_int64.txt).
 
 ## Boundaries of a successful run
 
