@@ -12,6 +12,20 @@ using namespace detail;
 #if defined(VG_HAS_VULKAN)
 using AllocationRecord = detail::DeviceState::AllocationRecord;
 using VulkanFacetRecord = detail::DeviceState::VulkanFacetRecord;
+
+// The two harness-only graphics probes deliberately do not consult the
+// production Raster capability: this narrow dynamic-rendering experiment is
+// evidence about physical VkPipeline/VkRendering objects, never an E1 feature
+// advertisement. It still requires the exact queue and feature it records.
+bool harness_dynamic_rendering_available(const detail::DeviceState& state) {
+  if (!state.supports_dynamic_rendering_ || state.compute_queue_family_ == UINT32_MAX) return false;
+  uint32_t count = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(state.physical_device_, &count, nullptr);
+  std::vector<VkQueueFamilyProperties> properties(count);
+  vkGetPhysicalDeviceQueueFamilyProperties(state.physical_device_, &count, properties.data());
+  return state.compute_queue_family_ < properties.size() &&
+         (properties[state.compute_queue_family_].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+}
 #endif
 
 bool AdapterHarness::run_sample_facet(const vg::core::Arena& arena, vg::core::FacetPool& pool,
@@ -276,6 +290,15 @@ bool AdapterHarness::run_sample_facet(const vg::core::Arena& arena, vg::core::Fa
   vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
                           &descriptor_set, 0, nullptr);
   vkCmdDispatch(command_buffer, invocations, 1, 1);
+  VkMemoryBarrier2 host_visibility{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  host_visibility.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  host_visibility.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+  host_visibility.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+  host_visibility.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+  VkDependencyInfo host_dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  host_dependency.memoryBarrierCount = 1;
+  host_dependency.pMemoryBarriers = &host_visibility;
+  vkCmdPipelineBarrier2(command_buffer, &host_dependency);
   vkEndCommandBuffer(command_buffer);
   if (!submit_and_wait_simple(state.device_, state.compute_queue_, state.command_pool_, command_buffer, error)) {
     destroy_all();
@@ -292,7 +315,7 @@ bool AdapterHarness::run_sample_facet(const vg::core::Arena& arena, vg::core::Fa
   result->violation_count = violations;
   result->report.command_buffer_count = 1;
   result->report.encoder_count = 1;
-  result->report.barrier_count = transitioned ? 1 : 0;
+  result->report.barrier_count = (transitioned ? 1 : 0) + 1;
   result->report.queue_wait_count = 1;
   result->report.heap_fragmentation_bytes += image->allocation_padding_bytes;
   result->report.add("sample_facet", vg::hal::LoweringClass::DevicePass, invocations,
@@ -318,6 +341,8 @@ bool AdapterHarness::run_sample_facet(const vg::core::Arena& arena, vg::core::Fa
                        "one vkCmdPipelineBarrier2 into SHADER_READ_ONLY_OPTIMAL, reported apart from "
                        "the sample it enables (07 §7)");
   }
+  result->report.add("sample_readback_visibility", vg::hal::LoweringClass::Direct, 1, 0,
+                     "vkCmdPipelineBarrier2 makes compute-written output and violation buffers visible to host readback");
   result->report.add("descriptor_update", vg::hal::LoweringClass::Direct,
                      result->descriptors.descriptor_write_count,
                      result->descriptors.descriptor_write_bytes,
@@ -519,6 +544,16 @@ bool AdapterHarness::run_storage_facet(const vg::core::Arena& arena, vg::core::F
   copy.imageExtent = {1, 1, 1};
   vkCmdCopyImageToBuffer(command_buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer,
                          1, &copy);
+  VkMemoryBarrier2 host_visibility{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  host_visibility.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+  host_visibility.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  host_visibility.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+  host_visibility.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+  VkDependencyInfo host_dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  host_dependency.memoryBarrierCount = 1;
+  host_dependency.pMemoryBarriers = &host_visibility;
+  vkCmdPipelineBarrier2(command_buffer, &host_dependency);
+  ++barriers;
   vkEndCommandBuffer(command_buffer);
   if (!submit_and_wait_simple(state.device_, state.compute_queue_, state.command_pool_, command_buffer, error)) {
     destroy_all();
@@ -536,6 +571,8 @@ bool AdapterHarness::run_storage_facet(const vg::core::Arena& arena, vg::core::F
                      vg::core::bytes_per_texel(view.format),
                      "imageStore through a writable VkImageView whose format matches the view's own, "
                      "then copied back out of the image so the reported texel is the device's");
+  result->report.add("storage_readback_visibility", vg::hal::LoweringClass::Direct, 1, 0,
+                     "vkCmdPipelineBarrier2 makes transfer-written readback bytes visible to the host");
   result->report.add("facet_image",
                      cache_hit ? vg::hal::LoweringClass::CachedObject : vg::hal::LoweringClass::DevicePass,
                      1, image->backing_bytes,
@@ -577,9 +614,9 @@ bool AdapterHarness::run_pipeline_classification(const std::vector<RasterPipelin
     return false;
   };
   if (variants.empty()) return reject("pipeline classification needs at least one variant");
-  if (!state.capabilities_.supports(vg::hal::Capability::Raster))
-    return reject("Unsupported: this device did not claim Capability::Raster, so no graphics pipeline "
-                  "can be created to count");
+  if (!harness_dynamic_rendering_available(state))
+    return reject("Unsupported: the narrow pipeline-classification harness requires enabled dynamicRendering "
+                  "and a graphics-capable selected queue; it does not advertise production Raster capability");
 
   // Both arms start empty so the counts describe this call and nothing else.
   // The VkPipelines themselves are left in raster_pipelines_/naive_raster_
@@ -684,6 +721,45 @@ bool AdapterHarness::run_raster_facet(const vg::core::Arena& arena, vg::core::Fa
     vg::core::FacetRef attachment_ref, vg::core::FacetRef source_ref,
     const RasterPassDesc& desc, RasterPassResult* result, std::string* error) {
   return device_.state_->run_raster_pass(arena, pool, attachment_ref, source_ref, desc, result, error);
+}
+
+bool AdapterHarness::observe_representation_backing(const vg::core::Arena& arena, vg::core::FacetPool& pool,
+                                                    vg::core::FacetRef retained_ref,
+                                                    RepresentationPhysicalObservation* result,
+                                                    std::string* error) {
+#if !defined(VG_HAS_VULKAN)
+  (void)arena;
+  (void)pool;
+  (void)retained_ref;
+  (void)result;
+  set_error(error, "Vulkan adapter is unavailable, so physical backing cannot be observed");
+  return false;
+#else
+  if (result == nullptr) {
+    set_error(error, "representation physical observation output is required");
+    return false;
+  }
+  *result = RepresentationPhysicalObservation{};
+  vg::core::FacetStatus status = vg::core::FacetStatus::Ok;
+  const vg::core::FacetSlot* slot = pool.lookup(arena, retained_ref, &status);
+  if (slot == nullptr || slot->kind != vg::core::FacetKind::Sample) {
+    set_error(error, "retained SampleFacet did not resolve while observing representation backing");
+    return false;
+  }
+  auto& state = *device_.state_;
+  const auto linear = state.allocation_map_.find(slot->view.allocation);
+  if (linear != state.allocation_map_.end()) result->cached_linear_backing_bytes = linear->second.byte_size;
+  for (const auto& [key, image] : state.facet_images_) {
+    if (key.facet_index != retained_ref.index || key.facet_generation != retained_ref.generation) continue;
+    ++result->cached_facet_image_count;
+    result->retained_facet_backing_bytes += image.backing_bytes;
+  }
+  if (result->cached_facet_image_count == 0 || result->retained_facet_backing_bytes == 0) {
+    set_error(error, "retained SampleFacet has no Vulkan image backing to observe");
+    return false;
+  }
+  return true;
+#endif
 }
 
 }  // namespace vg::vulkan

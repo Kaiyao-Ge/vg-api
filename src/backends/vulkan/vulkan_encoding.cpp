@@ -97,6 +97,12 @@ void layout_sync_scope(VkImageLayout layout, VkPipelineStageFlags2* stage, VkAcc
       *stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
       *access = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
       return;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+      *stage = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+               VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+      *access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+      return;
     default:
       *stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
       *access = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -105,7 +111,8 @@ void layout_sync_scope(VkImageLayout layout, VkPipelineStageFlags2* stage, VkAcc
 }
 
 void record_image_barrier(VkCommandBuffer command_buffer, VkImage image, VkImageLayout old_layout,
-                         VkImageLayout new_layout, uint32_t mip_levels, uint32_t array_layers) {
+                         VkImageLayout new_layout, VkImageAspectFlags aspect,
+                         uint32_t mip_levels, uint32_t array_layers) {
   VkPipelineStageFlags2 src_stage = VK_PIPELINE_STAGE_2_NONE;
   VkAccessFlags2 src_access = VK_ACCESS_2_NONE;
   VkPipelineStageFlags2 dst_stage = VK_PIPELINE_STAGE_2_NONE;
@@ -126,7 +133,7 @@ void record_image_barrier(VkCommandBuffer command_buffer, VkImage image, VkImage
   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = image;
-  barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barrier.subresourceRange.aspectMask = aspect;
   barrier.subresourceRange.baseMipLevel = 0;
   barrier.subresourceRange.levelCount = mip_levels;
   barrier.subresourceRange.baseArrayLayer = 0;
@@ -291,8 +298,11 @@ bool DeviceState::dispatch_task_ring_publication(const TaskRingBuffers& buffers,
 bool DeviceState::record_layout_transition(VkCommandBuffer command_buffer, VulkanFacetRecord* record,
                                          VkImageLayout new_layout) {
   if (record->layout == new_layout) return false;
-  record_image_barrier(command_buffer, record->image, record->layout, new_layout, record->mip_levels,
-                       record->array_layers);
+  const VkImageAspectFlags aspect = record->format == VK_FORMAT_D32_SFLOAT
+                                      ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                      : VK_IMAGE_ASPECT_COLOR_BIT;
+  record_image_barrier(command_buffer, record->image, record->layout, new_layout,
+                       aspect, record->mip_levels, record->array_layers);
   record->layout = new_layout;
   return true;
 }

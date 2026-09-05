@@ -48,6 +48,7 @@ struct AssemblyOptions {
   uint64_t graph_epoch{};
   const std::vector<core::RepresentationRequest>* representation_requests{};
   const core::FacetPool* facet_pool{};
+  const std::vector<core::NodeTable::Ref>* tier2_selection_nodes{};
   std::optional<core::AccessCertificateMode> certificate_mode;
   std::vector<core::PointerRef> certificate_touched;
   uint64_t timeline_wait{};
@@ -114,6 +115,7 @@ inline bool assemble_single_node_plan(core::Arena& arena, ir::Module module,
   inputs.working_set_budget = options.working_set_budget;
   inputs.working_set_lease = options.working_set_lease;
   inputs.pending_overflow = options.pending_overflow;
+  inputs.tier2_selection_nodes = options.tier2_selection_nodes;
   return core::ExecutionPlanAssembler::assemble(inputs, out, error);
 }
 
@@ -175,6 +177,7 @@ inline bool assemble_multi_node_plan(core::Arena& arena, std::vector<ir::Module>
   inputs.facet_pool = options.facet_pool;
   inputs.representation_requests = options.representation_requests;
   inputs.pending_overflow = options.pending_overflow;
+  inputs.tier2_selection_nodes = options.tier2_selection_nodes;
   return core::ExecutionPlanAssembler::assemble(inputs, out, error);
 }
 
@@ -240,6 +243,7 @@ inline bool assemble_single_user_raster_plan(
   inputs.working_set_budget = options.working_set_budget;
   inputs.working_set_lease = options.working_set_lease;
   inputs.pending_overflow = options.pending_overflow;
+  inputs.tier2_selection_nodes = options.tier2_selection_nodes;
   return core::ExecutionPlanAssembler::assemble(inputs, out, error);
 }
 

@@ -289,7 +289,29 @@ if(VG_ENABLE_VULKAN)
     INCLUDE_PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support"
     FEATURES_PRIVATE cxx_std_20)
   vg_test_modes(vg_vulkan_task_timeline_test vertical-slice.vulkan
-    task-tier0 timeline raster-rejected raster-msl-rejected)
+    task-tier0 timeline raster-basic raster-msl-rejected)
+
+  # B/C parity gates require a real Vulkan device; no skip or backend fallback.
+  vg_target(vg_vulkan_pointer_graph_test TYPE EXECUTABLE
+    SOURCES tests/vertical_slice/vulkan_pointer_graph_test.cpp
+    LINK_PRIVATE vg_backend_vulkan vg_backend_reference vg_compiler
+    INCLUDE_PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support"
+    FEATURES_PRIVATE cxx_std_20)
+  vg_test(vertical-slice.vulkan.pointer-graph COMMAND vg_vulkan_pointer_graph_test ${CMAKE_CURRENT_SOURCE_DIR})
+
+  vg_target(vg_vulkan_pointer_graph_abi_test TYPE EXECUTABLE
+    SOURCES tests/api/vg_vulkan_pointer_graph_abi_test.cpp
+    LINK_PRIVATE vg_api
+    FEATURES_PRIVATE cxx_std_17)
+  vg_test(api.vulkan-pointer-graph COMMAND vg_vulkan_pointer_graph_abi_test)
+
+  vg_target(vg_vulkan_discovery_working_set_test TYPE EXECUTABLE
+    SOURCES tests/vertical_slice/vulkan_discovery_working_set_test.cpp
+    LINK_PRIVATE vg_backend_vulkan vg_backend_reference vg_compiler
+    INCLUDE_PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/support"
+    FEATURES_PRIVATE cxx_std_20)
+  vg_test(vertical-slice.vulkan.discovery COMMAND vg_vulkan_discovery_working_set_test discovery ${CMAKE_CURRENT_SOURCE_DIR})
+  vg_test(vertical-slice.vulkan.working-set COMMAND vg_vulkan_discovery_working_set_test working-set ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 vg_python_test(schema.generate tests/tools/test_schema_generator.py ${CMAKE_CURRENT_SOURCE_DIR} ${VG_GENERATED_DIR})

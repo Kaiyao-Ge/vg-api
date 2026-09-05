@@ -78,6 +78,10 @@ bool PublicationRing::publish_task(const TaskRecord& task, uint32_t* slot, std::
 bool TaskGraphBuilder::append(const TaskRecord& task, std::string* error) {
   if (sealed_) { if (error) *error = "task graph builder is sealed"; return false; }
   if (task.node_generation == 0 || task.root_generation == 0) { if (error) *error = "task generation must be non-zero"; return false; }
+  if (task.kind == TaskKind::Raster && task.topology != Topology::TriangleList) {
+    if (error) *error = "raster topology is Unsupported; triangle-list is required";
+    return false;
+  }
   if (task.kind == TaskKind::Raster &&
       static_cast<uint32_t>(task.depth_compare_op) > static_cast<uint32_t>(DepthCompareOp::Always)) {
     if (error) *error = "raster depth compare op is invalid";

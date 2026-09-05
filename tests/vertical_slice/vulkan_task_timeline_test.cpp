@@ -149,12 +149,6 @@ bool make_raster_task(vg::hal::DeviceHal& device, vg::core::Arena& arena,
          acquire(vg::core::FacetKind::Address, 15, 1, &task->vertex_buffer_ref);
 }
 
-std::string raster_rejection(const TaskRecord& task) {
-  return "Vulkan Unsupported: NodeRef{" + std::to_string(task.node_index) + "," +
-         std::to_string(task.node_generation) +
-         "} domain=Raster; complete plan rejected before Commit";
-}
-
 // Per-Node Stage 6 and per-Task Stage 7 conformance. This stays in the existing
 // task-tier0 executable so Linux hardware runs it automatically without a new
 // CMake test lane.
@@ -705,87 +699,102 @@ bool run_timeline(const std::string& root) {
   return true;
 }
 
-// F2 (ADR-046) wired TaskGraph-driven rasterization through compile()/
-// submit() for the reference and Metal backends only -- this backend's own
-// raster machinery (ensure_raster_pipeline/run_raster_facet in
-// vulkan_device_hal.cpp) is separate, pre-existing, and permanently
-// compile-review-only (ADR-043 §7). A Raster-kind TaskRecord reaching this
-// backend's TaskGraph must be rejected at compile() time (Unsupported), not
-// silently republished as a default x=y=z=1 compute dispatch. The shared ring
-// codec is now compute-only and would reject it too, but this earlier Stage-6
-// check owns Vulkan's stable capability/Unsupported diagnostic. Same START.md
-// §4 invariant 10 contract
-// reference/Metal already enforce for index_count > 0 (see
-// reference_raster_test.cpp / metal_task_timeline_test.cpp's indexed-draw
-// sub-case). Compile-review-only here since no Linux/NVIDIA hardware is
-// available to actually run this binary.
-bool run_raster_rejected(const std::string& root) {
+// Stage 7 executes a mixed compute/raster plan in the Core-sealed order and
+// publishes both the compute side effect and the rendered attachment bytes.
+bool run_raster_basic(const std::string& root) {
   (void)root;
   std::string device_error;
   auto vulkan_device = vg::vulkan::make_device_hal(&device_error);
   if (vulkan_device == nullptr) {
-    std::cerr << "raster-rejected: no Vulkan device available on this host: " << device_error << "\n";
+    std::cerr << "raster-basic: no Vulkan device available on this host: " << device_error << "\n";
+    return false;
+  }
+  if (!vulkan_device->capabilities().supports(vg::hal::Capability::Raster)) {
+    std::cerr << "raster-basic: Vulkan device does not advertise Raster\n";
     return false;
   }
 
   vg::core::Arena arena;
-  const auto module = make_probe_module(arena);
-
-  // Real Stage-5 facets/effects and distinct NodeRefs ensure this reaches the
-  // backend guard, not a malformed-plan or same-Node domain rejection.
+  const auto raster_module = make_probe_module(arena);
   TaskRecord raster_task{};
-  vg::core::ExecutionPlan plan;
   std::string error;
-  if (!make_raster_task(*vulkan_device, arena, &raster_task, &error)) return false;
-  vg::test_support::AssemblyOptions options;
-  options.facet_pool = &vulkan_device->facet_pool();
-  vg::test_support::MultiNodePlanFixture fixture;
+  if (!make_raster_task(*vulkan_device, arena, &raster_task, &error)) {
+    std::cerr << "raster-basic: facet setup failed: " << error << "\n";
+    return false;
+  }
+  const auto* source_slot = vulkan_device->facet_pool().lookup(arena, raster_task.raster_facets.source);
+  const auto* target_slot = vulkan_device->facet_pool().lookup(arena, raster_task.raster_facets.target);
+  const auto* vertex_slot = vulkan_device->facet_pool().lookup(arena, raster_task.vertex_buffer_ref);
+  if (source_slot == nullptr || target_slot == nullptr || vertex_slot == nullptr) {
+    std::cerr << "raster-basic: live facet lookup failed\n";
+    return false;
+  }
+  auto* source = arena.lookup(vg::core::PointerRef{source_slot->view.allocation, source_slot->view.allocation_generation});
+  auto* target = arena.lookup(vg::core::PointerRef{target_slot->view.allocation, target_slot->view.allocation_generation});
+  auto* vertex = arena.lookup(vg::core::PointerRef{vertex_slot->view.allocation, vertex_slot->view.allocation_generation});
+  if (source == nullptr || target == nullptr || vertex == nullptr) {
+    std::cerr << "raster-basic: backing allocation lookup failed\n";
+    return false;
+  }
+  for (size_t i = 0; i < source->bytes.size(); i += 4) {
+    source->bytes[i] = 255;
+    source->bytes[i + 1] = 32;
+    source->bytes[i + 2] = 16;
+    source->bytes[i + 3] = 255;
+  }
+  const vg::reference::RasterVertex triangle[3] = {
+      {-1.0f, -1.0f, 0.5f, 0.0f, 0.0f},
+      {3.0f, -1.0f, 0.5f, 1.0f, 0.0f},
+      {-1.0f, 3.0f, 0.5f, 0.0f, 1.0f},
+  };
+  std::memcpy(vertex->bytes.data(), triangle, sizeof(triangle));
+  arena.mark_content_modified(*source);
+  arena.mark_content_modified(*vertex);
+
   auto& compute_output = arena.allocate(64);
   TaskRecord compute_task{};
   compute_task.root_allocation = compute_output.id;
   compute_task.root_generation = compute_output.generation;
-  const auto original_bytes = compute_output.bytes;
-  if (!vg::test_support::assemble_multi_node_plan(arena,
-          {make_store_module(compute_output, 9), module}, {compute_task, raster_task}, {},
-          &fixture, &plan, &error, options)) {
-    std::cerr << "raster-rejected: plan assembly failed: " << error << "\n";
+  vg::test_support::MultiNodePlanFixture fixture;
+  vg::core::ExecutionPlan plan;
+  vg::test_support::AssemblyOptions options;
+  options.facet_pool = &vulkan_device->facet_pool();
+  if (!vg::test_support::assemble_multi_node_plan(
+          arena, {make_store_module(compute_output, 9), raster_module},
+          {compute_task, raster_task}, {{0, 1}}, &fixture, &plan, &error, options)) {
+    std::cerr << "raster-basic: plan assembly failed: " << error << "\n";
     return false;
   }
   vg::hal::CompiledPlan compiled;
-  if (vulkan_device->compile(plan, &compiled, &error)) {
-    std::cerr << "raster-rejected: compile() unexpectedly accepted a Raster-kind task\n";
+  if (!vulkan_device->compile(plan, &compiled, &error)) {
+    std::cerr << "raster-basic: compile failed: " << error << "\n";
     return false;
   }
-  if (error != raster_rejection(plan.task_graph.tasks()[1]) ||
-      compiled.report.diagnostic != error || !compiled.per_node_packages.empty() ||
-      event_count(compiled.report, "vulkan_pipeline") != 0 || compute_output.bytes != original_bytes) {
-    std::cerr << "raster-rejected: unexpected error message: " << error << "\n";
+  vg::hal::Submission submission;
+  if (!vulkan_device->submit(compiled, arena, &submission, &error)) {
+    std::cerr << "raster-basic: submit failed: " << error << "\n";
     return false;
   }
-  if (compiled.report.supported) {
-    std::cerr << "raster-rejected: report.supported should be false\n";
+  uint32_t stored = 0;
+  std::memcpy(&stored, compute_output.bytes.data(), sizeof(stored));
+  const bool rendered = std::any_of(target->bytes.begin(), target->bytes.end(),
+                                    [](uint8_t value) { return value != 0; });
+  if (!submission.result.ok || stored != 0x09090909u || !rendered ||
+      submission.raster_results.size() != 1 ||
+      submission.raster_results[0].resolved_rgba.size() != 4 ||
+      submission.published_tasks.size() != 2 ||
+      event_count(submission.report, "vulkan_raster_draw") == 0) {
+    std::cerr << "raster-basic: Stage7 did not publish compute+raster results: ok="
+              << submission.result.ok << " stored=" << stored
+              << " rendered=" << rendered
+              << " raster_results=" << submission.raster_results.size()
+              << " published=" << submission.published_tasks.size()
+              << " draw_events=" << event_count(submission.report, "vulkan_raster_draw")
+              << " fault=" << submission.result.fault.code
+              << " message=" << submission.result.message << "\n";
     return false;
   }
-  bool found_unsupported_event = false;
-  for (const auto& event : compiled.report.events) {
-    if (event.operation == "raster_task" && event.classification == vg::hal::LoweringClass::Unsupported &&
-        event.reason == raster_rejection(plan.task_graph.tasks()[1])) {
-      found_unsupported_event = true;
-      break;
-    }
-  }
-  if (!found_unsupported_event) {
-    std::cerr << "raster-rejected: missing Unsupported raster_task LoweringEvent\n";
-    return false;
-  }
-  vg::hal::Submission rejected;
-  if (vulkan_device->submit(compiled, arena, &rejected, &error) ||
-      !rejected.published_tasks.empty() || rejected.report.command_buffer_count != 0 ||
-      compute_output.bytes != original_bytes) {
-    std::cerr << "raster-rejected: unsupported mixed plan reached Commit\n";
-    return false;
-  }
-  std::cout << "raster-rejected: ok\n";
+  std::cout << "raster-basic: ok\n";
   return true;
 }
 
@@ -829,7 +838,7 @@ bool run_raster_msl_rejected(const std::string& root) {
     std::cerr << "raster-msl-rejected: compile() unexpectedly accepted a user_raster_shader Raster-kind task\n";
     return false;
   }
-  if (error != raster_rejection(plan.task_graph.tasks()[0])) {
+  if (error.find("Vulkan user Raster requires code object format vg.glsl.raster/v1; vg.msl.raster/v1 is Unsupported") == std::string::npos) {
     std::cerr << "raster-msl-rejected: unexpected error message: " << error << "\n";
     return false;
   }
@@ -839,7 +848,8 @@ bool run_raster_msl_rejected(const std::string& root) {
   }
   bool found_unsupported_event = false;
   for (const auto& event : compiled.report.events) {
-    if (event.operation == "raster_task" && event.classification == vg::hal::LoweringClass::Unsupported) {
+    if (event.operation == "node_raster_package" && event.classification == vg::hal::LoweringClass::Unsupported &&
+        event.reason.find("vg.msl.raster/v1 is Unsupported") != std::string::npos) {
       found_unsupported_event = true;
       break;
     }
@@ -857,7 +867,7 @@ bool run_raster_msl_rejected(const std::string& root) {
 int main(int argc, char** argv) {
   if (argc != 3) {
     std::cerr << "usage: vg_vulkan_task_timeline_test "
-                 "<task-tier0|timeline|raster-rejected|raster-msl-rejected> <repo_root>\n";
+                 "<task-tier0|timeline|raster-basic|raster-msl-rejected> <repo_root>\n";
     return 2;
   }
   const std::string mode = argv[1];
@@ -867,8 +877,8 @@ int main(int argc, char** argv) {
     ok = run_task_tier0(root);
   } else if (mode == "timeline") {
     ok = run_timeline(root);
-  } else if (mode == "raster-rejected") {
-    ok = run_raster_rejected(root);
+  } else if (mode == "raster-basic") {
+    ok = run_raster_basic(root);
   } else if (mode == "raster-msl-rejected") {
     ok = run_raster_msl_rejected(root);
   } else {

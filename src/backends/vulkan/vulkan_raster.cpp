@@ -65,10 +65,18 @@ bool DeviceState::run_raster_pass(const vg::core::Arena& arena, vg::core::FacetP
     return false;
   };
   const bool draws = !desc.vertices.empty();
-  if (draws && !capabilities_.supports(vg::hal::Capability::Raster))
-    return reject("Unsupported: this device did not claim Capability::Raster, so a draw cannot be "
-                  "lowered through dynamic rendering here and must not be approximated with a compute "
-                  "blit (device_hal.h, Capability::Raster)");
+  // This existing physical helper is called only by the narrow test harness.
+  // Production Raster remains rejected by compile(); its capability bit does
+  // not describe whether this device can perform an isolated legacy pass.
+  uint32_t queue_count = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_count, nullptr);
+  std::vector<VkQueueFamilyProperties> queues(queue_count);
+  vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_count, queues.data());
+  if (!supports_dynamic_rendering_ || !capabilities_.supports(vg::hal::Capability::EffectDag) ||
+      compute_queue_family_ >= queue_count ||
+      (queues[compute_queue_family_].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0)
+    return reject("Unsupported: narrow physical raster requires enabled dynamicRendering, "
+                  "synchronization2 and a graphics-capable selected queue; production Raster remains unsupported");
   if (desc.vertices.size() % 3 != 0)
     return reject("a triangle-list draw needs a vertex count that is a multiple of three");
   if (desc.sample_count != 1 && desc.sample_count != 2 && desc.sample_count != 4 && desc.sample_count != 8)
@@ -310,7 +318,8 @@ bool DeviceState::run_raster_pass(const vg::core::Arena& arena, vg::core::FacetP
     ++barriers;
   if (multisample_image != VK_NULL_HANDLE) {
     record_image_barrier(command_buffer, multisample_image, VK_IMAGE_LAYOUT_UNDEFINED,
-                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 1, 1);
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
     ++barriers;
   }
 
@@ -377,6 +386,16 @@ bool DeviceState::run_raster_pass(const vg::core::Arena& arena, vg::core::FacetP
   copy.imageExtent = {1, 1, 1};
   vkCmdCopyImageToBuffer(command_buffer, attachment_image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          readback.buffer, 1, &copy);
+  VkMemoryBarrier2 readback_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  readback_barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  readback_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  readback_barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+  readback_barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+  VkDependencyInfo readback_dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  readback_dependency.memoryBarrierCount = 1;
+  readback_dependency.pMemoryBarriers = &readback_barrier;
+  vkCmdPipelineBarrier2(command_buffer, &readback_dependency);
+  ++barriers;
   vkEndCommandBuffer(command_buffer);
   if (!submit_and_wait_simple(device_, compute_queue_, command_pool_, command_buffer, error)) {
     destroy_multisample();

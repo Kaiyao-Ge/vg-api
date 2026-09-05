@@ -49,6 +49,12 @@ UserRasterShaderContract parse_msl_raster_envelope(const std::string& text) {
   contract.source=require(o,"source").string(); if(contract.source.empty()) throw std::runtime_error("MSL raster envelope missing field: source");
   return contract;
 }
+UserRasterShaderContract parse_glsl_raster_envelope(const std::string& text) {
+  auto contract=parse_msl_raster_envelope(text);
+  if (contract.source.find("#version") == std::string::npos)
+    throw std::runtime_error("GLSL raster envelope source must declare #version");
+  return contract;
+}
 bool effect_covers(const Effect& declared,const Effect& actual){ if(declared.allocation!=actual.allocation||declared.representation_epoch!=actual.representation_epoch)return false; if((static_cast<uint64_t>(declared.access)&static_cast<uint64_t>(actual.access))!=static_cast<uint64_t>(actual.access))return false; if(actual.size==0||declared.size==0||declared.offset>actual.offset)return false; const uint64_t relative=actual.offset-declared.offset; return relative<=declared.size && actual.size<=declared.size-relative; }
 namespace {
 bool pointer_edge_covers(const Module& module,const Instruction& root,const Instruction& via){

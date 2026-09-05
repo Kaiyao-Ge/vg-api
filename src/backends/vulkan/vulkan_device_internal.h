@@ -2,13 +2,15 @@
 #define VG_BACKENDS_VULKAN_DEVICE_INTERNAL_H_
 
 #include "backends/vulkan/vulkan_device_hal.h"
-#include "backends/vulkan/vulkan_physical_types.h"
 #include "backends/vulkan/vulkan_diagnostics.h"
+#include "backends/vulkan/vulkan_physical_types.h"
+#include "backends/vulkan/vulkan_plan_indirect.h"
+#include "backends/vulkan/vulkan_plan_raster.h"
 #include "compiler/pipeline_classification.h"
 #include <map>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
-#include <string_view>
 #if defined(VG_HAS_VULKAN)
 #include <vulkan/vulkan.h>
 #endif
@@ -17,21 +19,23 @@ namespace vg::vulkan {
 
 namespace detail {
 struct DeviceState {
-  explicit DeviceState(DeviceHal& owner);
+  explicit DeviceState(DeviceHal &owner);
   ~DeviceState();
-  DeviceState(const DeviceState&) = delete;
-  DeviceState& operator=(const DeviceState&) = delete;
-  DeviceHal& owner_;
-  vg::core::FacetPool& facet_pool();
-  vg::core::EnvelopeContinuationTable& envelope_continuations();
-  const vg::hal::CapabilitySnapshot& capabilities() const;
-  bool compile(const vg::core::ExecutionPlan& plan, vg::hal::CompiledPlan* compiled,
-               std::string* error);
-  bool submit(const vg::hal::CompiledPlan& compiled, vg::core::Arena& arena,
-              vg::hal::Submission* submission, std::string* error);
-  bool run_raster_pass(const vg::core::Arena& arena, vg::core::FacetPool& pool,
-                       vg::core::FacetRef attachment_ref, vg::core::FacetRef source_ref,
-                       const RasterPassDesc& desc, RasterPassResult* result, std::string* error);
+  DeviceState(const DeviceState &) = delete;
+  DeviceState &operator=(const DeviceState &) = delete;
+  DeviceHal &owner_;
+  vg::core::FacetPool &facet_pool();
+  vg::core::EnvelopeContinuationTable &envelope_continuations();
+  const vg::hal::CapabilitySnapshot &capabilities() const;
+  bool compile(const vg::core::ExecutionPlan &plan,
+               vg::hal::CompiledPlan *compiled, std::string *error);
+  bool submit(const vg::hal::CompiledPlan &compiled, vg::core::Arena &arena,
+              vg::hal::Submission *submission, std::string *error);
+  bool run_raster_pass(const vg::core::Arena &arena, vg::core::FacetPool &pool,
+                       vg::core::FacetRef attachment_ref,
+                       vg::core::FacetRef source_ref,
+                       const RasterPassDesc &desc, RasterPassResult *result,
+                       std::string *error);
   vg::hal::CapabilitySnapshot capabilities_;
 
   // What vkGetPhysicalDeviceFormatProperties reported for one core::PixelFormat
@@ -45,18 +49,22 @@ struct DeviceState {
     bool sampled_image{};
     bool storage_image{};
     bool color_attachment{};
+    bool depth_stencil_attachment{};
     bool transfer_dst{};
     bool transfer_src{};
   };
   FormatSupport rgba8_support_;
   FormatSupport r32f_support_;
+  FormatSupport d32_support_;
   // 05 §10 makes a backend binary cache explicitly non-portable, so
   // compiler::PipelineKey::target_identity carries this device's identity
   // (name + API version + driver version) into every pipeline key rather than
   // letting a key look portable across drivers.
   std::string target_identity_;
-  const FormatSupport& format_support(vg::core::PixelFormat format) const {
-    return format == vg::core::PixelFormat::RGBA8Unorm ? rgba8_support_ : r32f_support_;
+  const FormatSupport &format_support(vg::core::PixelFormat format) const {
+    if (format == vg::core::PixelFormat::RGBA8Unorm) return rgba8_support_;
+    if (format == vg::core::PixelFormat::Depth32Float) return d32_support_;
+    return r32f_support_;
   }
 #if defined(VG_HAS_VULKAN)
   VkInstance instance_{VK_NULL_HANDLE};
@@ -84,7 +92,7 @@ struct DeviceState {
     VkBuffer buffer{VK_NULL_HANDLE};
     VkDeviceMemory memory{VK_NULL_HANDLE};
     VkDeviceAddress device_address{};
-    void* mapped{nullptr};
+    void *mapped{nullptr};
     uint32_t generation{};
     size_t byte_size{};
   };
@@ -130,15 +138,15 @@ struct DeviceState {
     VkBuffer state_buffer{VK_NULL_HANDLE};
     VkDeviceMemory state_memory{VK_NULL_HANDLE};
     VkDeviceAddress state_address{};
-    void* state_mapped{nullptr};
+    void *state_mapped{nullptr};
     VkBuffer fields_buffer{VK_NULL_HANDLE};
     VkDeviceMemory fields_memory{VK_NULL_HANDLE};
     VkDeviceAddress fields_address{};
-    void* fields_mapped{nullptr};
+    void *fields_mapped{nullptr};
     VkBuffer inputs_buffer{VK_NULL_HANDLE};
     VkDeviceMemory inputs_memory{VK_NULL_HANDLE};
     VkDeviceAddress inputs_address{};
-    void* inputs_mapped{nullptr};
+    void *inputs_mapped{nullptr};
     uint32_t task_count{};
   };
 
@@ -168,6 +176,7 @@ struct DeviceState {
     uint32_t facet_index{};
     uint32_t facet_generation{};
     uint32_t representation_epoch{};
+    uint64_t content_epoch{};
     vg::core::FacetKind kind{vg::core::FacetKind::Sample};
     uint64_t backing_bytes{};
     // requirements.size - backing_bytes for this image's dedicated allocation.
@@ -194,14 +203,16 @@ struct DeviceState {
     uint32_t height{};
     uint32_t array_layers{};
     uint32_t mip_levels{};
-    uint32_t swizzle{};  // four core::Swizzle channels packed one per byte
+    uint32_t swizzle{}; // four core::Swizzle channels packed one per byte
 
-    bool operator<(const FacetImageKey& other) const {
-      return std::tie(facet_index, facet_generation, representation_epoch, kind, format, view_type, width,
-                      height, array_layers, mip_levels, swizzle) <
-             std::tie(other.facet_index, other.facet_generation, other.representation_epoch, other.kind,
-                      other.format, other.view_type, other.width, other.height, other.array_layers,
-                      other.mip_levels, other.swizzle);
+    bool operator<(const FacetImageKey &other) const {
+      return std::tie(facet_index, facet_generation, representation_epoch, kind,
+                      format, view_type, width, height, array_layers,
+                      mip_levels, swizzle) <
+             std::tie(other.facet_index, other.facet_generation,
+                      other.representation_epoch, other.kind, other.format,
+                      other.view_type, other.width, other.height,
+                      other.array_layers, other.mip_levels, other.swizzle);
     }
   };
 
@@ -260,6 +271,10 @@ struct DeviceState {
   // (they are VK_DYNAMIC_STATE_*), and the tint is not (it is a UBO the shader
   // reads).
   std::map<uint64_t, VkPipeline> raster_pipelines_;
+  // E1 formal plan-driven Raster owns a distinct ABI/cache from the D legacy
+  // probe.
+  PlanRasterCache *plan_raster_cache_{};
+  PlanIndirectCache *plan_indirect_cache_{};
   // E013's "naive full permutation" arm keeps its own map so a variant whose
   // naive and classified keys happen to coincide does not have one arm's
   // VkPipeline handed to the other -- the two counts have to be independent
@@ -271,34 +286,38 @@ struct DeviceState {
   // Compiles `glsl_source` (GLSL -> SPIR-V via a glslc subprocess -> a
   // VkPipeline bound only by a push-constant BDA-address array, no descriptor
   // sets), caching by the complete immutable package/entry key. Failure here
-  // is the sole source of truth for whether this device/driver can run the module -- unlike
-  // Metal, no HostAssisted fallback is attempted: the target NVIDIA/Linux
-  // hardware is expected to support this natively, so failure is reported
-  // as Unsupported rather than silently degraded.
-  bool ensure_pipeline(const std::string& cache_key, const std::string& glsl_source,
-                       uint32_t binding_count, const ComputePipelineRecord** out,
-                       bool* cache_hit, std::string* error);
+  // is the sole source of truth for whether this device/driver can run the
+  // module -- unlike Metal, no HostAssisted fallback is attempted: the target
+  // NVIDIA/Linux hardware is expected to support this natively, so failure is
+  // reported as Unsupported rather than silently degraded.
+  bool ensure_pipeline(const std::string &cache_key,
+                       const std::string &glsl_source, uint32_t binding_count,
+                       const ComputePipelineRecord **out, bool *cache_hit,
+                       std::string *error);
   // Creates or reuses a host-visible-coherent VkBuffer for `allocation`,
   // uploading its current bytes. Invalidated (recreated) on generation or
   // required-size mismatch, mirroring Metal's allocation_map policy.
-  bool ensure_buffer(const core::Allocation& allocation, AllocationRecord** out, std::string* error);
-  bool ensure_timeline_semaphore(std::string* error);
-  bool ensure_task_ring_pipeline(std::string* error);
-  bool create_task_ring_buffers(uint32_t task_count, TaskRingBuffers* out, std::string* error);
-  void destroy_task_ring_buffers(TaskRingBuffers* buffers);
+  bool ensure_buffer(const core::Allocation &allocation, AllocationRecord **out,
+                     std::string *error);
+  bool ensure_timeline_semaphore(std::string *error);
+  bool ensure_task_ring_pipeline(std::string *error);
+  bool create_task_ring_buffers(uint32_t task_count, TaskRingBuffers *out,
+                                std::string *error);
+  void destroy_task_ring_buffers(TaskRingBuffers *buffers);
   // Publication-only pass. Canonical program execution is performed by
   // dispatch_task_graph below; the Task ring cannot select a Node pipeline or
   // become a second execution authority.
   struct TaskDispatchCounts;
-  bool dispatch_task_ring_publication(const TaskRingBuffers& buffers,
-                                       TaskDispatchCounts* counts, std::string* error);
+  bool dispatch_task_ring_publication(const TaskRingBuffers &buffers,
+                                      TaskDispatchCounts *counts,
+                                      std::string *error);
 
   struct CanonicalTaskDispatch {
     uint32_t task_index{};
     uint32_t x{1};
     uint32_t y{1};
     uint32_t z{1};
-    const ComputePipelineRecord* pipeline{};
+    const ComputePipelineRecord *pipeline{};
     std::vector<VkDeviceAddress> addresses;
     // Physical operations admitted by Stage 6 at this wave's first Task.
     std::vector<uint32_t> transitions_before;
@@ -313,9 +332,9 @@ struct DeviceState {
   // Records Core's component/wave schedule in one command buffer. Each Task
   // binds its own NodeRef-keyed Stage-6 pipeline and package bindings. A
   // conservative sync2 barrier is emitted only for Stage-6 wave operations.
-  bool dispatch_task_graph(const std::vector<CanonicalTaskDispatch>& dispatches,
+  bool dispatch_task_graph(const std::vector<CanonicalTaskDispatch> &dispatches,
                            uint64_t wait_value, uint64_t signal_value,
-                           TaskDispatchCounts* counts, std::string* error);
+                           TaskDispatchCounts *counts, std::string *error);
 
   // wait_value/signal_value of 0 mean "no timeline involvement for this
   // side" -- their fields are omitted from VkTimelineSemaphoreSubmitInfo
@@ -333,9 +352,10 @@ struct DeviceState {
   // reject a kind mismatch, reporting the status FacetPool itself classified
   // rather than a generic "stale" string (04 §4: every failure programmatically
   // determinable).
-  static const vg::core::FacetSlot* resolve_facet(const vg::core::Arena& arena, const vg::core::FacetPool& pool,
-                                                  vg::core::FacetRef ref, vg::core::FacetKind expected_kind,
-                                                  std::string* error);
+  static const vg::core::FacetSlot *
+  resolve_facet(const vg::core::Arena &arena, const vg::core::FacetPool &pool,
+                vg::core::FacetRef ref, vg::core::FacetKind expected_kind,
+                std::string *error);
 
   // Creates or reuses the VkImage/VkImageView behind `ref`, uploading every
   // subresource from the backing allocation's bytes using the CanonicalView's
@@ -350,33 +370,42 @@ struct DeviceState {
   // A cache hit does not touch the allocation's bytes at all, which is what
   // lets a facet keep resolving after a ConsumeInput released the linear
   // backing the image superseded (02 §4.2).
-  bool ensure_facet_image(const vg::core::Arena& arena, const vg::core::FacetPool& pool,
-                          vg::core::FacetRef ref, vg::core::FacetKind expected_kind, VkBuffer upload_source,
-                          VkDeviceSize upload_source_offset, VulkanFacetRecord** out, bool* cache_hit,
-                          uint64_t* temporary_bytes, std::string* error);
+  bool ensure_facet_image(const vg::core::Arena &arena,
+                          const vg::core::FacetPool &pool,
+                          vg::core::FacetRef ref,
+                          vg::core::FacetKind expected_kind,
+                          VkBuffer upload_source,
+                          VkDeviceSize upload_source_offset,
+                          VulkanFacetRecord **out, bool *cache_hit,
+                          uint64_t *temporary_bytes, std::string *error);
 
   // Records the VkImageMemoryBarrier2 that moves `record` into `new_layout` and
   // updates the adapter's own representation state. Returns true when a barrier
   // was actually recorded, so callers can report a barrier count that matches
   // what the command buffer contains. 07 §7: a layout transition is a separate
   // reported event from a representation transform, never folded into it.
-  static bool record_layout_transition(VkCommandBuffer command_buffer, VulkanFacetRecord* record,
+  static bool record_layout_transition(VkCommandBuffer command_buffer,
+                                       VulkanFacetRecord *record,
                                        VkImageLayout new_layout);
 
   // Destroys every cached facet image whose FacetRef no longer resolves in
   // `pool` -- i.e. exactly the slots core::FacetPool::retire_stale already
   // retired (07 §6's step 6, "epoch 退休后回收"). Never retires an image whose
   // slot is still resolvable, and never touches the allocation's linear buffer.
-  uint32_t retire_stale_facet_images(const vg::core::Arena& arena, const vg::core::FacetPool& pool);
+  uint32_t retire_stale_facet_images(const vg::core::Arena &arena,
+                                     const vg::core::FacetPool &pool);
 
-  bool ensure_sampler(vg::core::FilterMode filter, vg::core::WrapMode wrap, VkSampler* out,
-                      std::string* error);
-  bool ensure_descriptor_pool(std::string* error);
-  bool ensure_sample_facet_pipeline(bool array_kernel, bool checked_profile, VkPipeline* pipeline,
-                                    VkPipelineLayout* layout, VkDescriptorSetLayout* set_layout,
-                                    std::string* error);
-  bool ensure_storage_facet_pipeline(VkFormat format, VkPipeline* pipeline, std::string* error);
-  bool ensure_raster_shader_modules(std::string* error);
+  bool ensure_sampler(vg::core::FilterMode filter, vg::core::WrapMode wrap,
+                      VkSampler *out, std::string *error);
+  bool ensure_descriptor_pool(std::string *error);
+  bool ensure_sample_facet_pipeline(bool array_kernel, bool checked_profile,
+                                    VkPipeline *pipeline,
+                                    VkPipelineLayout *layout,
+                                    VkDescriptorSetLayout *set_layout,
+                                    std::string *error);
+  bool ensure_storage_facet_pipeline(VkFormat format, VkPipeline *pipeline,
+                                     std::string *error);
+  bool ensure_raster_shader_modules(std::string *error);
   // Creates (or returns from `pipelines`) the dynamic-rendering graphics
   // pipeline for `key`, with hit/miss and compile time accounted through
   // `cache` -- compiler::PipelineClassificationCache, deliberately not a second
@@ -389,12 +418,14 @@ struct DeviceState {
   // rejected rather than ignored: silently dropping a piece of state that was
   // classified as PipelineKey would compile a pipeline meaning something other
   // than what was asked for.
-  bool ensure_raster_pipeline(vg::compiler::PipelineClassificationCache& cache,
-                              std::map<uint64_t, VkPipeline>& pipelines, const vg::compiler::PipelineKey& key,
-                              const std::string& trigger_reason, VkFormat attachment_format,
-                              uint32_t sample_count,
-                              const std::vector<std::pair<std::string, uint64_t>>& raster_state,
-                              VkPipeline* pipeline, bool* cache_hit, uint64_t* binary_size, std::string* error);
+  bool ensure_raster_pipeline(
+      vg::compiler::PipelineClassificationCache &cache,
+      std::map<uint64_t, VkPipeline> &pipelines,
+      const vg::compiler::PipelineKey &key, const std::string &trigger_reason,
+      VkFormat attachment_format, uint32_t sample_count,
+      const std::vector<std::pair<std::string, uint64_t>> &raster_state,
+      VkPipeline *pipeline, bool *cache_hit, uint64_t *binary_size,
+      std::string *error);
   // What Stage 5 actually recorded and submitted, accumulated across a plan's
   // requests. Separate from hal::RepresentationTransformCost (which carries the
   // byte accounting core needs) because these are this backend's structural
@@ -408,11 +439,13 @@ struct DeviceState {
   };
 
   // Stage 5's physical step for one request, invoked from submit() through
-  // Stage-7 representation commit helper. Builds the optimal-tiled image for `facet`
-  // and copies the allocation's existing linear buffer into it.
-  bool transform_representation(const vg::core::Arena& arena, const vg::core::RepresentationSemanticPlanItem& request,
-                                vg::core::FacetRef facet, vg::hal::RepresentationTransformCost* cost,
-                                RepresentationStageCounts* counts, std::string* error);
+  // Stage-7 representation commit helper. Builds the optimal-tiled image for
+  // `facet` and copies the allocation's existing linear buffer into it.
+  bool transform_representation(
+      const vg::core::Arena &arena,
+      const vg::core::RepresentationSemanticPlanItem &request,
+      vg::core::FacetRef facet, vg::hal::RepresentationTransformCost *cost,
+      RepresentationStageCounts *counts, std::string *error);
 #endif
 
   // Whether every one of `plan.representation_requests` can actually be
@@ -421,8 +454,8 @@ struct DeviceState {
   // compile() turns into an Unsupported LoweringEvent -- START.md §4 invariant
   // 10: a semantic this hardware cannot express is rejected, never silently
   // dropped while the rest of the plan compiles as if nothing had been asked.
-  bool can_lower_representation_requests(const vg::core::ExecutionPlan& plan, std::string* reason) const;
-
+  bool can_lower_representation_requests(const vg::core::ExecutionPlan &plan,
+                                         std::string *reason) const;
 };
 
 #if defined(VG_HAS_VULKAN)
@@ -430,88 +463,103 @@ struct RawBuffer {
   VkBuffer buffer{VK_NULL_HANDLE};
   VkDeviceMemory memory{VK_NULL_HANDLE};
   VkDeviceAddress address{};
-  void* mapped{nullptr};
+  void *mapped{nullptr};
 };
 class FacetUseGuard {
- public:
-  FacetUseGuard(vg::core::FacetPool& pool, vg::core::FacetRef ref);
-  FacetUseGuard(const FacetUseGuard&) = delete;
-  FacetUseGuard& operator=(const FacetUseGuard&) = delete;
-  FacetUseGuard(FacetUseGuard&&) = delete;
-  FacetUseGuard& operator=(FacetUseGuard&&) = delete;
+public:
+  FacetUseGuard(vg::core::FacetPool &pool, vg::core::FacetRef ref);
+  FacetUseGuard(const FacetUseGuard &) = delete;
+  FacetUseGuard &operator=(const FacetUseGuard &) = delete;
+  FacetUseGuard(FacetUseGuard &&) = delete;
+  FacetUseGuard &operator=(FacetUseGuard &&) = delete;
   ~FacetUseGuard();
-  bool begin(const vg::core::Arena& arena, std::string* error);
- private:
-  vg::core::FacetPool& pool_;
+  bool begin(const vg::core::Arena &arena, std::string *error);
+
+private:
+  vg::core::FacetPool &pool_;
   vg::core::FacetRef ref_;
   bool held_{};
 };
 
-void append_cache_key_component(std::string* key, std::string_view value);
+void append_cache_key_component(std::string *key, std::string_view value);
 
-std::string compute_pipeline_cache_key(const vg::core::ExecutionPlan::ResolvedNode& node,
-                                       const vg::compiler::ComputePackage& package);
+std::string
+compute_pipeline_cache_key(const vg::core::ExecutionPlan::ResolvedNode &node,
+                           const vg::compiler::ComputePackage &package);
 #endif
-bool same_compute_bindings(const std::vector<vg::compiler::ComputeBinding>& left,
-                           const std::vector<vg::compiler::ComputeBinding>& right);
-bool same_vulkan_compute_package(const vg::compiler::ComputePackage& actual,
-                                 const vg::compiler::ComputePackage& expected);
-bool node_ref_equal(vg::core::NodeTable::Ref left, vg::core::NodeTable::Ref right);
+bool same_compute_bindings(
+    const std::vector<vg::compiler::ComputeBinding> &left,
+    const std::vector<vg::compiler::ComputeBinding> &right);
+bool same_vulkan_compute_package(const vg::compiler::ComputePackage &actual,
+                                 const vg::compiler::ComputePackage &expected);
+bool node_ref_equal(vg::core::NodeTable::Ref left,
+                    vg::core::NodeTable::Ref right);
 #if defined(VG_HAS_VULKAN)
-void lower_wave_transitions(vg::hal::CompiledPlan* compiled);
+void lower_wave_transitions(vg::hal::CompiledPlan *compiled);
 
-bool find_memory_type(VkPhysicalDevice physical_device, uint32_t type_bits, VkMemoryPropertyFlags required,
-                      uint32_t* out);
+bool find_memory_type(VkPhysicalDevice physical_device, uint32_t type_bits,
+                      VkMemoryPropertyFlags required, uint32_t *out);
 
-bool compile_glsl_stage(const std::string& glsl_source, const char* shader_stage,
-                        const std::vector<std::string>& defines, std::vector<uint32_t>* spirv,
-                        std::string* error);
+bool compile_glsl_stage(const std::string &glsl_source,
+                        const char *shader_stage,
+                        const std::vector<std::string> &defines,
+                        std::vector<uint32_t> *spirv, std::string *error);
 
-bool compile_glsl_to_spirv(const std::string& glsl_source, std::vector<uint32_t>* spirv, std::string* error);
+bool compile_glsl_to_spirv(const std::string &glsl_source,
+                           std::vector<uint32_t> *spirv, std::string *error);
 
-void destroy_raw_buffer(VkDevice device, RawBuffer* buffer);
+void destroy_raw_buffer(VkDevice device, RawBuffer *buffer);
 
-bool create_raw_buffer(VkDevice device, VkPhysicalDevice physical_device, VkDeviceSize size,
-                       VkBufferUsageFlags usage, bool want_address, bool want_map, RawBuffer* out,
-                       std::string* error);
+bool create_raw_buffer(VkDevice device, VkPhysicalDevice physical_device,
+                       VkDeviceSize size, VkBufferUsageFlags usage,
+                       bool want_address, bool want_map, RawBuffer *out,
+                       std::string *error);
 
-bool ensure_command_pool(VkDevice device, uint32_t queue_family, VkCommandPool* pool, std::string* error);
+bool ensure_command_pool(VkDevice device, uint32_t queue_family,
+                         VkCommandPool *pool, std::string *error);
 
-bool allocate_command_buffer(VkDevice device, VkCommandPool pool, VkCommandBuffer* out, std::string* error);
+bool allocate_command_buffer(VkDevice device, VkCommandPool pool,
+                             VkCommandBuffer *out, std::string *error);
 
-bool submit_and_wait(VkDevice device, VkQueue queue, VkCommandPool pool, VkCommandBuffer command_buffer,
-                     const void* submit_pnext, uint32_t wait_count, const VkSemaphore* wait_semaphores,
-                     const VkPipelineStageFlags* wait_stage_mask, uint32_t signal_count,
-                     const VkSemaphore* signal_semaphores, std::string* error,
-                     uint64_t* actual_host_waits = nullptr);
+bool submit_and_wait(VkDevice device, VkQueue queue, VkCommandPool pool,
+                     VkCommandBuffer command_buffer, const void *submit_pnext,
+                     uint32_t wait_count, const VkSemaphore *wait_semaphores,
+                     const VkPipelineStageFlags *wait_stage_mask,
+                     uint32_t signal_count,
+                     const VkSemaphore *signal_semaphores, std::string *error,
+                     uint64_t *actual_host_waits = nullptr);
 
-bool submit_and_wait_simple(VkDevice device, VkQueue queue, VkCommandPool pool, VkCommandBuffer command_buffer,
-                            std::string* error);
+bool submit_and_wait_simple(VkDevice device, VkQueue queue, VkCommandPool pool,
+                            VkCommandBuffer command_buffer, std::string *error);
 
 VkFormat to_vk_format(vg::core::PixelFormat format);
 
-const char* storage_image_format_qualifier(VkFormat format);
+const char *storage_image_format_qualifier(VkFormat format);
 
 VkComponentSwizzle to_vk_swizzle(vg::core::Swizzle swizzle);
 
-VkComponentMapping to_vk_component_mapping(const vg::core::SwizzleChannels& swizzle);
+VkComponentMapping
+to_vk_component_mapping(const vg::core::SwizzleChannels &swizzle);
 
-uint32_t packed_swizzle(const vg::core::SwizzleChannels& swizzle);
+uint32_t packed_swizzle(const vg::core::SwizzleChannels &swizzle);
 
 VkImageViewType to_vk_view_type(vg::core::ViewDimension dimension);
 
-VkImageLayout facet_read_layout(vg::core::FacetKind kind);
+VkImageLayout facet_read_layout(vg::core::FacetKind kind, VkFormat format);
 
-VkImageUsageFlags facet_image_usage(vg::core::FacetKind kind);
+VkImageUsageFlags facet_image_usage(vg::core::FacetKind kind, VkFormat format);
 
-void layout_sync_scope(VkImageLayout layout, VkPipelineStageFlags2* stage, VkAccessFlags2* access);
+void layout_sync_scope(VkImageLayout layout, VkPipelineStageFlags2 *stage,
+                       VkAccessFlags2 *access);
 
-void record_image_barrier(VkCommandBuffer command_buffer, VkImage image, VkImageLayout old_layout,
-                         VkImageLayout new_layout, uint32_t mip_levels, uint32_t array_layers);
+void record_image_barrier(VkCommandBuffer command_buffer, VkImage image,
+                          VkImageLayout old_layout, VkImageLayout new_layout,
+                          VkImageAspectFlags aspect, uint32_t mip_levels,
+                          uint32_t array_layers);
 
-std::array<float, 4> decode_first_texel(const void* bytes, VkFormat format);
+std::array<float, 4> decode_first_texel(const void *bytes, VkFormat format);
 
-std::string storage_facet_glsl_source(const char* format_qualifier);
+std::string storage_facet_glsl_source(const char *format_qualifier);
 
 VkSampleCountFlagBits to_vk_sample_count(uint32_t sample_count);
 
@@ -519,9 +567,10 @@ VkAttachmentLoadOp to_vk_load_op(vg::vulkan::AttachmentLoadAction load);
 
 VkAttachmentStoreOp to_vk_store_op(vg::vulkan::AttachmentStoreAction store);
 
-size_t encode_first_texel(const std::array<float, 4>& rgba, VkFormat format, uint8_t* out);
+size_t encode_first_texel(const std::array<float, 4> &rgba, VkFormat format,
+                          uint8_t *out);
 #endif
-}  // namespace detail
-}  // namespace vg::vulkan
+} // namespace detail
+} // namespace vg::vulkan
 
 #endif

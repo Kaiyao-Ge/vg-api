@@ -45,5 +45,6 @@ struct UserRasterShaderContract {
   std::string source;
 };
 UserRasterShaderContract parse_msl_raster_envelope(const std::string& text);
+UserRasterShaderContract parse_glsl_raster_envelope(const std::string& text);
 }
 #endif
