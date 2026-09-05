@@ -92,6 +92,29 @@ def main():
             assert all(s["status"] != "passed" for s in samples)
             review = [s for s in samples if s["backend"] == "vulkan"]
             assert all(s["status"] == "compile-review-only" and s["metrics"] == {} for s in review)
+    expected_vulkan = {
+        "facets", "representation", "consume-input", "facet-raster",
+        "pipeline-classification", "indirect", "cull-compact", "indexed-address", "tier2",
+    }
+    for outcome in ("passed", "failed", "missing", "skipped", "not-run"):
+        actual, summary, samples = run_case(module, "vulkan-df", outcome)
+        assert len(samples) == len(actual["calls"]) == 9
+        assert {s["parameters"]["ctest"] for s in samples} == {
+            "vertical-slice.vulkan." + name for name in expected_vulkan
+        }
+        assert all(s["backend"] == "vulkan" for s in samples)
+        assert summary["status"] == ("ok" if outcome == "passed" else "failed")
+        assert summary["performance"] == "unmeasured"
+    # New required-device acceptance returns a failing process status as well
+    # as preserving failed evidence; historical phase command behavior stays intact.
+    with tempfile.TemporaryDirectory(prefix="vg-required-exit-") as directory:
+        root = Path(directory)
+        for status, expected_code in (("ok", 0), ("failed", 1)):
+            (root / "summary.json").write_text(json.dumps({"status": status}))
+            with patch.object(module, "ROOT", root), \
+                 patch.object(module, "create_phase_run", return_value=root), \
+                 patch("builtins.print"):
+                assert module.command_phase(types.SimpleNamespace(command="vulkan-df", build_dir=str(root))) == expected_code
     for mutation in ("empty", "wrong-id", "unknown-gate", "fake-evidence"):
         phases = copy.deepcopy(module.PHASES)
         spec = phases["phase-a"]
@@ -106,7 +129,7 @@ def main():
                 pass
             else:
                 raise AssertionError(mutation)
-    print("phase contract: 10 legacy artifact cases, 15 missing/skip cases, 4 inventory negatives passed")
+    print("phase contract: 10 legacy artifact cases, 15 missing/skip cases, 4 inventory negatives, 5 Vulkan D/F routing cases and required exit statuses passed")
 
 
 if __name__ == "__main__":

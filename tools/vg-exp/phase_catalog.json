@@ -515,6 +515,87 @@
         "E017",
         "E018"
       ]
+    },
+    "vulkan-df": {
+      "title": "Vulkan D/F correctness acceptance",
+      "definition_files": {
+        "E005": "E005-consume-input-peak-memory.json",
+        "E007": "E007-root-pointer-vs-bindless.json",
+        "E008": "E008-sample-facet.json",
+        "E009": "E009-gpu-generated-same-node-work.json",
+        "E010": "E010-heterogeneous-node-lowering.json",
+        "E013": "E013-pipeline-classification.json",
+        "E016": "E016-representation-epoch-churn.json"
+      },
+      "experiments": {
+        "E005": [
+          {
+            "ctest": "vertical-slice.vulkan.consume-input",
+            "backend": "vulkan"
+          }
+        ],
+        "E007": [
+          {
+            "ctest": "vertical-slice.vulkan.indexed-address",
+            "backend": "vulkan"
+          }
+        ],
+        "E008": [
+          {
+            "ctest": "vertical-slice.vulkan.facets",
+            "backend": "vulkan"
+          },
+          {
+            "ctest": "vertical-slice.vulkan.facet-raster",
+            "backend": "vulkan"
+          }
+        ],
+        "E009": [
+          {
+            "ctest": "vertical-slice.vulkan.indirect",
+            "backend": "vulkan"
+          },
+          {
+            "ctest": "vertical-slice.vulkan.cull-compact",
+            "backend": "vulkan"
+          }
+        ],
+        "E010": [
+          {
+            "ctest": "vertical-slice.vulkan.tier2",
+            "backend": "vulkan"
+          }
+        ],
+        "E013": [
+          {
+            "ctest": "vertical-slice.vulkan.pipeline-classification",
+            "backend": "vulkan"
+          }
+        ],
+        "E016": [
+          {
+            "ctest": "vertical-slice.vulkan.representation",
+            "backend": "vulkan"
+          }
+        ]
+      },
+      "report_footer": "\n\nD/F correctness acceptance only. Narrow physical harnesses are not production Raster/indirect capabilities. No performance or full Phase B/C/D closure claim. All nine tests require Vulkan; missing/skipped tests fail this run. Linux device identity and validation-layer logs must accompany execution evidence.\n",
+      "summary_extra": {
+        "scope": "vulkan-df-correctness",
+        "performance": "unmeasured"
+      },
+      "resolved_extra": {
+        "scope": "D facets/representation/ConsumeInput and F compute-only physical experiments; excludes E1 Raster and draw-dependent F extensions"
+      },
+      "non_executed": [],
+      "csv_fields": [
+        "experiment",
+        "backend",
+        "variant",
+        "status",
+        "return_code"
+      ],
+      "required_tests": true
     }
   }
 }

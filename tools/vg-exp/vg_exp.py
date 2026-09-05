@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evidence runner with an explicit Phase A–E catalog; standard library only."""
+"""Evidence runner with explicit phase and backend acceptance catalogs; standard library only."""
 
 from __future__ import annotations
 
@@ -296,6 +296,9 @@ def create_phase_run(phase: str, build_dir: Path) -> Path:
 def command_phase(args: argparse.Namespace) -> int:
     run_dir = create_phase_run(args.command, Path(args.build_dir).resolve())
     print(run_dir.relative_to(ROOT))
+    if PHASES[args.command].get("required_tests"):
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        return 0 if summary["status"] == "ok" else 1
     return 0
 
 

@@ -33,6 +33,7 @@ class ReferenceDeviceHal final : public hal::DeviceHal {
         // generation exactly and host-side, which is stronger than the
         // in-shader check 06 §6.4 asks a GPU adapter for.
         static_cast<uint64_t>(hal::Capability::Raster) |
+        static_cast<uint64_t>(hal::Capability::IndexedBinding) |
         static_cast<uint64_t>(hal::Capability::RepresentationTransform) |
         static_cast<uint64_t>(hal::Capability::CheckedFacetGeneration) |
         // F3 (ADR-043 Decision #4): this backend accepts an

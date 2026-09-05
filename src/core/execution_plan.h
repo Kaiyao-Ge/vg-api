@@ -3,9 +3,9 @@
 
 #include "core/arena.h"
 #include "core/envelope.h"
+#include "core/execution_schedule.h"
 #include "core/representation.h"
 #include "core/task_graph.h"
-#include "core/execution_schedule.h"
 
 namespace vg::core {
 
@@ -28,7 +28,7 @@ enum class CapabilityRequirement : uint32_t {
   ReferenceStrict,
 };
 
-const char* capability_requirement_name(CapabilityRequirement requirement);
+const char *capability_requirement_name(CapabilityRequirement requirement);
 
 // Stage 5 request data is semantic input, not a backend-private descriptor.
 struct RepresentationRequest {
@@ -64,7 +64,7 @@ struct FacetLifetimeUse {
 // The one internal submission-plan representation.  DeviceHAL receives this
 // same type for Stage 6; capability snapshots remain a HAL concern.
 struct ExecutionPlan {
- private:
+private:
   // Opaque immutable witness of the facts produced by the assembler.  It is
   // validation-only: Stage 6/7 still consume the fields below, never a second
   // executable plan. Keeping the definition out of the header prevents a
@@ -73,7 +73,7 @@ struct ExecutionPlan {
   std::shared_ptr<const SemanticSeal> semantic_seal;
   friend class ExecutionPlanAssembler;
 
- public:
+public:
   Certificate certificate;
   TaskGraph task_graph;
   uint64_t graph_epoch{};
@@ -91,6 +91,10 @@ struct ExecutionPlan {
   std::vector<PointerRef> discovery_seeds;
   std::optional<uint32_t> envelope_task_quota;
   std::vector<NodeTable::Ref> authorized_nodes;
+  // Explicit semantic request for GPU selection among this sealed subset. It
+  // is never inferred from envelope authority or a multi-Node graph.
+  std::vector<NodeTable::Ref> tier2_selection_nodes;
+  bool tier2_selection_requested{};
   struct ResolvedNode {
     NodeTable::Ref ref;
     std::shared_ptr<const CodeObject> code_object;
@@ -138,51 +142,54 @@ struct ExecutionPlan {
   bool capability_requirements_derived{};
   bool assembled{};
 
-  bool validate(std::string* error = nullptr) const;
-  bool graph_epoch_matches(const Arena& arena, std::string* error = nullptr) const;
+  bool validate(std::string *error = nullptr) const;
+  bool graph_epoch_matches(const Arena &arena,
+                           std::string *error = nullptr) const;
 };
 
 // Internal construction inputs for the one ExecutionPlan.  This is purposely
 // a core-only mechanism, not a public VG object or a parallel plan type.
 struct ExecutionPlanAssemblerInputs {
-  const TaskGraph* task_graph{};
-  const NodeTable* nodes{};
-  const ExecutionEnvelope* envelope{};
-  const Arena* arena{};
-  const Certificate* certificate{};
-  const AccessCertificate* access_certificate{};
+  const TaskGraph *task_graph{};
+  const NodeTable *nodes{};
+  const ExecutionEnvelope *envelope{};
+  const Arena *arena{};
+  const Certificate *certificate{};
+  const AccessCertificate *access_certificate{};
   // Discovery is a witnessed result supplied by an existing discovery helper,
   // never a claim inferred from the certificate being checked.
-  const std::vector<PointerRef>* discovery_witness{};
+  const std::vector<PointerRef> *discovery_witness{};
   uint64_t graph_epoch{};
   // Representation requests are assembled here; adapters receive only the
   // resulting sealed semantic plan.
-  const std::vector<RepresentationRequest>* representation_requests{};
+  const std::vector<RepresentationRequest> *representation_requests{};
   // Existing device-owned pool, observed read-only while freezing Stage 5.
   // It is required for representation requests so ConsumeInput can reject
   // live old-epoch facet references before HAL compilation.
-  const FacetPool* facet_pool{};
+  const FacetPool *facet_pool{};
   // Core-only semantic inputs.  They deliberately reuse existing contracts;
   // no C ABI object is introduced for access planning.
-  const std::vector<PointerRef>* discovery_seeds{};
-  const WorkingSetBudget* working_set_budget{};
-  const WorkingSetLease* working_set_lease{};
+  const std::vector<PointerRef> *discovery_seeds{};
+  const WorkingSetBudget *working_set_budget{};
+  const WorkingSetLease *working_set_lease{};
   // A validated continuation token is semantic submission input.  It is
   // copied into the one assembled plan; adapters never attach it afterwards.
-  const EnvelopeOverflow* pending_overflow{};
+  const EnvelopeOverflow *pending_overflow{};
+  // Optional only when the caller explicitly requests Tier2 semantics.
+  const std::vector<NodeTable::Ref> *tier2_selection_nodes{};
 };
 
 class ExecutionPlanAssembler {
- public:
+public:
   // Performs semantic assembly: Node/task resolution, envelope and epoch
   // authority, effects, access/discovery/working-set facts, and validation
   // of submitted representation requests. Physical representation lowering,
   // lifetime retention, and Stage 6 backend lowering intentionally remain
   // outside this helper.
-  static bool assemble(const ExecutionPlanAssemblerInputs& inputs, ExecutionPlan* out,
-                       std::string* error = nullptr);
+  static bool assemble(const ExecutionPlanAssemblerInputs &inputs,
+                       ExecutionPlan *out, std::string *error = nullptr);
 };
 
-}  // namespace vg::core
+} // namespace vg::core
 
 #endif

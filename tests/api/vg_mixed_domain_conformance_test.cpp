@@ -179,9 +179,22 @@ void exercise(VgApi& api, VgAdapter adapter, uint32_t backend) {
   auto c = f.program(f.source, "store", 0, 4, 127);
   auto r = f.program(f.source, "load", 0, 4);
   if (backend == VG_BACKEND_VULKAN) {
-    const std::string diagnostic = "NodeRef{" + std::to_string(r.ref.index) + "," +
-                                   std::to_string(r.ref.generation) + "} domain=Raster";
-    f.run({f.compute(c, f.source), f.raster(r)}, false, diagnostic.c_str());
+    f.fill(f.source, 0); f.fill(f.target, 0);
+    const auto report = f.run({f.compute(c, f.source), f.raster(r)});
+    const auto source_after = f.read(f.source);
+    const auto target_after = f.read(f.target);
+    require(std::any_of(source_after.begin(), source_after.end(),
+                        [](uint8_t value) { return value == 127; }),
+            "Vulkan compute write is visible before Raster sampling");
+    require(std::any_of(target_after.begin(), target_after.end(),
+                        [](uint8_t value) { return value != 0; }),
+            "Vulkan Raster produced target pixels");
+    require(report.find("\"operation\":\"vulkan_raster_draw\"") != std::string::npos,
+            "Vulkan Stage7 reports the Raster draw");
+    require(report.find("\"operation\":\"task_publication_dispatch\"") != std::string::npos,
+            "Vulkan Stage7 publishes the sealed compute task");
+    require(report.find("\"operation\":\"raster_task_publication\"") != std::string::npos,
+            "Vulkan Stage7 publishes the sealed Raster task");
     return;
   }
   // Reverse storage order proves that public TaskGraph dependencies, not

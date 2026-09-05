@@ -39,8 +39,14 @@ VgResult VG_CALL load_code_object(VgDevice device, const VgCodeObjectDesc* desc,
     const std::string text(materialized->bytes.begin(), materialized->bytes.end());
     if (materialized->format_tag == "vg.msl.raster/v1")
       materialized->user_raster_shader = vg::ir::parse_msl_raster_envelope(text);
-    else
+    else if (materialized->format_tag == "vg.glsl.raster/v1")
+      materialized->user_raster_shader = vg::ir::parse_glsl_raster_envelope(text);
+    else if (materialized->format_tag.empty() || materialized->format_tag == "vg.ir/v1")
       materialized->module = vg::ir::parse_module(text);
+    else {
+      set_diagnostic("unsupported code object format tag");
+      return VG_ERROR_UNSUPPORTED;
+    }
   } catch (const std::exception& e) {
     set_diagnostic(e.what());
     return VG_ERROR_INVALID_ARGUMENT;

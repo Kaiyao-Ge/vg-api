@@ -145,6 +145,12 @@ int main() {
   code_desc.bytes = module_json.data();
   code_desc.byte_size = module_json.size();
   code_desc.format_tag = "vg.ir/v1";
+  VgCodeObjectDesc unknown_code_desc = code_desc;
+  unknown_code_desc.format_tag = "vendor.unknown/v1";
+  VgCodeObject unknown_code_object = nullptr;
+  check(api.loadCodeObject(device, &unknown_code_desc, &unknown_code_object) == VG_ERROR_UNSUPPORTED &&
+            unknown_code_object == nullptr,
+        "loadCodeObject rejects an unknown explicit format tag");
   VgCodeObject code_object = nullptr;
   check(api.loadCodeObject(device, &code_desc, &code_object) == VG_SUCCESS, "loadCodeObject");
 

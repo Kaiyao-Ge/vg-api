@@ -156,12 +156,15 @@ std::unique_ptr<DeviceHal> DeviceHal::create_impl(const uint8_t* uuid, std::stri
     support.sampled_image = (features_for_format & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
     support.storage_image = (features_for_format & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     support.color_attachment = (features_for_format & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+    support.depth_stencil_attachment =
+        (features_for_format & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
     support.transfer_dst = (features_for_format & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) != 0;
     support.transfer_src = (features_for_format & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0;
     return support;
   };
   adapter->state_->rgba8_support_ = probe_format(VK_FORMAT_R8G8B8A8_UNORM);
   adapter->state_->r32f_support_ = probe_format(VK_FORMAT_R32_SFLOAT);
+  adapter->state_->d32_support_ = probe_format(VK_FORMAT_D32_SFLOAT);
   adapter->state_->framebuffer_color_sample_counts_ = properties.limits.framebufferColorSampleCounts;
 
   // 05 §10: a backend pipeline binary cache is explicitly non-portable, so
@@ -237,10 +240,29 @@ std::unique_ptr<DeviceHal> DeviceHal::create_impl(const uint8_t* uuid, std::stri
   if (representation_transform)
     adapter->state_->capabilities_.capability_bits |=
         static_cast<uint64_t>(vg::hal::Capability::RepresentationTransform);
-  // Do not advertise Raster.  The standalone facet helper has reviewed
-  // vkCmdBeginRendering code, but ExecutionPlan Raster tasks are explicitly
-  // rejected above and therefore the DeviceHal capability contract is not
-  // fulfilled.  A standalone helper must not upgrade an unsupported plan.
+  const bool raster =
+      graphics_capable && adapter->state_->supports_dynamic_rendering_ && sync2 &&
+      spirv_compiler_available && transfer_capable &&
+      adapter->state_->rgba8_support_.sampled_image &&
+      adapter->state_->rgba8_support_.color_attachment &&
+      adapter->state_->rgba8_support_.transfer_dst &&
+      adapter->state_->rgba8_support_.transfer_src &&
+      adapter->state_->d32_support_.depth_stencil_attachment &&
+      adapter->state_->d32_support_.transfer_dst &&
+      adapter->state_->d32_support_.transfer_src;
+  if (raster) {
+    adapter->state_->capabilities_.capability_bits |=
+        static_cast<uint64_t>(vg::hal::Capability::Raster);
+    adapter->state_->capabilities_.capability_bits |=
+        static_cast<uint64_t>(vg::hal::Capability::IndexedBinding);
+    // Formal user GLSL packages compile through the same glslc-backed Raster
+    // pipeline, so advertising the import contract shares Raster's complete
+    // device gate instead of promising a standalone parser path.
+    adapter->state_->capabilities_.capability_bits |=
+        static_cast<uint64_t>(vg::hal::Capability::UserShaderImport);
+    adapter->state_->capabilities_.capability_bits |=
+        static_cast<uint64_t>(vg::hal::Capability::IndirectTier2Select);
+  }
   // CheckedFacetGeneration: the in-shader guard of 06 §6.4, which exists here
   // only because sample_facet_vulkan_source() is specialized with constant_id 0
   // = true and the token/generation-table/slot-count/violation bindings are
