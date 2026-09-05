@@ -4,6 +4,7 @@
 #include "backends/vulkan/vulkan_user_raster.h"
 #include "core/scene_root.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
